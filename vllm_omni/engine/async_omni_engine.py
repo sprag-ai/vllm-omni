@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import dataclasses
 import json
 import queue
 import shutil
