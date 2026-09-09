@@ -74,9 +74,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
-from vllm.entrypoints.speech_to_text.transcription.serving import (
-    OpenAIServingTranscription,
-)
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
@@ -174,6 +171,9 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
+from vllm_omni.entrypoints.openai.serving_transcription import (
+    OmniOpenAIServingTranscription,
+)
 from vllm_omni.entrypoints.openai.serving_video import (
     LatentEditInput,
     OmniOpenAIServingVideo,
@@ -1120,7 +1120,7 @@ async def omni_init_app_state(
 
     stt_engine_client = _TextOnlyEngineClient(engine_client)
     state.openai_serving_transcription = (
-        OpenAIServingTranscription(
+        OmniOpenAIServingTranscription(
             stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
