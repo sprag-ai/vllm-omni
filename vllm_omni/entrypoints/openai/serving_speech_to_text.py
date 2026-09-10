@@ -4,6 +4,9 @@ from vllm.entrypoints.serve.engine.typing import SpeechToTextRequest
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
+from vllm.entrypoints.speech_to_text.translation.serving import (
+    OpenAIServingTranslation,
+)
 from vllm.inputs import EngineInput
 
 _BASE_TOKENS = 128
@@ -18,14 +21,17 @@ cover. No utterance in that corpus exceeds the resulting bound.
 """
 
 
-class OmniOpenAIServingTranscription(OpenAIServingTranscription):
-    """Transcription serving that bounds generation by the duration of the audio it transcribes.
+class _AudioDurationBound:
+    """Bounds speech-to-text generation by the duration of the audio it transcribes.
 
     A transcript cannot outrun the speech it came from, but the upstream ceiling is the remaining
     context window, so a repetition loop on quasi-periodic audio generates until the context is full --
     65k tokens from a 7 second clip, observed. Bounding per request keeps a degenerate decode from
     holding a replica for minutes, and because the bound is derived from the audio it cannot truncate a
     transcript that the audio could legitimately produce.
+
+    Mixed into both speech-to-text endpoints: they share ``_preprocess_speech_to_text`` through
+    ``SpeechToTextBaseServing``, so a repetition loop reaches a replica through either one.
     """
 
     async def _preprocess_speech_to_text(
@@ -52,3 +58,11 @@ class OmniOpenAIServingTranscription(OpenAIServingTranscription):
         asked = request.max_completion_tokens
         request.max_completion_tokens = bound if asked is None else min(asked, bound)
         return engine_inputs, duration, chunk_start_offsets
+
+
+class OmniOpenAIServingTranscription(_AudioDurationBound, OpenAIServingTranscription):
+    """``/v1/audio/transcriptions``, bounded by the duration of its audio."""
+
+
+class OmniOpenAIServingTranslation(_AudioDurationBound, OpenAIServingTranslation):
+    """``/v1/audio/translations``, bounded by the duration of its audio."""
