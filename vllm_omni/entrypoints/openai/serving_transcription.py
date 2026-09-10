@@ -1,15 +1,10 @@
-import io
 import math
 
-import soundfile as sf
-from fastapi import Request
-from vllm.entrypoints.speech_to_text.transcription.protocol import TranscriptionRequest
+from vllm.entrypoints.serve.engine.typing import SpeechToTextRequest
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
+from vllm.inputs import EngineInput
 
 _BASE_TOKENS = 128
 """Allowance independent of length, covering short clips whose rate is dominated by the framing."""
@@ -23,21 +18,6 @@ cover. No utterance in that corpus exceeds the resulting bound.
 """
 
 
-def audio_token_bound(audio_data: bytes) -> int | None:
-    """Return the generation ceiling ``audio_data`` justifies, or None when its duration is unreadable.
-
-    Reads the container header rather than decoding, so the cost does not scale with clip length.
-    """
-    try:
-        info = sf.info(io.BytesIO(audio_data))
-        seconds = info.frames / info.samplerate if info.samplerate else None
-    except Exception:  # noqa: BLE001 — an unreadable header must not fail the request
-        seconds = None
-    if not seconds or seconds <= 0:
-        return None
-    return _BASE_TOKENS + math.ceil(_TOKENS_PER_SECOND * seconds)
-
-
 class OmniOpenAIServingTranscription(OpenAIServingTranscription):
     """Transcription serving that bounds generation by the duration of the audio it transcribes.
 
@@ -48,21 +28,27 @@ class OmniOpenAIServingTranscription(OpenAIServingTranscription):
     transcript that the audio could legitimately produce.
     """
 
-    async def create_transcription(
+    async def _preprocess_speech_to_text(
         self,
+        request: SpeechToTextRequest,
         audio_data: bytes,
-        request: TranscriptionRequest,
-        raw_request: Request | None = None,
-    ):
-        """Transcribe ``audio_data``, narrowing ``max_completion_tokens`` to what its duration allows."""
-        bound = audio_token_bound(audio_data)
-        if bound is not None:
-            asked = request.max_completion_tokens
-            narrowed = bound if asked is None else min(asked, bound)
-            if narrowed != asked:
-                request = request.model_copy(update={"max_completion_tokens": narrowed})
-        else:
-            logger.warning("transcription audio duration unreadable; generation left unbounded")
-        return await super().create_transcription(
-            audio_data=audio_data, request=request, raw_request=raw_request
+        request_id: str,
+    ) -> tuple[list[EngineInput], float, list[float]]:
+        """Preprocess as upstream does, then narrow ``max_completion_tokens`` to what the audio allows.
+
+        Overriding here rather than at the entrypoint reuses the duration the base class already measured
+        off the decoded waveform, so every container it can ingest is covered and nothing is read twice.
+        The caller reads ``max_completion_tokens`` back off this request when it builds the sampling
+        params, which is why the narrowing is applied in place.
+        """
+        engine_inputs, duration, chunk_start_offsets = await super()._preprocess_speech_to_text(
+            request=request, audio_data=audio_data, request_id=request_id
         )
+        # ``allow_audio_chunking`` -- the upstream split of a long clip into one generation per window,
+        # unrelated to vllm-omni's inter-stage ``async_chunk`` -- would charge this bound against each
+        # window rather than the whole clip: looser than necessary, never truncating. It is off for this
+        # model, whose config leaves ``min_energy_split_window_size`` None.
+        bound = _BASE_TOKENS + math.ceil(_TOKENS_PER_SECOND * duration)
+        asked = request.max_completion_tokens
+        request.max_completion_tokens = bound if asked is None else min(asked, bound)
+        return engine_inputs, duration, chunk_start_offsets
