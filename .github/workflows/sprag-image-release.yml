@@ -2,11 +2,13 @@
 # See SPRAG.md for the branch model, the tag scheme, and how to cut a new release branch.
 name: Sprag Image Release
 
+# Push-only. `workflow_dispatch` would need this file on the default branch, and main is kept a
+# clean upstream mirror, so a dispatcher there is not an option. To rebuild without a new commit,
+# re-run the previous run from the Actions UI -- it replays on the same ref.
 on:
   push:
     branches:
       - "release/**"
-  workflow_dispatch:
 
 concurrency:
   group: sprag-image-release-${{ github.ref }}
@@ -14,9 +16,9 @@ concurrency:
 
 jobs:
   release:
-    # workflow_dispatch is not branch-filtered, so guard the publish -- otherwise a manual run on a
-    # feature branch could publish an image that no release branch ever reviewed. The Workload
-    # Identity binding enforces the same rule at the IAM layer; this is the cheap first line.
+    # Redundant with the branch filter above, kept so that adding a trigger later cannot silently
+    # widen what publishes. The Workload Identity binding is the actual control: it names one repo
+    # and one ref, so a run on any other branch cannot assume the pushing identity regardless.
     if: startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
     permissions:
@@ -50,6 +52,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
+          # This action writes gha-creds-*.json into GITHUB_WORKSPACE by default. The build context
+          # is that workspace and docker/Dockerfile.cuda does `COPY . /app/vllm-omni`, so the file
+          # would be baked into a published image. Only the access_token output is used here, so
+          # suppress the file rather than relying on a .dockerignore this repo does not have.
+          create_credentials_file: false
 
       - name: Log in to Artifact Registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
@@ -60,8 +67,9 @@ jobs:
 
       # Tags are immutable by construction (they name a commit), so a tag that already exists was
       # built from identical source and rebuilding it would only churn the digest that seed pins.
-      # Classified explicitly: a transient registry error must not read as "missing" (spurious
-      # publish) or "present" (silently skipped build).
+      # Only manifest absence means "missing". DENIED and NAME_UNKNOWN are authorization and
+      # repository errors (Registry V2 lists them separately from MANIFEST_UNKNOWN); treating them
+      # as absence would start a ~30 GB build that can only fail at the push.
       - name: Determine whether a publish is needed
         id: check
         env:
@@ -74,7 +82,7 @@ jobs:
           if [ "${status}" -eq 0 ]; then
             echo "${GAR}:${TAG} already present; skipping build"
             echo "publish_needed=false" >> "${GITHUB_OUTPUT}"
-          elif echo "${output}" | grep -qiE 'manifest unknown|not found|no such manifest|denied|name unknown'; then
+          elif echo "${output}" | grep -qiE 'manifest unknown|no such manifest|not found'; then
             echo "${GAR}:${TAG} missing; will build"
             echo "publish_needed=true" >> "${GITHUB_OUTPUT}"
           else
