@@ -84,8 +84,14 @@ so only a run on `release/0.28` can assume the pushing service account. A run on
 cannot publish even if the workflow were altered to try, which is the point: production pulls from
 `sprag-prod`, so "can push a branch" must not imply "can publish an image production pulls".
 
-The workflow's `if: startsWith(github.ref, 'refs/heads/release/')` guard is a convenience that fails
-the run early with a clear message. The IAM binding is the actual control.
+The workflow's `if: startsWith(github.ref, 'refs/heads/release/')` guard is redundant with its
+branch filter; it is kept so a trigger added later cannot silently widen what publishes. The IAM
+binding is the actual control.
+
+The workflow is push-triggered only. `workflow_dispatch` would have to live on the default branch to
+be selectable, and `main` is a clean upstream mirror, so there is no dispatcher to add. To rebuild
+without a new commit, re-run the previous run from the Actions UI: it replays against the same ref,
+which is a ref the IAM binding already allows.
 
 ## Cutting a new release branch
 
