@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import dataclasses
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -148,7 +149,16 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     @classmethod
     def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> "SpeechToTextConfig":
-        return VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
+        """Enable chunking of long audio into ``max_audio_clip_s`` windows.
+
+        Upstream leaves ``min_energy_split_window_size`` None, which makes ``allow_audio_chunking``
+        False, so a long clip is transcribed as one generation. The model terminates early on those:
+        measured on 8 minutes of meeting audio, every instance returned "Okay." -- 5 characters --
+        while the same audio in 30 second windows returned 2,525. Chunking keeps each generation
+        inside the range the model handles.
+        """
+        base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
+        return dataclasses.replace(base, min_energy_split_window_size=1600)
 
     @classmethod
     def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
