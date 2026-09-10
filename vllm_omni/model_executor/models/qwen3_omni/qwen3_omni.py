@@ -157,8 +157,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         while the same audio in 30 second windows returned 2,525. Chunking keeps each generation
         inside the range the model handles.
         """
+        import os
+
         base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
-        return dataclasses.replace(base, min_energy_split_window_size=1600)
+        # SPRAG_AUDIO_CHUNK_S overrides the window in seconds so the size can be swept without
+        # rebuilding; 0 restores upstream behaviour (no chunking) for use as a control arm.
+        try:
+            chunk_s = int(os.environ.get("SPRAG_AUDIO_CHUNK_S", "0"))
+        except ValueError:
+            chunk_s = 0
+        if chunk_s < 0:
+            return base
+        if chunk_s == 0:
+            return dataclasses.replace(base, min_energy_split_window_size=1600)
+        return dataclasses.replace(
+            base, max_audio_clip_s=chunk_s, min_energy_split_window_size=1600
+        )
 
     @classmethod
     def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
