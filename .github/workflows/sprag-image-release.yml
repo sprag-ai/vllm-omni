@@ -1,0 +1,125 @@
+# Sprag-only workflow. Upstream has no file by this name, so an upstream sync never conflicts here.
+# See SPRAG.md for the branch model, the tag scheme, and how to cut a new release branch.
+name: Sprag Image Release
+
+on:
+  push:
+    branches:
+      - "release/**"
+  workflow_dispatch:
+
+concurrency:
+  group: sprag-image-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    # workflow_dispatch is not branch-filtered, so guard the publish -- otherwise a manual run on a
+    # feature branch could publish an image that no release branch ever reviewed. The Workload
+    # Identity binding enforces the same rule at the IAM layer; this is the cheap first line.
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token WIF exchanges for the Artifact Registry push identity
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      # Tag = <upstream base version>-sprag.<commit>. The upstream half is read from the Dockerfile's
+      # BASE_IMAGE rather than hardcoded, so bumping the base is the only edit needed to cut a new
+      # release line; the commit half is this branch's head, which is what actually built the image.
+      - name: Derive image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          base="$(sed -n 's/^ARG BASE_IMAGE=\(.*\)$/\1/p' docker/Dockerfile.cuda | head -1)"
+          [ -n "${base}" ] || { echo "::error::could not read ARG BASE_IMAGE from docker/Dockerfile.cuda"; exit 1; }
+          upstream="${base##*:}"
+          sha="$(git rev-parse --short=8 HEAD)"
+          echo "base_image=${base}"           >> "${GITHUB_OUTPUT}"
+          echo "tag=${upstream}-sprag.${sha}" >> "${GITHUB_OUTPUT}"
+          echo "Building ${upstream}-sprag.${sha} from ${base}"
+
+      - name: Authenticate to Google Cloud
+        id: gcp_auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth.outputs.access_token }}
+
+      # Tags are immutable by construction (they name a commit), so a tag that already exists was
+      # built from identical source and rebuilding it would only churn the digest that seed pins.
+      # Classified explicitly: a transient registry error must not read as "missing" (spurious
+      # publish) or "present" (silently skipped build).
+      - name: Determine whether a publish is needed
+        id: check
+        env:
+          GAR: us-central1-docker.pkg.dev/steady-method-485022-e5/sprag-prod/vllm-omni
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set +e
+          output="$(docker manifest inspect "${GAR}:${TAG}" 2>&1)"
+          status=$?
+          if [ "${status}" -eq 0 ]; then
+            echo "${GAR}:${TAG} already present; skipping build"
+            echo "publish_needed=false" >> "${GITHUB_OUTPUT}"
+          elif echo "${output}" | grep -qiE 'manifest unknown|not found|no such manifest|denied|name unknown'; then
+            echo "${GAR}:${TAG} missing; will build"
+            echo "publish_needed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::error::transient registry error for ${GAR}:${TAG}:" >&2
+            echo "${output}" >&2
+            exit 1
+          fi
+
+      # The CUDA base unpacks to ~30 GB, which does not fit beside the runner's preinstalled
+      # toolchains. Same reclaim dialtone's aligner-server release does for the same reason.
+      - name: Free up disk space
+        if: steps.check.outputs.publish_needed == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.publish_needed == 'true'
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # amd64 only: the CUDA base has no arm64 variant, and every cluster that pulls this is amd64.
+      - name: Build and push
+        if: steps.check.outputs.publish_needed == 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: docker/Dockerfile.cuda
+          build-args: BASE_IMAGE=${{ steps.tag.outputs.base_image }}
+          platforms: linux/amd64
+          push: true
+          tags: us-central1-docker.pkg.dev/steady-method-485022-e5/sprag-prod/vllm-omni:${{ steps.tag.outputs.tag }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Sprag image release"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`${{ steps.tag.outputs.tag }}\` |"
+            echo "| base | \`${{ steps.tag.outputs.base_image }}\` |"
+            echo "| branch | \`${{ github.ref_name }}\` |"
+            echo "| published | ${{ steps.check.outputs.publish_needed }} |"
+            echo
+            echo "Pin this tag in seed to deploy it; nothing rolls automatically."
+          } >> "${GITHUB_STEP_SUMMARY}"
