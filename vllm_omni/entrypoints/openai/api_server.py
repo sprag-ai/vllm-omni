@@ -87,9 +87,6 @@ from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
-from vllm.entrypoints.speech_to_text.translation.serving import (
-    OpenAIServingTranslation,
-)
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -137,8 +134,9 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServin
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.entrypoints.openai.serving_transcription import (
+from vllm_omni.entrypoints.openai.serving_speech_to_text import (
     OmniOpenAIServingTranscription,
+    OmniOpenAIServingTranslation,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
     OmniOpenAIServingVideo,
@@ -1117,7 +1115,7 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_translation = (
-        OpenAIServingTranslation(
+        OmniOpenAIServingTranslation(
             stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
