@@ -5,6 +5,7 @@
 
 import asyncio
 import dataclasses
+import os
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -85,6 +86,24 @@ def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
     if DEFAULT_SPEAKER in speaker_token_ids:
         return DEFAULT_SPEAKER
     return next(iter(speaker_token_ids))
+
+
+_DEFAULT_AUDIO_CHUNK_S = 90
+"""Window in seconds that minimised corpus WER over 135 AMI SDM meetings (42.50%)."""
+
+_SPLIT_SEARCH_SAMPLES = 1600
+"""Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
+
+
+def _audio_chunk_seconds() -> int:
+    """Window in seconds, from ``SPRAG_AUDIO_CHUNK_S``; negative disables chunking."""
+    raw = os.environ.get("SPRAG_AUDIO_CHUNK_S")
+    if raw is None:
+        return _DEFAULT_AUDIO_CHUNK_S
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_AUDIO_CHUNK_S
 
 
 # Special token IDs for Qwen3 Omni MoE
@@ -204,12 +223,25 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         Upstream leaves ``min_energy_split_window_size`` None, which makes ``allow_audio_chunking``
         False, so a long clip is transcribed as one generation. The model terminates early on those:
-        measured on 8 minutes of meeting audio, every instance returned "Okay." -- 5 characters --
-        while the same audio in 30 second windows returned 2,525. Chunking keeps each generation
-        inside the range the model handles.
+        measured over 135 AMI SDM meetings it returned a median of 69 words against a 5761 word
+        reference, for a corpus WER of 100.35%.
+
+        Window size is the tunable part; sweeping it over that corpus (corpus WER, lower better)::
+
+            30s   48.41%      240s   51.50%
+            60s   43.03%      480s   51.31%
+            90s   42.50%      600s   55.28%
+            120s  53.75%      none  100.35%
+
+        90s is the measured optimum and the default. ``SPRAG_AUDIO_CHUNK_S`` overrides it; a negative
+        value restores upstream's unchunked behaviour. The optimum comes from one corpus in one
+        acoustic condition, which is why it stays configurable rather than hardcoded.
         """
         base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
-        return dataclasses.replace(base, min_energy_split_window_size=1600)
+        chunk_s = _audio_chunk_seconds()
+        if chunk_s < 0:
+            return base
+        return dataclasses.replace(base, max_audio_clip_s=chunk_s, min_energy_split_window_size=_SPLIT_SEARCH_SAMPLES)
 
     @classmethod
     def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
