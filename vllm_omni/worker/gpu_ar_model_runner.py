@@ -65,6 +65,31 @@ from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 logger = init_logger(__name__)
 
 
+def _committed_num_scheduled_tokens(
+    scheduler_output: SchedulerOutput,
+    valid_sampled_token_ids: list[list[int]],
+    req_id: str,
+    idx: int,
+    num_scheduled: int,
+) -> int:
+    """Rows of a speculative step that survive verification.
+
+    The target forward also produces rows for rejected draft tokens. Only the
+    previously unprocessed token plus the accepted draft prefix are committed,
+    and the rejection sampler's emitted count is that number. Requests without
+    drafts, prefill included, keep their full scheduled span.
+    """
+    drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+    if not drafts or not drafts.get(req_id):
+        return num_scheduled
+    if idx >= len(valid_sampled_token_ids):
+        return num_scheduled
+    sampled = valid_sampled_token_ids[idx]
+    if not sampled:
+        return num_scheduled
+    return min(num_scheduled, len(sampled))
+
+
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     if tensor.device.type == "cpu":
@@ -1255,7 +1280,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if self.is_pooling_model:
                 multimodal_outputs = None
             else:
-                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
@@ -1860,7 +1885,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
-                        sched = int(num_scheduled_tokens_np[idx])
+                        sched = _committed_num_scheduled_tokens(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                            rid,
+                            idx,
+                            int(num_scheduled_tokens_np[idx]),
+                        )
                         end = start + sched
                         req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
 
@@ -1916,7 +1947,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
-                    sched = int(num_scheduled_tokens_np[idx])
+                    sched = _committed_num_scheduled_tokens(
+                        scheduler_output,
+                        valid_sampled_token_ids,
+                        rid,
+                        idx,
+                        int(num_scheduled_tokens_np[idx]),
+                    )
                     end = start + sched
                     payload = self._build_omni_pooler_payload(
                         rid=rid,

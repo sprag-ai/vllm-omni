@@ -23,6 +23,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
@@ -113,6 +114,16 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _as_row_matrix(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    """Normalise a thinker embed payload to [rows, hidden] on ``device``."""
+    if tensor is None:
+        return None
+    tensor = tensor.to(device)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -120,6 +131,7 @@ logger = init_logger(__name__)
 )
 class Qwen3OmniMoeForConditionalGeneration(
     nn.Module,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     Qwen3OmniMoeConditionalGenerationMixin,
@@ -1122,7 +1134,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         target_len = thinker_result_ids.shape[-1]
         im_start_indexes = torch.cat(
             (
-                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
+                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(-1),
                 torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
@@ -1198,23 +1210,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
 
-        cached_thinker_decode_embeds = embed.get("cached_decode", None)
-        thinker_decode_embed = embed.get("decode", None)
-        start_index = meta.get("num_processed_tokens", 0)
+        # A speculative thinker step commits several text tokens at once while the
+        # talker consumes one per call, so the arrivals are a queue rather than an
+        # array indexed by the processed-token count.
+        queue = _as_row_matrix(embed.get("cached_decode", None), device)
+        arriving = _as_row_matrix(embed.get("decode", None), device)
+        if queue is None:
+            queue = arriving
+        elif arriving is not None:
+            queue = torch.cat([queue, arriving], dim=0)
 
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-
-        elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
+        if queue is not None and queue.shape[0] > 0:
+            thinker_embed = queue[0]
+            update_dict.setdefault("embed", {})["cached_decode"] = queue[1:]
         else:
             # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
             # Use the finished_flag to mark that all tokens output by thinker have been consumed.
