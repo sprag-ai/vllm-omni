@@ -32,6 +32,28 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _committed_output_delta(
+    transfer_manager: Any,
+    request_id: str,
+    output_token_ids: Any,
+) -> int:
+    """Thinker output tokens committed since this request was last looked at.
+
+    The cursor is cleared by the sender-side cleanup, not on the final chunk:
+    ``output_token_ids`` is cumulative, so dropping it at a segment boundary
+    would make the next delta the whole output length.
+    """
+    lengths = getattr(transfer_manager, "_thinker_output_lens", None)
+    if lengths is None:
+        lengths = {}
+        transfer_manager._thinker_output_lens = lengths
+    current = len(output_token_ids) if output_token_ids is not None else 0
+    previous = lengths.get(request_id, 0)
+    lengths[request_id] = current
+    return current - previous
+
+
 # Pooling output layer indices (semantic names for clarity)
 # Actual layer indices are integers; these functions provide semantic access
 # Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
@@ -222,8 +244,15 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     emb_cpu = thinker_emb.detach().cpu()
     hid_cpu = thinker_hid.detach().cpu()
 
+    # Speculation commits several output tokens in one step, so a decode step can
+    # also carry several rows. Row count alone cannot tell that apart from a new
+    # input segment; a step whose rows are all accounted for by newly committed
+    # output tokens is a decode step.
+    output_delta = _committed_output_delta(transfer_manager, request_id, output_token_ids)
+    is_speculative_decode = thinker_emb.shape[0] > 1 and thinker_emb.shape[0] <= output_delta
+
     if output_token_ids:
-        if thinker_emb.shape[0] > 1:
+        if thinker_emb.shape[0] > 1 and not is_speculative_decode:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
             new_prompt_len = thinker_emb.shape[0]
@@ -462,16 +491,6 @@ def thinker2talker_async_chunk(
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager
             )
-        if thinker_emb.shape[0] > 1:
-            logger.warning(
-                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
-                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
-                chunk_id,
-                request_id,
-                request.num_computed_tokens,
-                thinker_emb.shape,
-            )
-            return None
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
