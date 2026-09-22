@@ -402,6 +402,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         class attribute.  When set, ``get_mrope_input_positions`` is expected
         to return positions covering **both** prefill and decode tokens.
         """
+        # A streaming talker prompt is extended in place by the omni connector
+        # adapter, so _init_mrope_positions never re-runs and the cached
+        # positions fall behind the prompt they index.
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None or req_state.prompt_token_ids is None:
+                continue
+            mrope_positions = getattr(req_state, "mrope_positions", None)
+            if mrope_positions is not None and mrope_positions.shape[1] < len(req_state.prompt_token_ids):
+                self._init_mrope_positions(req_state)
+
         # Run upstream logic (handles prompt positions + linear decode fallback)
         super()._calc_mrope_positions(scheduler_output)
 
@@ -2002,10 +2013,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        aux_hidden_states = None
+        if self.use_aux_hidden_state_outputs:
+            model_output, aux_hidden_states = model_output
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
+        if aux_hidden_states is not None:
+            return model_output, aux_hidden_states
         return model_output
 
     def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:
