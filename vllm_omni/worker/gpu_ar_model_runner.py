@@ -1384,6 +1384,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
+            if getattr(self.model, "sampling_ignores_prompt_ids", False):
+                from vllm_omni.model_executor.models.qwen3_tts.native_math import generated_only_sampling_metadata
+
+                # Copy only after the async history placeholders are resolved.
+                sampling_metadata = generated_only_sampling_metadata(sampling_metadata)
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does

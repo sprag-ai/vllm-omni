@@ -102,3 +102,37 @@ def test_torch27_cuda_mean_golden(cols, rows, bits):
     )
     actual = module.legacy_mean(x)
     assert torch.all(actual.view(torch.int32) == bits)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Serving GPU penalty implementation")
+def test_generated_only_penalty_does_not_penalize_embedding_placeholders():
+    from dataclasses import dataclass
+
+    from vllm.v1.sample.sampler import Sampler
+
+    @dataclass
+    class Metadata:
+        prompt_token_ids: torch.Tensor
+        no_penalties: bool
+        presence_penalties: torch.Tensor
+        frequency_penalties: torch.Tensor
+        repetition_penalties: torch.Tensor
+
+    raw = torch.tensor([[3.0, 2.0, -1.0], [3.0, 2.0, -1.0]], device="cuda")
+    metadata = Metadata(
+        torch.ones((2, 7), device="cuda", dtype=torch.long),
+        False,
+        torch.zeros(2, device="cuda"),
+        torch.zeros(2, device="cuda"),
+        torch.full((2,), 1.05, device="cuda"),
+    )
+    clean = module.generated_only_sampling_metadata(metadata)
+    assert metadata.prompt_token_ids.shape == (2, 7)
+    assert clean.prompt_token_ids.shape == (2, 0)
+    actual = Sampler.apply_penalties(raw.clone(), clean, [[2], [1]])
+    expected = raw.clone()
+    expected[0, 2] *= metadata.repetition_penalties[0]
+    expected[1, 1] /= metadata.repetition_penalties[1]
+    assert torch.equal(actual, expected)
+    old = Sampler.apply_penalties(raw.clone(), metadata, [[2], [1]])
+    assert old[0, 1] != expected[0, 1]

@@ -8,6 +8,7 @@ including replay after preemption. Unsupported engine settings fail at startup.
 
 import os
 import types
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -159,6 +160,10 @@ def install(talker, config):
         attention.forward = types.MethodType(attention_forward, attention)
     install_predictor(talker.code_predictor)
     talker.talker_mtp_graph_safe = False
+    # Embedding prompts carry placeholder IDs, not spoken codec history.
+    talker.sampling_ignores_prompt_ids = True
+    # Codec 0 is valid in the native checkpoint; only special IDs are suppressed.
+    talker._codec_disallowed_mask[0] = False
 
 
 def install_predictor(predictor):
@@ -170,3 +175,10 @@ def install_predictor(predictor):
             module.forward = types.MethodType(norm_forward, module)
         elif isinstance(module, CodePredictorAttention):
             module._native_math = True
+
+
+def generated_only_sampling_metadata(metadata):
+    """Remove embedding-prompt placeholders without mutating engine metadata."""
+    if metadata.prompt_token_ids is None:
+        return metadata
+    return replace(metadata, prompt_token_ids=metadata.prompt_token_ids[:, :0])

@@ -20,6 +20,10 @@ The opt-in `SPRAG_QWEN_NATIVE_MATH=1` uses native BF16 residual, normalization,
 RoPE and all-16 codec reduction boundaries; reproduces Torch 2.7's FP32 mean
 addition tree; and explicitly selects Torch flash SDPA with repeated KV heads.
 The residual predictor stays eager. Its temperature division is FP32.
+Repetition penalties use generated codec history only, excluding the dummy IDs
+used to represent embedding prompts. Native codec token 0 remains available.
+Numerical parity is separate from pacing quality: the initial audition was
+reported as too rushed, so this remains an experimental listening baseline.
 `SPRAG_PRESERVE_RNG_STATE=1` bypasses vLLM startup/profile reseeding. Requests in
 the smoke test supply no seed. This image is for Qwen3-TTS only.
 
