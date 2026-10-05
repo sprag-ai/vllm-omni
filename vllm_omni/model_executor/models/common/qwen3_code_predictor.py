@@ -300,14 +300,23 @@ class CodePredictorAttention(nn.Module):
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                scale=self.scaling,
-                is_causal=True,
-                enable_gqa=self.is_gqa,
-            )
+            if getattr(self, "_native_math", False):
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                if self.is_gqa:
+                    k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                    v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    attn_out = F.scaled_dot_product_attention(q, k, v, scale=self.scaling, is_causal=True)
+            else:
+                attn_out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=self.scaling,
+                    is_causal=True,
+                    enable_gqa=self.is_gqa,
+                )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -747,6 +756,11 @@ class CodePredictorWrapper(nn.Module):
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
 
+        if getattr(self, "_native_math", False):
+            # Eager operations retain the audited BF16 cast/reduction boundaries.
+            self._compiled_model_fwd = self.model.forward
+            return
+
         # torch.compile fuses RMSNorm/RoPE in ways that lose float32
         # precision, compounding across AR steps. Use epilogue_fusion=False
         # to disable the problematic fusions while still getting kernel
@@ -763,6 +777,11 @@ class CodePredictorWrapper(nn.Module):
             logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
         else:
             logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
+
+    @staticmethod
+    def _temperature_logits(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        # HF promotes before temperature/top-k; BF16 scaling can merge candidates.
+        return logits.float() / temperature
 
     def _padded_bsz(self, bsz: int) -> int:
         """Round batch size up to nearest power-of-2 bucket."""
@@ -1046,7 +1065,6 @@ class CodePredictorWrapper(nn.Module):
             s_top_p = self._top_p
         else:
             use_sampling = do_sample and temperature > 0
-            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
             if use_sampling and top_p != 1.0:
                 raise NotImplementedError(
                     "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
@@ -1117,7 +1135,7 @@ class CodePredictorWrapper(nn.Module):
             else:
                 # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
                 if use_sampling:
-                    scaled = logits * inv_temperature
+                    scaled = self._temperature_logits(logits, temperature)
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))

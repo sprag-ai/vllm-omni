@@ -1,0 +1,58 @@
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 1
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169]
+custom_voice_dir: /voices
+stages:
+  - stage_id: 0
+    enforce_eager: true
+    gpu_memory_utilization: 0.30
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    max_num_seqs: 1
+    devices: "0"
+    engine_extras:
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+      repetition_penalty: 1.05
+      max_tokens: 4096
+      min_tokens: 2
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+  - stage_id: 1
+    gpu_memory_utilization: 0.60
+    enforce_eager: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    engine_extras:
+      enable_prefix_caching: false
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0
