@@ -513,6 +513,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speaker_cache=self._speaker_cache,
         )
         self._load_custom_voice_profiles()
+        from .native_math import enabled, install
+
+        self._native_math = enabled()
+        if self._native_math:
+            install(self, vllm_config)
 
     # -------------------- custom voice profiles --------------------
 
@@ -1308,6 +1313,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         embed_weight = self._stacked_codec_embed.to(device=dev)
         row_idx = torch.arange(max_steps, device=dev).unsqueeze(0).expand(bsz, -1)
         gathered = embed_weight[row_idx, residual_ids_t]
-        summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
+        if self._native_math:
+            # Preserve the single BF16 reduction over all 16 codec embeddings.
+            summed = torch.cat((last_id_hidden, gathered), dim=1).sum(dim=1, keepdim=True)
+        else:
+            summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)

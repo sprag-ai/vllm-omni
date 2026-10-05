@@ -1,0 +1,12 @@
+# Keep the vLLM/Torch/CUDA stack identical to the audited serving image.
+ARG BASE_IMAGE=vllm/vllm-omni@sha256:6f8be103eaf0055448cf7578cfd621405fd669079d4361bd58896326b2bf722a
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=uncommitted
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+WORKDIR /app/vllm-omni
+COPY . .
+# Do not resolve a different Torch/vLLM stack for this controlled experiment.
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.28.0 uv pip install --system --no-deps --no-cache-dir .
+RUN python3 docker/preserve_rng.py
+ENV SPRAG_QWEN_NATIVE_MATH=1 SPRAG_PRESERVE_RNG_STATE=1
+ENTRYPOINT ["vllm"]
