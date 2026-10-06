@@ -152,6 +152,10 @@ class OmniServeCommand(CLISubcommand):
                 # --no-guardrails is a CLI-only alias, not a diffusion engine arg.
                 args.explicit_keys = (explicit_keys - {"no_guardrails"}) | {"model_config"}
 
+        if getattr(args, "decision_bundle", None):
+            if args.headless or (getattr(args, "api_server_count", None) or 1) != 1:
+                raise ValueError("Decision serving requires one API server and cannot run headless")
+
         if args.headless:
             run_headless(args)
         elif (getattr(args, "api_server_count", None) or 1) > 1:
@@ -332,6 +336,18 @@ class OmniServeCommand(CLISubcommand):
             title="OmniConfig", description="Configuration for vLLM-Omni multi-stage and diffusion models."
         )
 
+        omni_config_group.add_argument(
+            "--decision-bundle",
+            type=str,
+            default=None,
+            help="Frozen native-audio decision bundle; serves completions and block-residual embeddings.",
+        )
+        omni_config_group.add_argument(
+            "--decision-max-pending",
+            type=int,
+            default=16,
+            help="Maximum admitted audio decision requests (active plus waiting).",
+        )
         omni_config_group.add_argument(
             "--omni",
             action="store_true",

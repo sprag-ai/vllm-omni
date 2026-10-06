@@ -96,7 +96,7 @@ class DecisionEngine:
 
     def decide(self, wave, threshold, sample_rate=16000, mode="auto"):
         wave = validate_wave(wave, threshold, sample_rate)
-        if mode not in ("auto", "head", "full"):
+        if mode not in ("auto", "head", "full", "raw", "embedding"):
             raise ValueError("Unknown execution mode")
         with self.lock:
             start = time.perf_counter()

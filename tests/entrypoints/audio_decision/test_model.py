@@ -52,3 +52,27 @@ def test_accept_skips_layers_reject_continues_same_forward():
     assert len(calls) == 3
     result = model.take_decision()
     assert result["used_full_decoder"] and result["decoder_depth"] == 3
+
+
+def test_embedding_is_logical_unnormalized_residual():
+    model = Qwen3OmniDecisionThinker.__new__(Qwen3OmniDecisionThinker)
+    nn.Module.__init__(model)
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[lambda p, h, r: (h + 2, h + 3)],
+            embed_input_ids=lambda _: torch.tensor([[1.0, 2.0], [4.0, 5.0]], dtype=torch.bfloat16),
+        )
+    )
+    model.decision_spec = {"depth": 1, "head_temperature": 1}
+    model.decision_head = {
+        "mean": torch.zeros(2, dtype=torch.float64),
+        "scale": torch.ones(2, dtype=torch.float64),
+        "weight": torch.zeros(2, 3, dtype=torch.float64),
+        "bias": torch.zeros(3, dtype=torch.float64),
+    }
+    model.decision_request = None
+    model.arm_decision(0.95, "embedding", "embedding")
+    model.forward(torch.ones(2, dtype=torch.long), torch.arange(2))
+    result = model.take_decision()
+    assert result["embedding"] == [13.0, 15.0]
+    assert not result["used_full_decoder"]

@@ -241,6 +241,12 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
 
     listen_address, sock = setup_openai_server(args, reuse_port=False)
 
+    if getattr(args, "decision_bundle", None):
+        from vllm_omni.entrypoints.openai.serving_decision import run_decision_server
+
+        await run_decision_server(args, sock, **uvicorn_kwargs)
+        return
+
     # Unified use of omni_run_server_worker, AsyncOmni automatically handles LLM and Diffusion models
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 

@@ -106,7 +106,7 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
     def arm_decision(self, threshold, request_id, mode="auto"):
         if self.decision_request is not None:
             raise RuntimeError("Previous decision has not been consumed")
-        if mode not in ("auto", "head", "full"):
+        if mode not in ("auto", "head", "full", "raw", "embedding"):
             raise ValueError("Unknown execution mode")
         self.decision_encoder_calls = 0
         self.decision_request = (float(threshold), request_id, mode)
@@ -139,16 +139,19 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
         fallback = True
         head_confidence = None
         self.decision_scores = None
+        embedding = None
         for index, layer in enumerate(decoder.layers):
             hidden, residual = layer(positions, hidden, residual)
             executed += 1
             if index + 1 == self.decision_spec["depth"]:
                 logical = hidden[-1] if residual is None else hidden[-1] + residual[-1]
+                if mode == "embedding":
+                    embedding = logical.float().cpu().tolist()
                 h = self.decision_head
                 scores = ((logical.double() - h["mean"]) / h["scale"]) @ h["weight"] + h["bias"]
                 scores = scores / self.decision_spec["head_temperature"]
                 head_confidence = float(torch.softmax(scores, dim=-1).max())
-                fallback = mode == "full" or (mode == "auto" and head_confidence < threshold)
+                fallback = mode in ("full", "raw") or (mode == "auto" and head_confidence < threshold)
                 if not fallback:
                     self.decision_scores = scores
                     break
@@ -163,6 +166,8 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
             "input_tokens": int(hidden.shape[0]),
             "audio_encoder_calls": self.decision_encoder_calls,
         }
+        if embedding is not None:
+            self.decision_result["embedding"] = embedding
         if inputs_embeds is not None:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden
@@ -174,7 +179,9 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
             raise RuntimeError("Decision serving requires exactly one complete request")
         if self.decision_scores is None:
             stock = super().compute_logits(hidden_states)
-            scores = stock[0, self.decision_ids].double() / self.decision_spec["full_temperature"]
+            scores = stock[0, self.decision_ids].double()
+            if self.decision_request[2] != "raw":
+                scores = scores / self.decision_spec["full_temperature"]
         else:
             scores = self.decision_scores
         probabilities = torch.softmax(scores, dim=-1)
@@ -186,6 +193,7 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
             action=actions[int(probabilities.argmax())],
             probabilities=dict(zip(actions, p)),
             confidence=max(p),
+            label_logprobs=torch.log_softmax(scores, dim=-1).cpu().tolist(),
         )
         logits = torch.full(
             (1, self.config.text_config.vocab_size),

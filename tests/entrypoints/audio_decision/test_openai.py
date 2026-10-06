@@ -1,0 +1,189 @@
+# SPDX-License-Identifier: Apache-2.0
+import asyncio
+import base64
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import numpy as np
+import soundfile as sf
+from fastapi.testclient import TestClient
+
+from vllm_omni.entrypoints.openai.serving_decision import DecisionServing, build_decision_app
+
+
+def args():
+    return SimpleNamespace(
+        disable_fastapi_docs=False,
+        enable_offline_docs=False,
+        root_path="",
+        allowed_origins=["*"],
+        allow_credentials=False,
+        allowed_methods=["*"],
+        allowed_headers=["*"],
+        api_key=["test-secret"],
+        enable_request_id_headers=True,
+        middleware=[],
+        served_model_name=["test-model"],
+        decision_max_pending=1,
+        enable_server_load_tracking=True,
+        disable_log_stats=True,
+        log_error_stack=True,
+    )
+
+
+def body():
+    f = io.BytesIO()
+    sf.write(f, np.zeros(1600), 16000, format="WAV")
+    return {
+        "model": "test-model",
+        "prompt": "audio_turn_decision",
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": 3,
+        "input_audio": {"format": "wav", "data": base64.b64encode(f.getvalue()).decode()},
+    }
+
+
+class Engine:
+    config = {"prompt": "frozen prompt", "actions": ["keep_listening", "respond", "insufficient_evidence"]}
+    token_ids = [32, 33, 34]
+
+    def decide(self, wave, threshold, mode="auto"):
+        p = [0.1, 0.8, 0.1]
+        result = {
+            "action": "respond",
+            "label_logprobs": np.log(p).tolist(),
+            "probabilities": dict(zip(self.config["actions"], p)),
+            "input_tokens": 40,
+            "decoder_depth": 24 if mode in ("head", "embedding") else 48,
+            "audio_seconds": len(wave) / 16000,
+            "audio_encoder_calls": 1,
+            "elapsed_ms": 1,
+            "threshold": threshold,
+            "mode": mode,
+        }
+        if mode == "embedding":
+            result["embedding"] = [1.25, -2.5, 3.0]
+        return result
+
+
+def test_actual_upstream_routes_and_openai_formats():
+    app = build_decision_app(args(), Engine())
+    routes = {r.path: r for r in app.routes}
+    assert routes["/v1/completions"].endpoint.__module__ == "vllm.entrypoints.openai.completion.api_router"
+    assert routes["/v1/embeddings"].endpoint.__module__ == "vllm.entrypoints.pooling.embed.api_router"
+    assert "/v1/decide" not in routes
+    headers = {"Authorization": "Bearer test-secret"}
+    with TestClient(app) as c:
+        assert c.post("/v1/completions", json=body()).status_code == 401
+        assert c.get("/health").status_code == 200
+        assert c.get("/v1/models", headers=headers).json()["data"][0]["id"] == "test-model"
+        r = c.post("/v1/completions", json=body(), headers=headers)
+        assert r.status_code == 200, r.text
+        out = r.json()
+        assert out["object"] == "text_completion" and out["choices"][0]["text"] == "B"
+        assert out["decision"]["mode"] == "raw"
+        assert np.isclose(sum(np.exp(list(out["choices"][0]["logprobs"]["top_logprobs"][0].values()))), 1)
+        b = {
+            "model": "test-model",
+            "input": "audio_turn_decision",
+            "input_audio": body()["input_audio"],
+            "encoding_format": "float",
+        }
+        r = c.post("/v1/embeddings", json=b, headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["data"][0]["embedding"] == [1.25, -2.5, 3.0]
+        b["encoding_format"] = "base64"
+        r = c.post("/v1/embeddings", json=b, headers=headers)
+        assert np.array_equal(
+            np.frombuffer(base64.b64decode(r.json()["data"][0]["embedding"]), dtype="<f4"), [1.25, -2.5, 3]
+        )
+        assert c.get("/load").json()["server_load"] == 0
+
+
+def test_invalid_options_audio_and_queue(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    engine = Engine()
+    original = engine.decide
+
+    def delayed(*a, **k):
+        entered.set()
+        assert release.wait(10)
+        return original(*a, **k)
+
+    headers = {"Authorization": "Bearer test-secret"}
+    with TestClient(build_decision_app(args(), engine)) as c:
+        for change in (
+            {"model": "other"},
+            {"prompt": "silently ignored prompt"},
+            {"max_tokens": 2},
+            {"stream": True},
+            {"temperature": 0.5},
+            {"allowed_token_ids": [32]},
+            {"decision_threshold": True},
+            {"logprobs": 4},
+            {"decision_mode": "oops"},
+            {"top_p": 0.5},
+            {"input_audio": {"data": "???", "format": "wav"}},
+            {"input_audio": {"url": "file:///etc/passwd"}},
+        ):
+            r = c.post("/v1/completions", json={**body(), **change}, headers=headers)
+            assert r.status_code == 400, (change, r.text)
+        for change in ({"input": ["", ""]}, {"dimensions": 2}, {"encoding_format": "bytes"}):
+            b = {"model": "test-model", "input": "audio_turn_decision", "input_audio": body()["input_audio"], **change}
+            assert c.post("/v1/embeddings", json=b, headers=headers).status_code == 400
+        monkeypatch.setattr(engine, "decide", delayed)
+        with ThreadPoolExecutor(1) as p:
+            f = p.submit(c.post, "/v1/completions", json=body(), headers=headers)
+            assert entered.wait(10)
+            assert c.post("/v1/completions", json=body(), headers=headers).status_code == 429
+            release.set()
+            assert f.result().status_code == 200
+        assert c.post("/v1/completions", json=body(), headers=headers).status_code == 200
+
+
+def test_disconnect_holds_admission_until_worker_done():
+    async def run():
+        entered, release = threading.Event(), threading.Event()
+        engine = Engine()
+        original = engine.decide
+
+        def delayed(*a, **k):
+            entered.set()
+            assert release.wait(10)
+            return original(*a, **k)
+
+        engine.decide = delayed
+        handler = DecisionServing(engine, "test-model", 1)
+        job = asyncio.create_task(handler.infer(body(), "head", 0.95))
+        await asyncio.to_thread(entered.wait, 5)
+        job.cancel()
+        try:
+            await job
+        except asyncio.CancelledError:
+            pass
+        assert handler.pending == 1
+        assert (await handler.infer(body(), "head", 0.95)).error.code == 429
+        release.set()
+        await handler.close()
+        await asyncio.sleep(0)
+        assert handler.pending == 0
+
+    asyncio.run(run())
+
+
+def test_launcher_shutdown_and_watchdog_contract():
+    from vllm.entrypoints.launchers.launcher import terminate_if_errored
+
+    handler = DecisionServing(Engine(), "test-model")
+    server = SimpleNamespace(should_exit=False)
+    terminate_if_errored(server, handler)
+    assert handler.is_running and not server.should_exit
+    handler.errored = True
+    terminate_if_errored(server, handler)
+    assert server.should_exit and not handler.is_running
+    handler.shutdown(timeout=10)
+    handler.shutdown(timeout=10)
+    assert handler.closed and handler._stopped
