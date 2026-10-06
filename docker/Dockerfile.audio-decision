@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=vllm/vllm-omni:v0.30.0@sha256:fc77cfaac7b1b43c30cbf32eaea214864434c6e0f303e6e9eb9f64104241a994
+FROM ${BASE_IMAGE}
+WORKDIR /opt/vllm-omni-decision
+COPY . .
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.30.0 uv pip install --system --no-deps --no-build-isolation .
+ENV HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false VLLM_ENABLE_V1_MULTIPROCESSING=0
+EXPOSE 8000
+ENTRYPOINT ["python3", "-m", "vllm_omni.entrypoints.audio_decision.server"]
