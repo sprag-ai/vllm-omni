@@ -7,21 +7,23 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import queue
 import threading
 import time
 import uuid
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import janus
 import torch
 from vllm import envs as vllm_envs
 from vllm.logger import init_logger
+from vllm.model_executor.models.registry import ModelRegistry
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
@@ -58,6 +60,10 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
@@ -71,6 +77,52 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class _CapabilityTask:
+    """A logical check for whether a ``StagePool`` supports a task."""
+
+    task: str
+    probe: Callable[[str | list[str], ModelConfig], bool]
+    eligible: Callable[[StageClient], bool]
+
+    def check(self, pool: StagePool) -> bool:
+        """Whether this pool's stage serves the task: an eligible stage running a capable model."""
+        client = pool.stage_client
+        if client is None or not self.eligible(client):
+            return False
+
+        # Diffusion-stage pools carry no vLLM config; nothing to probe.
+        if (model_config := getattr(pool.stage_vllm_config, "model_config", None)) is None:
+            return False
+
+        try:
+            return bool(self.probe(model_config.architectures, model_config))
+        except Exception:
+            logger.debug(
+                "Could not probe %s for %s",
+                getattr(self.probe, "__name__", self.probe),
+                getattr(model_config, "model", "<unknown>"),
+                exc_info=True,
+            )
+            return False
+
+
+_MODEL_CAPABILITY_TASKS: tuple[_CapabilityTask, ...] = (
+    # SupportsTranscription -> /v1/audio/transcriptions, /v1/audio/translations.
+    _CapabilityTask(
+        task="transcription",
+        probe=ModelRegistry.is_transcription_model,
+        eligible=lambda client: getattr(client, "is_comprehension", False),
+    ),
+)
+
+
+def _derive_capability_tasks(stage_pools: Sequence[StagePool]) -> set[str]:
+    """Tasks a stage topology serves because a stage's model implements the capability."""
+    return {rule.task for rule in _MODEL_CAPABILITY_TASKS if any(rule.check(pool) for pool in stage_pools)}
+
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
@@ -429,6 +481,7 @@ class OmniEngineBase:
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
+        supported_tasks |= _derive_capability_tasks(self.stage_pools)
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(
