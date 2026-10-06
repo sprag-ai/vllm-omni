@@ -1,0 +1,92 @@
+# Manually push audio-decision-build/<name> after merging into the prototype branch.
+# A tag trigger works without installing workflow_dispatch on the upstream-mirror main.
+name: Native audio prototype image
+
+on:
+  push:
+    tags:
+      - 'audio-decision-build/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-audio-prototype-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'sprag-ai/vllm-omni'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate source and derive image name
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD origin/prototype/audio-decision-v030
+          base="$(sed -n 's/^ARG BASE_IMAGE=\(.*\)$/\1/p' docker/Dockerfile.audio-decision-openai)"
+          [[ "$base" =~ ^vllm/vllm-omni:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[a-f0-9]{64}$ ]] || {
+            echo '::error::Expected a versioned, digest-pinned vLLM-Omni base'
+            exit 1
+          }
+          version="${base%@*}"
+          version="${version##*:}"
+          commit="$(git rev-parse HEAD)"
+          image="ghcr.io/sprag-ai/native-audio-decision:${version}-audio-decision.${commit}"
+          echo "ref=$image" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the prototype registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and publish the prototype
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: docker/Dockerfile.audio-decision-openai
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/sprag-ai/vllm-omni
+            org.opencontainers.image.revision=${{ steps.image.outputs.commit }}
+            org.opencontainers.image.title=Native audio decision prototype
+
+      - name: Record published image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '### Native audio decision prototype'
+            echo
+            printf 'Image: %s\n\n' "$IMAGE"
+            printf 'Digest: %s\n\n' "$DIGEST"
+            echo 'Pin the digest for deployment. No deployment was performed.'
+          } >> "$GITHUB_STEP_SUMMARY"

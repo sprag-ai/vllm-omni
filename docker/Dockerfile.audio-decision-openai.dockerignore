@@ -3,3 +3,10 @@
 .ruff_cache
 **/__pycache__
 **/._*
+# Never include local credentials or frozen model assets in the image context.
+gha-creds-*.json
+.env
+.env.*
+bundle
+models
+*.gitbundle

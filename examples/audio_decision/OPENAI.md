@@ -5,6 +5,45 @@ request/response schemas, authentication, CORS and request-ID middleware. A froz
 decision handler serves `/v1/completions` and `/v1/embeddings` through one native
 vLLM-Omni Thinker engine. It does not start the separate `/v1/decide` server.
 
+## Separate prototype image builds
+
+The integration branch is `prototype/audio-decision-v030`. It is independent of
+`release/0.30`; `main` remains the upstream mirror. Merge the prototype PR there
+before requesting a build.
+
+A build is requested manually by pushing a tag at a reviewed prototype commit:
+
+```sh
+git fetch https://github.com/sprag-ai/vllm-omni.git prototype/audio-decision-v030
+git tag audio-decision-build/2026-10-06-1 FETCH_HEAD
+git push https://github.com/sprag-ai/vllm-omni.git refs/tags/audio-decision-build/2026-10-06-1
+```
+
+Choose a new build-tag name for each request. Normal branch pushes and PR updates
+never publish an image. The tag-triggered `Native audio prototype image` workflow
+works without adding a manual-dispatch workflow to `main`. It rejects commits
+outside the prototype branch history.
+
+Images are published to the separate GHCR package:
+
+```text
+ghcr.io/sprag-ai/native-audio-decision:v0.30.0-audio-decision.<full-commit-sha>
+```
+
+The version comes from the digest-pinned base in
+`docker/Dockerfile.audio-decision-openai`. The build uses the repository's
+`GITHUB_TOKEN` with `packages: write`; it needs no production registry credentials.
+Organization package-creation policy must permit this repository to publish. If
+the package already exists, grant this repository Actions write access to it.
+GHCR package visibility and pull access are managed separately from repository
+visibility; authenticate with a token with `read:packages` when required.
+
+The run summary records the image tag and digest. Rebuilding the same commit can
+replace that tag, so pin the digest for reproducibility. No moving `latest` tag
+is produced and nothing deploys automatically. Weights and the frozen decision
+bundle remain external mounts. The image is Linux amd64 and uses the same
+prototype Dockerfile as the local build below.
+
 ## Build and start
 
 ```sh
