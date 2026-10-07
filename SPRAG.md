@@ -16,13 +16,13 @@ Our code lives on a **release branch per upstream minor version**:
 
 ```
 main (upstream mirror)
-  └── release/0.28        <- every sprag patch for the v0.28 line; images are built from here
+  └── release/0.30        <- every sprag patch for the v0.30 line; images are built from here
         ├── feat/...      <- work in progress, merged in by PR
         └── feat/...
 ```
 
 One release branch is the integration point for a whole upstream line. A feature branch is
-short-lived: open a PR into `release/0.28`, merge, and the branch is done. Images are built only
+short-lived: open a PR into the release branch, merge, and the branch is done. Images are built only
 from `release/**`, so a feature branch never produces one — test by merging into the release branch
 and rolling **dev**, which is safe because nothing deploys automatically (see *Deploying*).
 
@@ -42,11 +42,16 @@ and the branch itself sits ~180 commits behind `main`. Do not merge it forward.
 ```
 <upstream base version>-sprag.<commit>
 
-v0.28.0-sprag.3bdf9321
+v0.30.0-sprag.3bdf9321
 └─ upstream ──┘      └── the release-branch commit that built it
 ```
 
 Published to `us-central1-docker.pkg.dev/steady-method-485022-e5/sprag-prod/vllm-omni`.
+
+The installed `vllm_omni` package reports `<upstream version>+sprag` (e.g. `0.30.0+sprag`), passed to the
+build as `VLLM_OMNI_VERSION_OVERRIDE`. PEP 440 has no `-sprag` form, so the local-version label carries it.
+Without the override the build context has no tags and the package would report a `0.1.devN` version that
+vLLM flags as mismatched.
 
 Both halves are load-bearing. The upstream half is read from `ARG BASE_IMAGE` in
 `docker/Dockerfile.cuda` rather than hardcoded in the workflow, so it cannot drift from the base
@@ -68,21 +73,26 @@ seed/clusters/us-west1/inference/models/symphony/values.yaml.gotmpl      # prod
 ```
 
 Dev and prod are pinned independently and are routinely on different tags. That separation is the
-reason a release-branch build is safe: merging into `release/0.28` can never move prod.
+reason a release-branch build is safe: merging into a release branch can never move prod.
 
 ## Publishing identity
 
-The workflow authenticates by Workload Identity Federation, with no long-lived key. The binding is
-scoped to **one repository and one ref**:
+The workflow authenticates by Workload Identity Federation, with no long-lived key, as
+`vllm-omni-ci@steady-method-485022-e5.iam.gserviceaccount.com`. The service account, its
+`roles/artifactregistry.writer` on `sprag-prod`, and its binding are managed in seed
+(`infra/envs/project`). The binding admits **any `release/*` branch of this repository and no other ref**:
 
 ```
 principalSet://iam.googleapis.com/projects/254791206063/locations/global/workloadIdentityPools/
-  github-actions/attribute.repository_ref/sprag-ai/vllm-omni@refs/heads/release/0.28
+  github-actions/attribute.release_repository/sprag-ai/vllm-omni
 ```
 
-so only a run on `release/0.28` can assume the pushing service account. A run on any other branch
-cannot publish even if the workflow were altered to try, which is the point: production pulls from
-`sprag-prod`, so "can push a branch" must not imply "can publish an image production pulls".
+`attribute.release_repository` is mapped on the pool's provider (seed `infra/bootstrap`) to the
+repository name when the token's ref is `refs/heads/release/*` and `none` otherwise; IAM matches
+attribute values exactly, so a prefix cannot be expressed in the binding itself. A run on any other
+branch cannot publish even if the workflow were altered to try: production pulls from `sprag-prod`, so
+"can push a branch" must not imply "can publish an image production pulls". Writer, not admin, so a
+compromised run can add images but cannot delete what production is running.
 
 The workflow's `if: startsWith(github.ref, 'refs/heads/release/')` guard is redundant with its
 branch filter; it is kept so a trigger added later cannot silently widen what publishes. The IAM
@@ -90,29 +100,17 @@ binding is the actual control.
 
 The workflow is push-triggered only. `workflow_dispatch` would have to live on the default branch to
 be selectable, and `main` is a clean upstream mirror, so there is no dispatcher to add. To rebuild
-without a new commit, re-run the previous run from the Actions UI: it replays against the same ref,
-which is a ref the IAM binding already allows.
+without a new commit, re-run the previous run from the Actions UI: it replays against the same ref.
 
 ## Cutting a new release branch
 
-When upstream ships a new minor version — say v0.29.0:
+When upstream ships a new minor version, say v0.31.0:
 
 1. Sync `main` from upstream (fast-forward).
-2. Branch `release/0.29` from `main`, then carry the sprag patches over from `release/0.28`.
-3. Point `ARG BASE_IMAGE` in `docker/Dockerfile.cuda` at `vllm/vllm-openai:v0.29.0`. The tag scheme
-   follows automatically; no workflow edit.
-4. Add the IAM binding for the new ref — this is the one manual step, and it is manual on purpose,
-   since it is the grant that lets a branch publish:
-
-```bash
-gcloud iam service-accounts add-iam-policy-binding \
-  vllm-omni-ci@steady-method-485022-e5.iam.gserviceaccount.com \
-  --project=steady-method-485022-e5 \
-  --role=roles/iam.workloadIdentityUser \
-  --member="principalSet://iam.googleapis.com/projects/254791206063/locations/global/workloadIdentityPools/github-actions/attribute.repository_ref/sprag-ai/vllm-omni@refs/heads/release/0.29"
-```
-
-5. Keep `release/0.28` until nothing pins its tags, then remove its binding.
+2. Branch `release/0.31` from `main`, then carry the sprag patches over from the previous release branch.
+3. Point `ARG BASE_IMAGE` in `docker/Dockerfile.cuda` at `vllm/vllm-openai:v0.31.0`. The image tag and
+   package version follow automatically; no workflow edit and no IAM change.
+4. Keep the previous release branch until nothing pins its tags.
 
 ## Repository configuration
 
@@ -122,9 +120,6 @@ Two repository secrets, both identifiers rather than credentials:
 | --- | --- |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/254791206063/locations/global/workloadIdentityPools/github-actions/providers/github` |
 | `GCP_SERVICE_ACCOUNT` | `vllm-omni-ci@steady-method-485022-e5.iam.gserviceaccount.com` |
-
-The service account needs `roles/artifactregistry.writer` on the `sprag-prod` repository — writer,
-not admin, so a compromised run can add images but cannot delete what production is running.
 
 ## Build cost
 

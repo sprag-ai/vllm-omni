@@ -4,9 +4,11 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import dataclasses
+import os
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,10 +28,14 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsRealtime,
+    SupportsTranscription,
 )
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeThinkerForConditionalGeneration as VllmQwen3OmniMoeThinker,
 )
 from vllm.model_executor.models.utils import (
     WeightsMapper,
@@ -63,6 +69,24 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.platforms import current_omni_platform
 
+_DEFAULT_AUDIO_CHUNK_S = 90
+"""Window in seconds that minimised corpus WER over 135 AMI SDM meetings (42.50%)."""
+
+_SPLIT_SEARCH_SAMPLES = 1600
+"""Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
+
+
+def _audio_chunk_seconds() -> int:
+    """Window in seconds, from ``SPRAG_AUDIO_CHUNK_S``; zero or negative disables chunking."""
+    raw = os.environ.get("SPRAG_AUDIO_CHUNK_S")
+    if raw is None:
+        return _DEFAULT_AUDIO_CHUNK_S
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_AUDIO_CHUNK_S
+
+
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
 
@@ -85,6 +109,9 @@ TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
+if TYPE_CHECKING:
+    from vllm.config import SpeechToTextConfig, SpeechToTextParams
+
 logger = init_logger(__name__)
 
 
@@ -102,6 +129,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsMRoPE,
     SupportsRealtime,
     SupportsQuant,
+    SupportsTranscription,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -134,6 +162,42 @@ class Qwen3OmniMoeForConditionalGeneration(
         apply_outer_quant_config_mapping(self)
 
     realtime_max_tokens = 64
+
+    # Speech-to-text serving resolves this composite class from the checkpoint
+    # architecture; transcription itself runs on the thinker stage, so the
+    # classmethods delegate to vLLM's thinker implementation.
+    supported_languages = VllmQwen3OmniMoeThinker.supported_languages
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> "SpeechToTextConfig":
+        """Enable chunking of long audio into ``max_audio_clip_s`` windows.
+
+        Upstream leaves ``min_energy_split_window_size`` None, which makes ``allow_audio_chunking``
+        False, so a long clip is transcribed as one generation. The model terminates early on those:
+        measured over 135 AMI SDM meetings it returned a median of 69 words against a 5761 word
+        reference, for a corpus WER of 100.35%.
+
+        Window size is the tunable part; sweeping it over that corpus (corpus WER, lower better)::
+
+            30s   48.41%      240s   51.50%
+            60s   43.03%      480s   51.31%
+            90s   42.50%      600s   55.28%
+            120s  53.75%      none  100.35%
+
+        90s is the measured optimum and the default. ``SPRAG_AUDIO_CHUNK_S`` overrides it; zero or a
+        negative value restores upstream's unchunked behaviour (upstream's splitter never terminates on a
+        zero window). The optimum comes from one corpus in one acoustic condition, which is why it stays
+        configurable rather than hardcoded.
+        """
+        base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
+        chunk_s = _audio_chunk_seconds()
+        if chunk_s <= 0:
+            return base
+        return dataclasses.replace(base, max_audio_clip_s=chunk_s, min_energy_split_window_size=_SPLIT_SEARCH_SAMPLES)
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
+        return VllmQwen3OmniMoeThinker.get_generation_prompt(stt_params)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -295,6 +359,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
+        tools: list[dict[str, Any]] | None = None,
+        speaker: str | None = None,
+        instructions: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -309,9 +376,54 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
+        if tools or instructions:
+            # Render through the model's own chat template (rather than the
+            # hardcoded f-string below) so the thinker gets the <tools>...</tools>
+            # system preamble and <tool_call></tool_call> output format it was
+            # trained on (see chat_template.json) when tools are present, and/or
+            # an actual system message when instructions are present - this is
+            # the same mechanism /v1/chat/completions already supports for this
+            # checkpoint, just never previously wired into the realtime audio-in
+            # path. When both are empty this renders byte-identical to the plain
+            # f-string below, so that path is untouched to keep this change
+            # scoped to the new capability.
+            #
+            # tokenizer.apply_chat_template() alone raises here: the tokenizer
+            # object itself has no .chat_template set. safe_apply_chat_template
+            # is the same helper vLLM's own /v1/chat/completions path uses to
+            # resolve the template from model_config before calling
+            # apply_chat_template - but its own auto-resolution
+            # (resolve_chat_template in vllm/renderers/hf.py) explicitly skips
+            # the AutoProcessor-based lookup whenever `tools` is given (its
+            # 2nd-priority path is gated on `tools is None`), and for this
+            # multimodal checkpoint the chat_template genuinely lives on the
+            # processor, not the raw tokenizer - so with tools set it falls
+            # through silently to vLLM's generic (non-tool-aware) fallback
+            # template instead of erroring. Passing the processor's own
+            # chat_template explicitly bypasses that broken auto-resolution
+            # (resolve_chat_template's 1st priority: an explicit template
+            # always wins and still respects `tools` when applying it).
+            from vllm.renderers.hf import safe_apply_chat_template
+
+            prompt_template = safe_apply_chat_template(
+                model_config,
+                tokenizer,
+                ([{"role": "system", "content": instructions}] if instructions else [])
+                + [{"role": "user", "content": audio_placeholder}],
+                tools=tools,
+                chat_template=processor.chat_template,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        else:
+            prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+        # Same shape /v1/chat/completions uses (serving_chat.py): a one-element
+        # list under "speaker" in additional_information, read back out by
+        # talker_preprocess_prefill via payload.get("speaker").
+        additional_information = {"speaker": [speaker]} if speaker else None
+        extra_prompt_kwargs = {"additional_information": additional_information} if additional_information else {}
 
         # In non-async-chunk (full-payload) mode the engine treats each
         # streaming TokensPrompt as a fresh decode, so mid-stream segment
@@ -328,6 +440,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         multi_modal_data={"audio": segment},
+                        **extra_prompt_kwargs,
                     )
 
         remaining = buffer.flush()
@@ -335,6 +448,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
                 multi_modal_data={"audio": remaining},
+                **extra_prompt_kwargs,
             )
 
     # ==================== Device utilities ====================
