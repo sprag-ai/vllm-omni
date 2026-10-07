@@ -77,7 +77,7 @@ _SPLIT_SEARCH_SAMPLES = 1600
 
 
 def _audio_chunk_seconds() -> int:
-    """Window in seconds, from ``SPRAG_AUDIO_CHUNK_S``; negative disables chunking."""
+    """Window in seconds, from ``SPRAG_AUDIO_CHUNK_S``; zero or negative disables chunking."""
     raw = os.environ.get("SPRAG_AUDIO_CHUNK_S")
     if raw is None:
         return _DEFAULT_AUDIO_CHUNK_S
@@ -184,13 +184,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             90s   42.50%      600s   55.28%
             120s  53.75%      none  100.35%
 
-        90s is the measured optimum and the default. ``SPRAG_AUDIO_CHUNK_S`` overrides it; a negative
-        value restores upstream's unchunked behaviour. The optimum comes from one corpus in one
-        acoustic condition, which is why it stays configurable rather than hardcoded.
+        90s is the measured optimum and the default. ``SPRAG_AUDIO_CHUNK_S`` overrides it; zero or a
+        negative value restores upstream's unchunked behaviour (upstream's splitter never terminates on a
+        zero window). The optimum comes from one corpus in one acoustic condition, which is why it stays
+        configurable rather than hardcoded.
         """
         base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
         chunk_s = _audio_chunk_seconds()
-        if chunk_s < 0:
+        if chunk_s <= 0:
             return base
         return dataclasses.replace(base, max_audio_clip_s=chunk_s, min_energy_split_window_size=_SPLIT_SEARCH_SAMPLES)
 
