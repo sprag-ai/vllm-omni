@@ -46,7 +46,9 @@ class Qwen3OmniDecisionThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
         scheduler = vllm_config.scheduler_config
         if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
             raise ValueError("Decision model supports TP=1 and PP=1 only")
-        if scheduler.max_num_seqs != 1 or scheduler.enable_chunked_prefill:
+        if scheduler.enable_chunked_prefill or (
+            scheduler.max_num_seqs != 1 and not getattr(vllm_config.model_config.hf_config, "decision_batched", False)
+        ):
             raise ValueError("Decision model requires one sequence and unchunked prefill")
         if vllm_config.cache_config.enable_prefix_caching or not vllm_config.model_config.enforce_eager:
             raise ValueError("Decision model requires eager execution without prefix caching")

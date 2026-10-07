@@ -70,9 +70,12 @@ this port does not refit or recalibrate it. Add `--api-key YOUR_KEY` for bearer
 authentication. Keep the port private unless you provide an appropriate deployment
 boundary. The existing `--served-model-name` and HTTP/TLS options apply.
 
-The execution policy is fixed to one sequence, one GPU, BF16, eager, unchunked
-prefill, no prefix cache and fresh audio encoding. `--gpu-memory-utilization`
-controls the memory allocation. Explicit engine flags such as `--dtype`,
+The execution policy uses one GPU, BF16, eager, unchunked prefills, no prefix
+cache and fresh audio encoding. Concurrent requests enter vLLM's `AsyncLLM`
+scheduler and can share a prefill batch. `--max-num-seqs` defaults to 8 (range
+1–32); `--max-num-batched-tokens` defaults to 2048 times that limit (range
+2048–65536). The model context remains 2048 tokens per request.
+`--gpu-memory-utilization` controls the memory allocation. Explicit engine flags such as `--dtype`,
 `--max-model-len`, `--seed`, `--enforce-eager`, tokenizer overrides and stage
 configuration are rejected at startup, including values supplied through
 `--config`. Omit them even when they match the frozen setting. TP and PP may
@@ -205,7 +208,8 @@ This implementation shares the validated one-prefill generation runner: it
 internally samples one label token and discards it for embedding responses.
 `decision.internal_sample_tokens=1` makes that cost explicit. It is not vLLM's
 dedicated pooling runner, does not free unused later-layer weights, and does not
-provide continuous batching. There is no autoregressive response generation or
+use a dedicated pooling schedule. Concurrent completion and embedding requests
+can share the same scheduler batch. There is no autoregressive response generation or
 incremental audio/KV streaming.
 
 ## Audio contract and supported task
@@ -214,7 +218,8 @@ All three endpoints accept inline base64 audio supported by the installed vLLM
 audio loader, up to 30 seconds and 12 MiB after base64 decoding. The adapter also
 bounds decoded PCM memory and requires a source rate of 8–192 kHz. Audio is
 downmixed and resampled to 16 kHz. No URL fetching, server-local file paths, transcript, labels, source IDs
-or provider IDs are accepted. Every call performs one fresh audio encoder pass.
+or provider IDs are accepted. Every call contributes one fresh audio item to the encoder batch; no decision
+result, prefix or audio-feature cache is reused between requests.
 
 Use `audio_turn_decision` or the exact bundled prompt as `prompt`/`input`.
 Arbitrary questions, text-only calls, batch arrays, streaming, different labels,
@@ -230,3 +235,43 @@ an unmodified text-only AnyJev client cannot supply this native-audio task.
 Readiness is `GET /health` (200), model discovery is `GET /v1/models`, and queued
 request load is `GET /load`. Unrelated generation routes are not advertised in
 this mode.
+
+## Async execution and batch diagnostics
+
+The server decodes audio in a bounded CPU thread pool, then awaits the async
+engine. It does not serialize GPU calls in a Python inference lock. A worker
+binds request metadata after the native scheduler compacts/reorders its batch,
+and the model reads each request's final prefill token. Thresholds, execution
+modes and results remain keyed to individual requests. `--decision-max-pending`
+continues to cap all admitted work, including disconnected requests while their
+inference drains.
+
+If every request accepts the early head, the batch exits at block 24. If any
+request needs full depth, the batch continues together; accepted requests still
+return their saved block-24 head scores. `decoder_depth` records the selected
+readout depth and `batch_decoder_depth` records the layers actually executed.
+`batch_size`, `audio_encoder_items`, `batch_audio_items` and
+`batch_audio_encoder_calls` distinguish per-request audio from shared encoder
+executions. The engine defaults to and requires `VLLM_BATCH_INVARIANT=1`:
+ordinary batch-dependent kernels changed a forced-head action in regression
+testing. FP64 response log-probabilities are computed on CPU because vLLM's
+invariant CUDA log-softmax does not support FP64. This kernel configuration
+can differ numerically from the legacy serial runtime; parity and performance
+must be measured on the target device. It does not imply Transformers parity.
+
+The audio tower groups recordings by their standalone convolution padding
+width. Otherwise, a longer recording changes a short recording's boundary
+features through biased convolutions. Long recordings still share an encoder
+batch; mixed short lengths may require several internal encoder groups. The
+decoder retains the native scheduler batch across those groups.
+With invariant mode enabled, the CUDA audio convolutions use unfold plus vLLM's
+invariant linear kernel; cuDNN's small-batch algorithm changed BF16 results in
+the third convolution despite identical inputs. This uses additional temporary
+workspace and must be included in target-device latency/memory validation.
+
+This path requires model runner V1 (`VLLM_USE_V2_MODEL_RUNNER=0`). Async HTTP
+admission and native scheduler batching are enabled; vLLM's separate
+`async_scheduling` option for CPU/GPU step pipelining remains disabled. Chunked
+prefill, speculative decoding, pipeline/tensor parallelism and incremental
+audio streaming remain unsupported. The standalone `/v1/decide` prototype
+continues to use its legacy serial engine.

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native-audio handlers attached to the existing OpenAI API routers.
 
-This opt-in server mode uses the frozen serial decision engine. It deliberately
+This opt-in server mode uses the frozen decision policy over AsyncLLM. It
 rejects unsupported generation/pooling options instead of silently ignoring them.
 """
 
@@ -23,7 +23,7 @@ from vllm.entrypoints.openai.completion.protocol import CompletionResponse
 from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse, ModelCard, ModelList
 
-from vllm_omni.entrypoints.audio_decision.engine import DecisionEngine
+from vllm_omni.entrypoints.audio_decision.async_engine import AsyncDecisionEngine
 from vllm_omni.entrypoints.audio_decision.server import MAX_BYTES, decode_audio
 from vllm_omni.entrypoints.openai.decision_protocol import (
     DecisionChatRequest,
@@ -109,7 +109,11 @@ class DecisionServing:
             raise ValueError("decision-max-pending must be positive")
         self.engine = engine
         self.model_name = model_name
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="decision-openai")
+        self.pool = ThreadPoolExecutor(
+            max_workers=4 if getattr(engine, "is_async", False) else 1, thread_name_prefix="decision-audio"
+        )
+        self.active = set()
+        self.loop = None
         self.pending = 0
         self.max_pending = max_pending
         self.closed = False
@@ -122,6 +126,14 @@ class DecisionServing:
     @property
     def is_running(self):
         return not self.closed and not self.errored
+
+    @property
+    def errored(self):
+        return self._errored or getattr(self.engine, "errored", False)
+
+    @errored.setter
+    def errored(self, value):
+        self._errored = value
 
     async def check_health(self):
         if not self.is_running:
@@ -173,7 +185,8 @@ class DecisionServing:
                 raise ValueError("Raw residual embeddings cannot be truncated with dimensions")
 
     async def infer(self, body, mode, threshold):
-        if self.closed:
+        self.loop = asyncio.get_running_loop()
+        if self.closed or self.errored:
             return error("Decision engine unavailable", 503)
         if self.pending >= self.max_pending:
             return error("Decision queue is full", 429)
@@ -184,12 +197,31 @@ class DecisionServing:
                 wave = parse_audio(body)
                 return self.engine.decide(wave, threshold, mode=mode)
 
-            future = asyncio.get_running_loop().run_in_executor(self.pool, execute)
+            if getattr(self.engine, "is_async", False):
+
+                async def execute_async():
+                    wave = await asyncio.get_running_loop().run_in_executor(self.pool, parse_audio, body)
+                    return await self.engine.decide(wave, threshold, mode=mode)
+
+                future = asyncio.create_task(execute_async())
+            else:
+                future = asyncio.get_running_loop().run_in_executor(self.pool, execute)
+            self.active.add(future)
         except BaseException:
             self.pending -= 1
             raise
+
         # HTTP cancellation must not admit another request while its GPU job runs.
-        future.add_done_callback(lambda _: setattr(self, "pending", self.pending - 1))
+        def completed(done):
+            self.active.discard(done)
+            self.pending -= 1
+            # Observe failures even when the HTTP waiter already disconnected.
+            if not done.cancelled():
+                failure = done.exception()
+                if failure is not None and not isinstance(failure, ValueError):
+                    self.errored = True
+
+        future.add_done_callback(completed)
         try:
             return await asyncio.shield(future)
         except ValueError as e:
@@ -291,7 +323,19 @@ class DecisionServing:
         # Do not present this as normalized embeddings or a decision distribution.
         metadata = {
             k: result[k]
-            for k in ("decoder_depth", "audio_seconds", "input_tokens", "audio_encoder_calls", "elapsed_ms")
+            for k in (
+                "decoder_depth",
+                "audio_seconds",
+                "input_tokens",
+                "audio_encoder_calls",
+                "elapsed_ms",
+                "batch_decoder_depth",
+                "batch_size",
+                "audio_encoder_items",
+                "batch_audio_encoder_calls",
+                "batch_audio_items",
+            )
+            if k in result
         }
         metadata.update(normalized=False, representation="last_token_post_block_residual", internal_sample_tokens=1)
         response = DecisionEmbeddingResponse(
@@ -310,14 +354,38 @@ class DecisionServing:
             if self._stopped:
                 return
             self.closed = True
+            if (
+                timeout > 0
+                and getattr(self.engine, "is_async", False)
+                and self.loop is not None
+                and self.loop.is_running()
+            ):
+                # The upstream launcher calls shutdown in its executor before
+                # ASGI lifespan teardown. CPU pool draining alone cannot wait
+                # for AsyncLLM jobs, so drain them on their owning event loop.
+                drain = asyncio.run_coroutine_threadsafe(self.drain(), self.loop)
+                try:
+                    drain.result(timeout=timeout)
+                except TimeoutError:
+                    drain.cancel()
             self.pool.shutdown(wait=True, cancel_futures=False)
-            llm = getattr(self.engine, "llm", None)
-            if llm is not None:
-                llm.llm_engine.engine_core.shutdown()
+            if getattr(self.engine, "is_async", False):
+                self.engine.shutdown()
+            else:
+                llm = getattr(self.engine, "llm", None)
+                if llm is not None:
+                    llm.llm_engine.engine_core.shutdown()
             self._stopped = True
 
+    async def drain(self):
+        if self.active:
+            await asyncio.gather(*(asyncio.shield(f) for f in tuple(self.active)), return_exceptions=True)
+
     async def close(self):
-        await asyncio.to_thread(self.shutdown)
+        self.closed = True
+        if self.active:
+            await asyncio.wait(tuple(self.active), timeout=self.vllm_config.shutdown_timeout)
+        await asyncio.to_thread(self.shutdown, timeout=0)
 
 
 def build_decision_app(args, engine):
@@ -392,10 +460,17 @@ async def run_decision_server(args, sock, **uvicorn_kwargs):
     import vllm.envs as envs
     from vllm.entrypoints.launchers.launcher import serve_http
 
-    # The current model's side-channel is deliberately single-request; fail early.
+    # The FP32 adapter layout requires one tensor/pipeline rank.
     if getattr(args, "tensor_parallel_size", 1) != 1 or getattr(args, "pipeline_parallel_size", 1) != 1:
         raise ValueError("Decision mode supports TP=1 and PP=1 only")
-    engine = DecisionEngine(args.model, args.decision_bundle, args.gpu_memory_utilization)
+    keys = args.explicit_keys
+    engine = AsyncDecisionEngine(
+        args.model,
+        args.decision_bundle,
+        args.gpu_memory_utilization,
+        max_num_seqs=args.max_num_seqs if "max_num_seqs" in keys else 8,
+        max_num_batched_tokens=args.max_num_batched_tokens if "max_num_batched_tokens" in keys else None,
+    )
     app = build_decision_app(args, engine)
     shutdown_task = await serve_http(
         app,

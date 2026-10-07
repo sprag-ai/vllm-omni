@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import vllm.envs as envs
 from transformers import PretrainedConfig
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeConfig,
@@ -351,6 +352,24 @@ class Qwen3OmniMoeAudioEncoderLayer(_Qwen3OmniMoeAudioEncoderLayer):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
 
+def audio_conv2d_batch_invariant(inputs, conv):
+    """Express this audio tower's ungrouped convolution as invariant GEMM."""
+    from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
+
+    if conv.groups != 1 or conv.padding_mode != "zeros":
+        raise ValueError("Invariant audio convolution requires groups=1 and zero padding")
+    patches = F.unfold(inputs, conv.kernel_size, conv.dilation, conv.padding, conv.stride)
+    rows = patches.transpose(1, 2).reshape(-1, patches.shape[1])
+    output = linear_batch_invariant(rows, conv.weight.flatten(1), conv.bias)
+    height, width = [
+        (size + 2 * padding - dilation * (kernel - 1) - 1) // stride + 1
+        for size, padding, dilation, kernel, stride in zip(
+            inputs.shape[-2:], conv.padding, conv.dilation, conv.kernel_size, conv.stride
+        )
+    ]
+    return output.view(inputs.shape[0], height, width, conv.out_channels).permute(0, 3, 1, 2).contiguous()
+
+
 class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
     """Subclass that adds quant_config support to the audio encoder."""
 
@@ -440,7 +459,36 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
+        # Match each recording's standalone convolution padding. Padding a
+        # short recording to another recording's longer chunk is not neutral:
+        # biased convolution + GELU creates nonzero values beyond its boundary
+        # before the next convolution, and also changes its attention window.
+        # Full-window recordings still share one native encoder batch.
+        lengths = feature_lens.tolist()
+        groups = {}
+        for index, length in enumerate(lengths):
+            groups.setdefault(min(length, self.n_window * 2), []).append(index)
+        if len(groups) == 1:
+            return self._forward_same_padding(input_features, feature_lens, aftercnn_lens)
+        features = input_features.split(lengths, dim=-1)
+        outputs = [None] * len(lengths)
+        for indices in groups.values():
+            group_output = self._forward_same_padding(
+                torch.cat([features[i] for i in indices], dim=-1),
+                feature_lens[indices],
+                aftercnn_lens[indices],
+            )
+            for index, output in zip(indices, group_output.split(aftercnn_lens[indices].tolist())):
+                outputs[index] = output
+        return torch.cat(outputs)
+
+    def _forward_same_padding(self, input_features, feature_lens, aftercnn_lens):
         import torch.nn.functional as F
+
+        def convolve(layer, inputs):
+            if envs.VLLM_BATCH_INVARIANT and inputs.is_cuda:
+                return audio_conv2d_batch_invariant(inputs, layer)
+            return layer(inputs)
 
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -464,15 +512,15 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         padded_feature = padded_feature.unsqueeze(1)
 
         if padded_feature.size(0) <= self.conv_chunksize:
-            padded_embed = F.gelu(self.conv2d1(padded_feature))
-            padded_embed = F.gelu(self.conv2d2(padded_embed))
-            padded_embed = F.gelu(self.conv2d3(padded_embed))
+            padded_embed = F.gelu(convolve(self.conv2d1, padded_feature))
+            padded_embed = F.gelu(convolve(self.conv2d2, padded_embed))
+            padded_embed = F.gelu(convolve(self.conv2d3, padded_embed))
         else:
             padded_embeds = []
             for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-                padded_embed = F.gelu(self.conv2d1(chunk))
-                padded_embed = F.gelu(self.conv2d2(padded_embed))
-                padded_embed = F.gelu(self.conv2d3(padded_embed))
+                padded_embed = F.gelu(convolve(self.conv2d1, chunk))
+                padded_embed = F.gelu(convolve(self.conv2d2, padded_embed))
+                padded_embed = F.gelu(convolve(self.conv2d3, padded_embed))
                 padded_embeds.append(padded_embed)
             padded_embed = torch.cat(padded_embeds, dim=0)
 
