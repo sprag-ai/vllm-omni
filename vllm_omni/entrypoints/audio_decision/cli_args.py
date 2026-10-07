@@ -17,6 +17,8 @@ SUPPORTED_DECISION_ARGS = frozenset(
         "decision_bundle",
         "decision_max_pending",
         "gpu_memory_utilization",
+        "max_num_seqs",
+        "max_num_batched_tokens",
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "api_server_count",
@@ -59,7 +61,8 @@ def validate_decision_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"Unsupported options with --decision-bundle: {flags}. "
             "Decision engine settings are frozen (BF16, max-model-len=2048, eager, seed=17); "
-            "only --gpu-memory-utilization is a configurable engine option. Remove the unsupported options."
+            "configurable engine options are --gpu-memory-utilization, --max-num-seqs and "
+            "--max-num-batched-tokens. Remove the unsupported options."
         )
     if getattr(args, "tensor_parallel_size", 1) != 1 or getattr(args, "pipeline_parallel_size", 1) != 1:
         raise ValueError("Decision mode supports TP=1 and PP=1 only")

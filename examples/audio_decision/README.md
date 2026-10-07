@@ -1,4 +1,7 @@
-# Native audio decision API (vLLM-Omni 0.30.0)
+# Standalone native audio decision prototype (vLLM-Omni 0.30.0)
+
+This page describes the legacy serial `/v1/decide` server. For the async,
+batched OpenAI endpoints, see [OPENAI.md](OPENAI.md).
 
 This is a single-GPU, audio-in/decision-out service for the frozen runtime26
 conversational-turn model. It runs the **native vLLM-Omni Qwen3-Omni Thinker** on
