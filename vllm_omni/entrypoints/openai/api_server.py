@@ -239,6 +239,9 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer", skip_if_decorated=True)
 
+    from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
+
+    validate_decision_args(args)
     listen_address, sock = setup_openai_server(args, reuse_port=False)
 
     if getattr(args, "decision_bundle", None):

@@ -67,7 +67,12 @@ boundary. The existing `--served-model-name` and HTTP/TLS options apply.
 
 The execution policy is fixed to one sequence, one GPU, BF16, eager, unchunked
 prefill, no prefix cache and fresh audio encoding. `--gpu-memory-utilization`
-controls the memory allocation. The decision engine does not expose the general
+controls the memory allocation. Explicit engine flags such as `--dtype`,
+`--max-model-len`, `--seed`, `--enforce-eager`, tokenizer overrides and stage
+configuration are rejected at startup, including values supplied through
+`--config`. Omit them even when they match the frozen setting. TP and PP may
+only be explicitly set to 1. Supported HTTP/authentication/TLS options continue
+to apply. The decision engine does not expose the general
 vLLM model/sampling/parallelism configuration. `--decision-max-pending 16` bounds
 active plus queued inference requests; overflow returns 429.
 
