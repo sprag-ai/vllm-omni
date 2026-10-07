@@ -4,7 +4,7 @@
 import torch
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_omni.entrypoints.audio_decision.model import Qwen3OmniDecisionThinker
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_decision_base import Qwen3OmniDecisionThinker
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerDummyInputsBuilder,
     Qwen3OmniMoeThinkerMultiModalProcessor,
@@ -89,7 +89,6 @@ class Qwen3OmniBatchedDecisionThinker(Qwen3OmniDecisionThinker):
                 "threshold": request["threshold"],
                 "input_tokens": lengths[index],
                 "batch_size": len(requests),
-                "audio_encoder_items": 1,
                 "batch_audio_encoder_calls": self.decision_encoder_calls,
                 "batch_audio_items": self.batch_audio_items,
             }

@@ -250,18 +250,21 @@ If every request accepts the early head, the batch exits at block 24. If any
 request needs full depth, the batch continues together; accepted requests still
 return their saved block-24 head scores. `decoder_depth` records the selected
 readout depth and `batch_decoder_depth` records the layers actually executed.
-`batch_size`, `audio_encoder_items`, `batch_audio_items` and
-`batch_audio_encoder_calls` distinguish per-request audio from shared encoder
-executions. The engine defaults to and requires `VLLM_BATCH_INVARIANT=1`:
+`batch_size`, `batch_audio_items` and `batch_audio_encoder_calls` report
+the scheduler batch size, measured audio item count and encoder executions.
+The worker requires one freshly encoded item per scheduled request.
+The engine defaults to and requires `VLLM_BATCH_INVARIANT=1`:
 ordinary batch-dependent kernels changed a forced-head action in regression
 testing. FP64 response log-probabilities are computed on CPU because vLLM's
 invariant CUDA log-softmax does not support FP64. This kernel configuration
 can differ numerically from the legacy serial runtime; parity and performance
 must be measured on the target device. It does not imply Transformers parity.
 
-The audio tower groups recordings by their standalone convolution padding
-width. Otherwise, a longer recording changes a short recording's boundary
-features through biased convolutions. Long recordings still share an encoder
+With `VLLM_BATCH_INVARIANT=1`, the audio tower groups recordings by their
+standalone convolution padding width. Ordinary serving with invariant mode
+disabled retains the existing encoder batching behavior. Grouping prevents a
+longer recording from changing a short recording's boundary features through
+biased convolutions. Long recordings still share an encoder
 batch; mixed short lengths may require several internal encoder groups. The
 decoder retains the native scheduler batch across those groups.
 With invariant mode enabled, the CUDA audio convolutions use unfold plus vLLM's

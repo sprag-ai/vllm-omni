@@ -66,7 +66,7 @@ class DecisionEngine:
         self.token_ids = [v[0] for v in ids]
         ModelRegistry.register_model(
             "Qwen3OmniDecisionThinker",
-            "vllm_omni.entrypoints.audio_decision.model:Qwen3OmniDecisionThinker",
+            "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_decision_base:Qwen3OmniDecisionThinker",
         )
         self.llm = LLM(
             model=model,

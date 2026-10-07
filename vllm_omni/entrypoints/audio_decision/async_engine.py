@@ -23,7 +23,6 @@ class AsyncDecisionEngine:
 
         from transformers import Qwen3OmniMoeProcessor
         from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.model_executor.models import ModelRegistry
         from vllm.v1.engine.async_llm import AsyncLLM
 
         if not 1 <= max_num_seqs <= 32:
@@ -58,10 +57,6 @@ class AsyncDecisionEngine:
         for letter, token in zip(("A", "B", "C"), self.token_ids):
             if tokenizer.encode(self.rendered + letter, add_special_tokens=False) != prefix + [token]:
                 raise RuntimeError("Action token boundary changed")
-        ModelRegistry.register_model(
-            "Qwen3OmniBatchedDecisionThinker",
-            "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_decision:Qwen3OmniBatchedDecisionThinker",
-        )
         args = AsyncEngineArgs(
             model=model,
             tokenizer=model,
@@ -124,8 +119,6 @@ class AsyncDecisionEngine:
             consumed = True
             if not result or result["request_id"] != request_id:
                 raise RuntimeError("Worker decision did not match the request")
-            if result["audio_encoder_items"] != 1 or result["batch_audio_items"] != result["batch_size"]:
-                raise RuntimeError("Decision audio encoder accounting mismatch")
             expected = self.token_ids[self.config["actions"].index(result["action"])]
             if output is None or list(output.outputs[0].token_ids) != [expected]:
                 raise RuntimeError("Sampler and decision head disagree")

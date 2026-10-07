@@ -459,6 +459,8 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
+        if not envs.VLLM_BATCH_INVARIANT:
+            return self._forward_same_padding(input_features, feature_lens, aftercnn_lens)
         # Match each recording's standalone convolution padding. Padding a
         # short recording to another recording's longer chunk is not neutral:
         # biased convolution + GELU creates nonzero values beyond its boundary

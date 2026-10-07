@@ -6,10 +6,10 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.entrypoints.audio_decision.model import Qwen3OmniDecisionThinker
 from vllm_omni.entrypoints.audio_decision.worker import decision_batch
 from vllm_omni.entrypoints.openai.serving_decision import DecisionServing
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_decision import Qwen3OmniBatchedDecisionThinker
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_decision_base import Qwen3OmniDecisionThinker
 
 
 def fake_model(requests):
@@ -198,7 +198,7 @@ def test_embedding_accepts_batch_encoder_accounting():
         def decide(self, *a, **kw):
             result = super().decide(*a, **kw)
             result.pop("audio_encoder_calls")
-            result.update(batch_size=3, audio_encoder_items=1, batch_audio_encoder_calls=1, batch_audio_items=3)
+            result.update(batch_size=3, batch_audio_encoder_calls=1, batch_audio_items=3)
             return result
 
     f = io.BytesIO()
@@ -311,7 +311,8 @@ def test_upstream_executor_shutdown_drains_async_jobs(monkeypatch):
     asyncio.run(run())
 
 
-def test_audio_encoder_mixed_lengths_preserve_standalone_padding():
+def test_audio_encoder_mixed_lengths_preserve_standalone_padding(monkeypatch):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import Qwen3OmniMoeAudioEncoder
 
     class Linear(nn.Linear):
@@ -349,8 +350,11 @@ def test_audio_encoder_mixed_lengths_preserve_standalone_padding():
         )
         combined = tower(features, lengths, output_lengths)
         legacy = tower._forward_same_padding(features, lengths, output_lengths)
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+        default = tower(features, lengths, output_lengths)
     torch.testing.assert_close(combined, individual, rtol=1e-5, atol=1e-7)
     assert float((legacy - individual).abs().max()) > 1e-5
+    torch.testing.assert_close(default, legacy, rtol=0, atol=0)
 
 
 def test_idle_engine_death_reaches_health_and_admission():
@@ -383,3 +387,109 @@ def test_invariant_audio_convolution_matches_conv2d_math(monkeypatch):
             conv = nn.Conv2d(2, 4, 3, stride=2, padding=1, dilation=dilation).double()
             inputs = torch.randn(shape, dtype=torch.float64)
             torch.testing.assert_close(audio_conv2d_batch_invariant(inputs, conv), conv(inputs), atol=1e-12, rtol=1e-12)
+
+
+def test_worker_rejects_measured_audio_count_mismatch():
+    requests = [{"request_id": "a", "input_tokens": 1, "mode": "auto", "threshold": 0.95}]
+    model, calls = fake_model(requests)
+    model.batch_audio_items = 0
+    with pytest.raises(RuntimeError, match="freshly encoded audio"):
+        model.forward(None, torch.arange(1), inputs_embeds=torch.zeros(1, 2))
+    assert not calls
+
+
+def test_shutdown_timeout_still_disposes_engine(monkeypatch):
+    from vllm_omni.entrypoints.openai import serving_decision
+
+    # Python 3.10's futures exception is distinct from built-in TimeoutError.
+    class SimulatedFuturesTimeoutError(Exception):
+        pass
+
+    events = []
+
+    class Drain:
+        def result(self, timeout):
+            events.append(("wait", timeout))
+            raise SimulatedFuturesTimeoutError()
+
+        def cancel(self):
+            events.append("cancel")
+
+    def submit(coroutine, loop):
+        coroutine.close()
+        return Drain()
+
+    monkeypatch.setattr(serving_decision, "FuturesTimeoutError", SimulatedFuturesTimeoutError)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    engine = SimpleNamespace(is_async=True, shutdown=lambda: events.append("shutdown"))
+    handler = DecisionServing(engine, "test")
+    handler.loop = SimpleNamespace(is_running=lambda: True)
+    handler.shutdown(timeout=0.01)
+    handler.shutdown(timeout=0.01)
+    assert events == [("wait", 0.01), "cancel", "shutdown"]
+    assert handler.closed and handler._stopped
+
+
+@pytest.mark.parametrize(
+    "failure", ["cancel_forward", "forward_error", "cancel_take", "take_error", "take_error_after_pop"]
+)
+def test_async_engine_abort_then_take_cleans_completed_results(failure):
+    from vllm_omni.entrypoints.audio_decision.async_engine import AsyncDecisionEngine
+
+    async def run():
+        entered = asyncio.Event()
+        never = asyncio.Event()
+        events = []
+        results = {}
+        aborted = set()
+
+        class LLM:
+            async def generate(self, prompt, params, request_id):
+                results[request_id] = {"request_id": request_id, "action": "respond"}
+                events.append("stored")
+                if failure in ("cancel_forward", "forward_error"):
+                    entered.set()
+                    if failure == "cancel_forward":
+                        await never.wait()
+                    raise RuntimeError("forward failed after storing readout")
+                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[2])])
+
+            async def collective_rpc(self, method, args):
+                assert method == "take_decision_result"
+                key = args[0]
+                if key in aborted:
+                    events.append("cleanup_take")
+                    return [results.pop(key, None)]
+                events.append("take")
+                entered.set()
+                if failure == "cancel_take":
+                    await never.wait()
+                if failure == "take_error_after_pop":
+                    results.pop(key)
+                raise RuntimeError("result retrieval failed")
+
+            async def abort(self, request_id):
+                events.append("abort")
+                # Simulate asynchronous engine-core acknowledgement. Cleanup
+                # must await it before issuing the result-removal RPC.
+                await asyncio.sleep(0)
+                aborted.add(request_id)
+
+        engine = AsyncDecisionEngine.__new__(AsyncDecisionEngine)
+        engine.llm = LLM()
+        engine.rendered = "task"
+        engine.token_ids = [1, 2, 3]
+        engine.config = {"actions": ["keep_listening", "respond", "insufficient_evidence"]}
+        task = asyncio.create_task(engine.decide([0.0] * 160, 0.95))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        if failure.startswith("cancel"):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(RuntimeError, match="failed"):
+                await task
+        assert events[-2:] == ["abort", "cleanup_take"]
+        assert len(aborted) == 1 and not results
+
+    asyncio.run(run())

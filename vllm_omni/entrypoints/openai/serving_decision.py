@@ -11,6 +11,7 @@ import binascii
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -331,7 +332,6 @@ class DecisionServing:
                 "elapsed_ms",
                 "batch_decoder_depth",
                 "batch_size",
-                "audio_encoder_items",
                 "batch_audio_encoder_calls",
                 "batch_audio_items",
             )
@@ -366,7 +366,7 @@ class DecisionServing:
                 drain = asyncio.run_coroutine_threadsafe(self.drain(), self.loop)
                 try:
                     drain.result(timeout=timeout)
-                except TimeoutError:
+                except FuturesTimeoutError:
                     drain.cancel()
             self.pool.shutdown(wait=True, cancel_futures=False)
             if getattr(self.engine, "is_async", False):
