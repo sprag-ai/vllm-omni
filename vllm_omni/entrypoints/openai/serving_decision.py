@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import numpy as np
 from fastapi.responses import JSONResponse
 from vllm.entrypoints.openai.api_server import build_app
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
 from vllm.entrypoints.openai.completion.protocol import CompletionResponse
 from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse, ModelCard, ModelList
@@ -28,6 +29,10 @@ MAX_JSON_BYTES = 4 * ((MAX_BYTES + 2) // 3) + 65536
 
 
 class DecisionCompletionResponse(CompletionResponse):
+    decision: dict
+
+
+class DecisionChatResponse(ChatCompletionResponse):
     decision: dict
 
 
@@ -193,6 +198,109 @@ class DecisionServing:
             self.errored = True
             raise
 
+    def chat_body(self, body):
+        """Validate one audio turn and translate it to the frozen decision task."""
+        allowed = {
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "stream",
+            "modalities",
+            "user",
+            "cache_salt",
+        }
+        unknown = set(body) - allowed
+        if unknown:
+            raise ValueError("Unsupported fields for audio decisions: " + ", ".join(sorted(unknown)))
+        for name in ("max_tokens", "max_completion_tokens", "n"):
+            if name in body and (type(body[name]) is not int or body[name] != 1):
+                raise ValueError(f"Only {name}=1 is supported")
+        if body.get("stream", False) is not False:
+            raise ValueError("Only stream=false is supported")
+        if body.get("modalities", ["text"]) != ["text"]:
+            raise ValueError("Only modalities=[text] is supported")
+        if isinstance(body.get("temperature"), bool):
+            raise ValueError("temperature must be numeric zero")
+        if "cache_salt" in body and not isinstance(body["cache_salt"], str):
+            raise ValueError("cache_salt must be a string")
+        # Dialtone supplies cache_salt; this engine has all cross-request caches disabled.
+        messages = body.get("messages")
+        if not isinstance(messages, list) or len(messages) != 1:
+            raise ValueError("Expected exactly one user message containing one audio clip")
+        message = messages[0]
+        if not isinstance(message, dict) or set(message) != {"role", "content"} or message["role"] != "user":
+            raise ValueError("Only a single user message with role and content is supported")
+        content = message["content"]
+        if not isinstance(content, list):
+            raise ValueError("Message content must contain an input_audio part")
+        audio, text = [], []
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError("Invalid message content part")
+            if set(part) == {"type", "input_audio"} and part["type"] == "input_audio":
+                audio.append(part["input_audio"])
+            elif set(part) == {"type", "text"} and part["type"] == "text":
+                text.append(part["text"])
+            else:
+                raise ValueError("Only input_audio and the fixed task text are supported")
+        if len(audio) != 1 or len(text) > 1:
+            raise ValueError("Expected one audio clip and at most one task text part")
+        task = text[0] if text else "audio_turn_decision"
+        lp = body.get("logprobs", False)
+        top = body.get("top_logprobs", 0)
+        if type(lp) is not bool or type(top) is not int or not 0 <= top <= 3:
+            raise ValueError("logprobs must be boolean and top_logprobs an integer from 0 to 3")
+        if top and not lp:
+            raise ValueError("top_logprobs requires logprobs=true")
+        normalized = {
+            "model": body.get("model"),
+            "prompt": task,
+            "input_audio": audio[0],
+            "temperature": body.get("temperature", 0),
+        }
+        self.common(normalized, "completion")
+        return normalized, lp, top
+
+    async def create_chat_completion(self, request, raw_request):
+        try:
+            body, include_logprobs, top = self.chat_body(await raw_request.json())
+        except ValueError as e:
+            return error(str(e))
+        # The chat API is the fixed calibrated policy, not the raw readout experiment API.
+        result = await self.infer(body, "auto", 0.95)
+        if isinstance(result, ErrorResponse):
+            return result
+        labels = ["A", "B", "C"]
+        index = self.engine.config["actions"].index(result["action"])
+        logprobs = None
+        if include_logprobs:
+            lp = result["label_logprobs"]
+            ranked = sorted(range(3), key=lambda i: lp[i], reverse=True)
+
+            def token(i):
+                return {"token": labels[i], "logprob": lp[i], "bytes": list(labels[i].encode())}
+
+            logprobs = {"content": [{**token(index), "top_logprobs": [token(i) for i in ranked[:top]]}]}
+        tokens = result["input_tokens"]
+        return DecisionChatResponse(
+            model=self.model_name,
+            choices=[
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": labels[index]},
+                    "finish_reason": "length",
+                    "logprobs": logprobs,
+                }
+            ],
+            usage={"prompt_tokens": tokens, "completion_tokens": 1, "total_tokens": tokens + 1},
+            decision={**result, "mode": "auto"},
+        )
+
     async def create_completion(self, request, raw_request):
         body = await raw_request.json()
         try:
@@ -295,6 +403,7 @@ def build_decision_app(args, engine):
         raise ValueError("Decision serving requires exactly one served model name")
     handler = DecisionServing(engine, names[0], getattr(args, "decision_max_pending", 16))
     app.state.openai_serving_completion = handler
+    app.state.openai_serving_chat = handler
     app.state.serving_embedding = handler  # vLLM 0.30 uses this name in embed.api_router.
     app.state.openai_serving_models = handler
     app.state.engine_client = handler
@@ -304,6 +413,7 @@ def build_decision_app(args, engine):
     # Unsupported routes should be absent, not advertise handlers that aren't loaded.
     allowed = {
         "/v1/completions",
+        "/v1/chat/completions",
         "/v1/embeddings",
         "/v1/models",
         "/health",
