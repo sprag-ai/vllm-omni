@@ -112,7 +112,11 @@ label-restricted log probabilities are the calibrated policy scores. It does not
 accept `decision_mode` or `decision_threshold` overrides. The existing completion
 endpoint retains its raw-by-default experimental readout contract.
 
-Supply exactly one user message with one inline audio part. An optional text part
+Supply exactly one user message with one inline audio part. Supported `format`
+values are `wav`, `flac`, `mp3`, `ogg` (Vorbis or Opus), and `aiff`; the same
+containers work on completions and embeddings. The packaged SoundFile/libsndfile
+decoder downmixes and resamples decoded audio to mono 16 kHz. AAC, M4A and WebM
+require gateway transcoding to WAV and are not native decoder formats. An optional text part
 must be `audio_turn_decision` or the exact bundled prompt. Arbitrary instructions,
 history, tools, multiple clips and streaming are rejected. `max_tokens` and
 `max_completion_tokens`, if supplied, must both be 1; `n` must be 1 and

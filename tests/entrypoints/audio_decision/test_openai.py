@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
@@ -330,7 +331,7 @@ def test_chat_schema_validates_before_serving_and_describes_contract(monkeypatch
                 "messages": [
                     {
                         "role": "user",
-                        "content": [{"type": "input_audio", "input_audio": {"data": "unused", "format": "mp3"}}],
+                        "content": [{"type": "input_audio", "input_audio": {"data": "unused", "format": "aac"}}],
                     }
                 ]
             },
@@ -402,3 +403,64 @@ def test_chat_handler_uses_parsed_request_and_per_app_model_binding():
             ).status_code
             == 200
         )
+
+
+@pytest.mark.parametrize(
+    "container,subtype",
+    [
+        ("WAV", "PCM_16"),
+        ("FLAC", "PCM_16"),
+        ("MP3", "MPEG_LAYER_III"),
+        ("OGG", "VORBIS"),
+        ("OGG", "OPUS"),
+        ("AIFF", "PCM_16"),
+    ],
+)
+@pytest.mark.parametrize("route", ["chat/completions", "completions", "embeddings"])
+def test_supported_audio_containers_decode_through_api(container, subtype, route):
+    samples = (0.2 * np.sin(2 * np.pi * 440 * np.arange(8000) / 16000)).astype(np.float32)
+    encoded = io.BytesIO()
+    sf.write(encoded, samples, 16000, format=container, subtype=subtype)
+    payload = encoded.getvalue()
+    expected, rate = sf.read(io.BytesIO(payload), dtype="float32")
+    assert rate == 16000
+    assert expected.shape == samples.shape
+    assert np.max(np.abs(expected)) > 0.1
+    audio = {"format": container.lower(), "data": base64.b64encode(payload).decode()}
+
+    class DecodingEngine(Engine):
+        def decide(self, wave, threshold, mode="auto"):
+            if container == "MP3":
+                # Separate MPEG decode executions can differ at float32 rounding precision.
+                np.testing.assert_allclose(wave, expected, rtol=0, atol=np.finfo(np.float32).eps)
+            else:
+                np.testing.assert_array_equal(wave, expected)
+            return super().decide(wave, threshold, mode)
+
+    if route == "chat/completions":
+        request = chat_body()
+        request["messages"][0]["content"][0]["input_audio"] = audio
+    elif route == "completions":
+        request = {**body(), "input_audio": audio}
+    else:
+        request = {"model": "test-model", "input": "audio_turn_decision", "input_audio": audio}
+    with TestClient(build_decision_app(args(), DecodingEngine())) as client:
+        response = client.post("/v1/" + route, json=request, headers={"Authorization": "Bearer test-secret"})
+        assert response.status_code == 200, response.text
+        assert response.json()["decision"]["audio_seconds"] == 0.5
+
+
+@pytest.mark.parametrize("container", ["mp3", "ogg", "aiff"])
+def test_corrupt_audio_in_supported_container_never_reaches_engine(container):
+    class UnreachableEngine(Engine):
+        def decide(self, *args, **kwargs):
+            raise AssertionError("Corrupt audio reached inference")
+
+    request = chat_body()
+    request["messages"][0]["content"][0]["input_audio"] = {
+        "format": container,
+        "data": base64.b64encode(b"not an audio file").decode(),
+    }
+    with TestClient(build_decision_app(args(), UnreachableEngine())) as client:
+        response = client.post("/v1/chat/completions", json=request, headers={"Authorization": "Bearer test-secret"})
+        assert response.status_code == 400

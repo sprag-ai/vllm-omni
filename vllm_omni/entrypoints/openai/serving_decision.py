@@ -25,7 +25,11 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse, ModelCard, Mod
 
 from vllm_omni.entrypoints.audio_decision.engine import DecisionEngine
 from vllm_omni.entrypoints.audio_decision.server import MAX_BYTES, decode_audio
-from vllm_omni.entrypoints.openai.decision_protocol import DecisionChatRequest, decision_chat_request_type
+from vllm_omni.entrypoints.openai.decision_protocol import (
+    DecisionChatRequest,
+    DecisionInputAudio,
+    decision_chat_request_type,
+)
 
 MAX_JSON_BYTES = 4 * ((MAX_BYTES + 2) // 3) + 65536
 
@@ -85,15 +89,9 @@ class BodyLimitMiddleware:
 
 
 def parse_audio(body):
-    audio = body.get("input_audio")
-    if not isinstance(audio, dict) or set(audio) != {"data", "format"}:
-        raise ValueError("input_audio must contain base64 data and format (wav or flac)")
-    if audio["format"] not in ("wav", "flac") or not isinstance(audio["data"], str):
-        raise ValueError("input_audio supports base64 WAV or FLAC only")
-    if len(audio["data"]) > 4 * ((MAX_BYTES + 2) // 3):
-        raise ValueError("Audio exceeds 12 MiB")
+    audio = DecisionInputAudio.model_validate(body.get("input_audio"))
     try:
-        payload = base64.b64decode(audio["data"], validate=True)
+        payload = base64.b64decode(audio.data, validate=True)
     except (ValueError, binascii.Error) as e:
         raise ValueError("Invalid base64 audio") from e
     if len(payload) > MAX_BYTES:

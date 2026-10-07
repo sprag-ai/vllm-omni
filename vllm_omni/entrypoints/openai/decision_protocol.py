@@ -12,7 +12,7 @@ class DecisionRequestModel(BaseModel):
 
 class DecisionInputAudio(DecisionRequestModel):
     data: str = Field(max_length=4 * ((12 * 1024 * 1024 + 2) // 3))
-    format: Literal["wav", "flac"]
+    format: Literal["wav", "flac", "mp3", "ogg", "aiff"]
 
 
 class DecisionAudioPart(DecisionRequestModel):
