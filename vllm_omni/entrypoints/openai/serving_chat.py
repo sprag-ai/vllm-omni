@@ -378,6 +378,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_extra_output_params = None
         instance.engine_client = None
         instance.has_kv_connector = False
+        # No engine config to fingerprint; responses carry null, as upstream does when the lookup fails.
+        instance.system_fingerprint = None
         # Extra body/output params are resolved lazily on first use; see
         # _get_diffusion_extra_body_params / _get_diffusion_extra_output_params.
         return instance
@@ -2146,6 +2148,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             modality=final_output_type,
                             metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                         )
+                        if (
+                            not include_usage
+                            and self.system_fingerprint is not None
+                            and choice_data.finish_reason is not None
+                        ):
+                            chunk.system_fingerprint = self.system_fingerprint
 
                         # handle usage stats if requested & if continuous
                         if include_continuous_usage:
@@ -2238,6 +2246,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         modality=final_output_type,
                         metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
+                    if (
+                        not include_usage
+                        and self.system_fingerprint is not None
+                        and any(c.finish_reason is not None for c in choices_data)
+                    ):
+                        chunk.system_fingerprint = self.system_fingerprint
                     chunk.usage = UsageInfo(
                         prompt_tokens=num_prompt_tokens,
                         completion_tokens=0,
@@ -2279,6 +2293,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         modality=final_output_type,
                         metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
+                    if (
+                        not include_usage
+                        and self.system_fingerprint is not None
+                        and any(c.finish_reason is not None for c in choices_data)
+                    ):
+                        chunk.system_fingerprint = self.system_fingerprint
                     # NOTE: Currently usage is only set the text stages to align with the behavior
                     # of the full generator. TODO (Alex): Add support for usage on all stages for
                     # both streaming and non-streaming.
@@ -2305,6 +2325,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         created=created_time,
                         choices=[stop_choice],
                         model=model_name,
+                        system_fingerprint=self.system_fingerprint,
                     )
                     data = stop_chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
@@ -2348,6 +2369,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     created=created_time,
                     choices=[],
                     model=model_name,
+                    system_fingerprint=self.system_fingerprint,
                     usage=final_usage,
                     metrics=self._filter_stage_metrics_detail(last_metrics, request),
                 )
@@ -2531,6 +2553,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             id=request_id,
             created=created_time,
             model=model_name,
+            system_fingerprint=self.system_fingerprint,
             choices=choices,
             usage=usage,
             prompt_logprobs=prompt_logprobs,
@@ -3837,6 +3860,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     id=request_id,
                     created=created_time,
                     model=self._diffusion_model_name,
+                    system_fingerprint=self.system_fingerprint,
                     choices=[choice],
                     usage=UsageInfo(
                         prompt_tokens=len(prompt.split()),
@@ -3973,6 +3997,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 id=request_id,
                 created=created_time,
                 model=self._diffusion_model_name,
+                system_fingerprint=self.system_fingerprint,
                 choices=[choice],
                 usage=UsageInfo(
                     prompt_tokens=len(prompt.split()),
