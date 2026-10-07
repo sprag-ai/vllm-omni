@@ -378,6 +378,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_extra_output_params = None
         instance.engine_client = None
         instance.has_kv_connector = False
+        # No engine config to fingerprint; responses carry null, as upstream does when the lookup fails.
+        instance.system_fingerprint = None
         # Extra body/output params are resolved lazily on first use; see
         # _get_diffusion_extra_body_params / _get_diffusion_extra_output_params.
         return instance
@@ -2244,6 +2246,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         modality=final_output_type,
                         metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
+                    if (
+                        not include_usage
+                        and self.system_fingerprint is not None
+                        and any(c.finish_reason is not None for c in choices_data)
+                    ):
+                        chunk.system_fingerprint = self.system_fingerprint
                     chunk.usage = UsageInfo(
                         prompt_tokens=num_prompt_tokens,
                         completion_tokens=0,
