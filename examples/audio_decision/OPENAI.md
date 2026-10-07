@@ -1,7 +1,9 @@
 # Native audio over the vLLM-Omni OpenAI server
 
-This mode uses `vllm serve --omni`, the upstream OpenAI HTTP routers and their
-request/response schemas, authentication, CORS and request-ID middleware. A frozen
+This mode uses `vllm serve --omni`, upstream OpenAI HTTP handlers, response
+schemas, authentication, CORS and request-ID middleware. Chat requests use a
+strict Pydantic schema bound at the FastAPI edge; `/openapi.json` describes its
+supported fields. A frozen
 decision handler serves `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` through one native
 vLLM-Omni Thinker engine. It does not start the separate `/v1/decide` server.
 
@@ -221,5 +223,5 @@ and the correct frozen head. The included OpenAI SDK client is a working example
 an unmodified text-only AnyJev client cannot supply this native-audio task.
 
 Readiness is `GET /health` (200), model discovery is `GET /v1/models`, and queued
-request load is `GET /load`. `/v1/chat/completions` and unrelated generation routes
-are not advertised in this mode.
+request load is `GET /load`. Unrelated generation routes are not advertised in
+this mode.
