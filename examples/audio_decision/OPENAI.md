@@ -56,8 +56,11 @@ docker run --gpus device=0 --ipc=host \
   -v /path/to/decision-bundle:/models/decision:ro \
   sprag-audio-decision:openai-v0.30.0 \
   /models/qwen3/snapshots/26291f793822fb6be9555850f06dfe95f2d7e695 \
-  --decision-bundle /models/decision --host 0.0.0.0 --port 8000
+  --omni --decision-bundle /models/decision --host 0.0.0.0 --port 8000
 ```
+
+When overriding Docker arguments, put the model path first and include `--omni`.
+The vLLM CLI rejects flags before the model when `--served-model-name` is set.
 
 Mount the whole Hugging Face model repository, including `blobs`, because the
 snapshot contains symlinks. The bundle is the unchanged vllm29 seed17 export;

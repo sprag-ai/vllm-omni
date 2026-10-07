@@ -6,5 +6,5 @@ COPY . .
 RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.30.0 uv pip install --system --no-deps --no-build-isolation .
 ENV HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false VLLM_ENABLE_V1_MULTIPROCESSING=0
 EXPOSE 8000
-ENTRYPOINT ["vllm", "serve", "--omni"]
-CMD ["/models/qwen3-omni", "--decision-bundle", "/models/decision", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["vllm", "serve"]
+CMD ["/models/qwen3-omni", "--omni", "--decision-bundle", "/models/decision", "--host", "0.0.0.0", "--port", "8000"]
