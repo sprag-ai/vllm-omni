@@ -12,7 +12,9 @@ class DecisionRequestModel(BaseModel):
 
 class DecisionInputAudio(DecisionRequestModel):
     data: str = Field(max_length=4 * ((12 * 1024 * 1024 + 2) // 3))
-    format: Literal["wav", "flac"]
+    # Informational container hint. The upstream decoder inspects the bytes;
+    # its installed backends determine support, not an adapter format list.
+    format: str = Field(min_length=1)
 
 
 class DecisionAudioPart(DecisionRequestModel):

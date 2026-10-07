@@ -62,7 +62,8 @@ curl --fail-with-body 'http://127.0.0.1:8917/v1/decide?threshold=0.95' \
 
 The request body is raw audio bytes (WAV/FLAC supported by libsndfile), not
 multipart form data, a transcript, or a server file path. Audio is converted to
-mono 16 kHz. Limits: 30 seconds, 12 MiB upload, up to 8 channels, sample rates
+mono 16 kHz. The shared vLLM audio loader handles container detection and decoder fallback.
+Limits: 30 seconds, 12 MiB upload, bounded decoded PCM memory, sample rates
 8–192 kHz, 16 pending requests. Invalid input returns 422, oversized upload
 413, full queue 429. The service does not persist uploaded audio.
 
