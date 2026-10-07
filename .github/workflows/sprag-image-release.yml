@@ -43,6 +43,8 @@ jobs:
           sha="$(git rev-parse --short=8 HEAD)"
           echo "base_image=${base}"           >> "${GITHUB_OUTPUT}"
           echo "tag=${upstream}-sprag.${sha}" >> "${GITHUB_OUTPUT}"
+          # Package version: PEP 440 has no "-sprag" form, so the local-version label carries it.
+          echo "package_version=${upstream#v}+sprag" >> "${GITHUB_OUTPUT}"
           echo "Building ${upstream}-sprag.${sha} from ${base}"
 
       - name: Authenticate to Google Cloud
@@ -112,7 +114,9 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.cuda
-          build-args: BASE_IMAGE=${{ steps.tag.outputs.base_image }}
+          build-args: |
+            BASE_IMAGE=${{ steps.tag.outputs.base_image }}
+            VLLM_OMNI_VERSION_OVERRIDE=${{ steps.tag.outputs.package_version }}
           platforms: linux/amd64
           push: true
           tags: us-central1-docker.pkg.dev/steady-method-485022-e5/sprag-prod/vllm-omni:${{ steps.tag.outputs.tag }}
