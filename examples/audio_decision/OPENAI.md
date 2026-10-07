@@ -1,8 +1,10 @@
 # Native audio over the vLLM-Omni OpenAI server
 
-This mode uses `vllm serve --omni`, the upstream OpenAI HTTP routers and their
-request/response schemas, authentication, CORS and request-ID middleware. A frozen
-decision handler serves `/v1/completions` and `/v1/embeddings` through one native
+This mode uses `vllm serve --omni`, upstream OpenAI HTTP handlers, response
+schemas, authentication, CORS and request-ID middleware. Chat requests use a
+strict Pydantic schema bound at the FastAPI edge; `/openapi.json` describes its
+supported fields. A frozen
+decision handler serves `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` through one native
 vLLM-Omni Thinker engine. It does not start the separate `/v1/decide` server.
 
 ## Separate prototype image builds
@@ -56,8 +58,11 @@ docker run --gpus device=0 --ipc=host \
   -v /path/to/decision-bundle:/models/decision:ro \
   sprag-audio-decision:openai-v0.30.0 \
   /models/qwen3/snapshots/26291f793822fb6be9555850f06dfe95f2d7e695 \
-  --decision-bundle /models/decision --host 0.0.0.0 --port 8000
+  --omni --decision-bundle /models/decision --host 0.0.0.0 --port 8000
 ```
+
+When overriding Docker arguments, put the model path first and include `--omni`.
+The vLLM CLI rejects flags before the model when `--served-model-name` is set.
 
 Mount the whole Hugging Face model repository, including `blobs`, because the
 snapshot contains symlinks. The bundle is the unchanged vllm29 seed17 export;
@@ -75,6 +80,52 @@ only be explicitly set to 1. Supported HTTP/authentication/TLS options continue
 to apply. The decision engine does not expose the general
 vLLM model/sampling/parallelism configuration. `--decision-max-pending 16` bounds
 active plus queued inference requests; overflow returns 429.
+
+## Chat completions: calibrated turn decisions
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8917/v1", api_key="YOUR_KEY")
+result = client.chat.completions.create(
+    model="native-audio-decision",
+    messages=[{"role": "user", "content": [
+        {"type": "input_audio", "input_audio": {
+            "data": base64.b64encode(open("sample.wav", "rb").read()).decode(),
+            "format": "wav",
+        }},
+        {"type": "text", "text": "audio_turn_decision"},
+    ]}],
+    max_completion_tokens=1,
+    temperature=0,
+    logprobs=True,
+    top_logprobs=3,
+)
+print(result.choices[0].message.content)
+print(result.choices[0].logprobs.content[0].top_logprobs)
+```
+
+`A = keep_listening`, `B = respond`, `C = insufficient_evidence`. Chat uses the
+frozen calibrated early-exit/fallback policy (`auto`, threshold `0.95`). Its
+label-restricted log probabilities are the calibrated policy scores. It does not
+accept `decision_mode` or `decision_threshold` overrides. The existing completion
+endpoint retains its raw-by-default experimental readout contract.
+
+Supply exactly one user message with one inline audio part. An optional text part
+must be `audio_turn_decision` or the exact bundled prompt. Arbitrary instructions,
+history, tools, multiple clips and streaming are rejected. `max_tokens` and
+`max_completion_tokens`, if supplied, must both be 1; `n` must be 1 and
+`temperature` 0. `top_logprobs` supports 0 through 3 and requires `logprobs=true`
+when nonzero. `modalities`, if supplied, must be `["text"]`.
+
+The standard assistant message, usage and chat log-probability fields survive
+OpenAI-compatible gateway response normalization. The direct server's `decision`
+metadata extension is optional diagnostics and may be dropped by a gateway.
+`cache_salt` is accepted as gateway partition metadata; all cross-request model
+caches remain disabled. Dialtone can use its existing chat request/response path
+with the matching audio media profile and supported-parameter catalog entry.
+Embeddings remain available only through their separate endpoint.
 
 ## Completions: label log probabilities
 
@@ -172,5 +223,5 @@ and the correct frozen head. The included OpenAI SDK client is a working example
 an unmodified text-only AnyJev client cannot supply this native-audio task.
 
 Readiness is `GET /health` (200), model discovery is `GET /v1/models`, and queued
-request load is `GET /load`. `/v1/chat/completions` and unrelated generation routes
-are not advertised in this mode.
+request load is `GET /load`. Unrelated generation routes are not advertised in
+this mode.

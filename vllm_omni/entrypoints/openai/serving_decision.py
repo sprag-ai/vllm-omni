@@ -15,19 +15,26 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import numpy as np
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from vllm.entrypoints.openai.api_server import build_app
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
 from vllm.entrypoints.openai.completion.protocol import CompletionResponse
 from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse, ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_decision.engine import DecisionEngine
 from vllm_omni.entrypoints.audio_decision.server import MAX_BYTES, decode_audio
+from vllm_omni.entrypoints.openai.decision_protocol import DecisionChatRequest, decision_chat_request_type
 
 MAX_JSON_BYTES = 4 * ((MAX_BYTES + 2) // 3) + 65536
 
 
 class DecisionCompletionResponse(CompletionResponse):
+    decision: dict
+
+
+class DecisionChatResponse(ChatCompletionResponse):
     decision: dict
 
 
@@ -193,6 +200,40 @@ class DecisionServing:
             self.errored = True
             raise
 
+    async def create_chat_completion(self, request: DecisionChatRequest, raw_request):
+        body = {"input_audio": request.input_audio.model_dump()}
+        # The chat API is the fixed calibrated policy, not the raw readout experiment API.
+        result = await self.infer(body, "auto", 0.95)
+        if isinstance(result, ErrorResponse):
+            return result
+        labels = ["A", "B", "C"]
+        index = self.engine.config["actions"].index(result["action"])
+        logprobs = None
+        if request.logprobs:
+            lp = result["label_logprobs"]
+            ranked = sorted(range(3), key=lambda i: lp[i], reverse=True)
+
+            def token(i):
+                return {"token": labels[i], "logprob": lp[i], "bytes": list(labels[i].encode())}
+
+            logprobs = {
+                "content": [{**token(index), "top_logprobs": [token(i) for i in ranked[: request.top_logprobs]]}]
+            }
+        tokens = result["input_tokens"]
+        return DecisionChatResponse(
+            model=self.model_name,
+            choices=[
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": labels[index]},
+                    "finish_reason": "length",
+                    "logprobs": logprobs,
+                }
+            ],
+            usage={"prompt_tokens": tokens, "completion_tokens": 1, "total_tokens": tokens + 1},
+            decision={**result, "mode": "auto"},
+        )
+
     async def create_completion(self, request, raw_request):
         body = await raw_request.json()
         try:
@@ -282,7 +323,7 @@ class DecisionServing:
 
 
 def build_decision_app(args, engine):
-    """Keep upstream routes, schemas, auth/CORS middleware and error handlers."""
+    """Keep upstream handlers and middleware with a strict decision chat schema."""
     app = build_app(args, ("generate", "embed"))
     # Upstream chooses a single runner router family; explicitly attach its
     # embedding router for this dual-readout engine, without replacing routes.
@@ -293,8 +334,27 @@ def build_decision_app(args, engine):
     names = getattr(args, "served_model_name", None) or ["native-audio-decision"]
     if len(names) != 1:
         raise ValueError("Decision serving requires exactly one served model name")
+    # Bind the request schema before FastAPI parses the body. Delegate transport,
+    # cancellation and load accounting to the upstream chat route handler.
+    from vllm.entrypoints.openai.chat_completion.api_router import create_chat_completion
+
+    request_type = decision_chat_request_type(names[0], engine.config["prompt"])
+
+    async def decision_chat(request: request_type, raw_request: Request):
+        return await create_chat_completion(request, raw_request)
+
+    chat_route = next(r for r in app.routes if getattr(r, "path", None) == "/v1/chat/completions")
+    app.router.routes.remove(chat_route)
+    app.add_api_route(
+        "/v1/chat/completions",
+        decision_chat,
+        methods=["POST"],
+        dependencies=chat_route.dependencies,
+        responses=chat_route.responses,
+    )
     handler = DecisionServing(engine, names[0], getattr(args, "decision_max_pending", 16))
     app.state.openai_serving_completion = handler
+    app.state.openai_serving_chat = handler
     app.state.serving_embedding = handler  # vLLM 0.30 uses this name in embed.api_router.
     app.state.openai_serving_models = handler
     app.state.engine_client = handler
@@ -304,6 +364,7 @@ def build_decision_app(args, engine):
     # Unsupported routes should be absent, not advertise handlers that aren't loaded.
     allowed = {
         "/v1/completions",
+        "/v1/chat/completions",
         "/v1/embeddings",
         "/v1/models",
         "/health",
