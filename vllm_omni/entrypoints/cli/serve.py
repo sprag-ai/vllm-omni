@@ -26,6 +26,7 @@ from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -134,6 +135,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        validate_decision_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
@@ -160,6 +162,7 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        validate_decision_args(args)
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
@@ -332,6 +335,18 @@ class OmniServeCommand(CLISubcommand):
             title="OmniConfig", description="Configuration for vLLM-Omni multi-stage and diffusion models."
         )
 
+        omni_config_group.add_argument(
+            "--decision-bundle",
+            type=str,
+            default=None,
+            help="Frozen native-audio decision bundle; serves completions and block-residual embeddings.",
+        )
+        omni_config_group.add_argument(
+            "--decision-max-pending",
+            type=int,
+            default=16,
+            help="Maximum admitted audio decision requests (active plus waiting).",
+        )
         omni_config_group.add_argument(
             "--omni",
             action="store_true",
