@@ -1,5 +1,6 @@
 import math
 
+from vllm.config import SpeechToTextConfig
 from vllm.entrypoints.serve.engine.typing import SpeechToTextRequest
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
@@ -34,6 +35,8 @@ class _AudioDurationBound:
     ``SpeechToTextBaseServing``, so a repetition loop reaches a replica through either one.
     """
 
+    asr_config: SpeechToTextConfig
+
     async def _preprocess_speech_to_text(
         self,
         request: SpeechToTextRequest,
@@ -50,11 +53,15 @@ class _AudioDurationBound:
         engine_inputs, duration, chunk_start_offsets = await super()._preprocess_speech_to_text(
             request=request, audio_data=audio_data, request_id=request_id
         )
-        # ``allow_audio_chunking`` -- the upstream split of a long clip into one generation per window,
-        # unrelated to vllm-omni's inter-stage ``async_chunk`` -- would charge this bound against each
-        # window rather than the whole clip: looser than necessary, never truncating. It is off for this
-        # model, whose config leaves ``min_energy_split_window_size`` None.
-        bound = _BASE_TOKENS + math.ceil(_TOKENS_PER_SECOND * duration)
+        # With ``allow_audio_chunking`` -- upstream's split of a long clip into one generation per window,
+        # unrelated to vllm-omni's inter-stage ``async_chunk`` -- every window is its own generation sharing
+        # these sampling params, so the bound covers one window. Upstream's chunks never exceed
+        # ``max_audio_clip_s``; the last, shorter window gets the full budget, which is loose but never
+        # truncates.
+        bounded_s = duration
+        if self.asr_config.allow_audio_chunking:
+            bounded_s = min(duration, self.asr_config.max_audio_clip_s)
+        bound = _BASE_TOKENS + math.ceil(_TOKENS_PER_SECOND * bounded_s)
         asked = request.max_completion_tokens
         request.max_completion_tokens = bound if asked is None else min(asked, bound)
         return engine_inputs, duration, chunk_start_offsets
