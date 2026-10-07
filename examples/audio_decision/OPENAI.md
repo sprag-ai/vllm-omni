@@ -135,7 +135,7 @@ from BF16 to float32. It is not a semantic similarity embedding. `encoding_forma
 can be `float` or `base64` (little-endian float32); the OpenAI SDK also handles its
 default base64 behavior. No dimension reduction or activation is applied.
 
-Use `openai_client.py --mode embedding --bundle /path/to/bundle sample.wav` to
+Use `tools/audio_decision/openai_client.py --mode embedding --bundle /path/to/bundle sample.wav` to
 apply the exported FP64 feature normalization, ridge head and head temperature
 client-side. The head bundle must match the served backbone, adapter and depth.
 This head-only result does not invoke the full-decoder fallback. Use completion

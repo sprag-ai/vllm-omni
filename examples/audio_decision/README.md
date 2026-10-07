@@ -16,7 +16,7 @@ or incrementally streaming implementation.
 Use the preserved research Python environment (NumPy and safetensors required):
 
 ```sh
-python examples/audio_decision/export_bundle.py \
+python tools/audio_decision/export_bundle.py \
   --runtime /path/to/research/runtime26 \
   --output /path/to/decision-bundle \
   --model weight1_s17
@@ -104,6 +104,6 @@ docker run --rm --entrypoint python3 \
 ```
 
 For a GPU smoke, override the entrypoint and run
-`examples/audio_decision/smoke.py --model ... --bundle ... --audio ... --output ...`
+`tools/audio_decision/smoke.py --model ... --bundle ... --audio ... --output ...`
 with a 16 kHz mono WAV. It exercises forced head, forced full depth and automatic
 routing. The output location must be writable.
