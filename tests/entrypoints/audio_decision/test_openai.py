@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import io
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -331,7 +332,7 @@ def test_chat_schema_validates_before_serving_and_describes_contract(monkeypatch
                 "messages": [
                     {
                         "role": "user",
-                        "content": [{"type": "input_audio", "input_audio": {"data": "unused", "format": "aac"}}],
+                        "content": [{"type": "input_audio", "input_audio": {"data": "unused", "format": 7}}],
                     }
                 ]
             },
@@ -464,3 +465,89 @@ def test_corrupt_audio_in_supported_container_never_reaches_engine(container):
     with TestClient(build_decision_app(args(), UnreachableEngine())) as client:
         response = client.post("/v1/chat/completions", json=request, headers={"Authorization": "Bearer test-secret"})
         assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "container,codec,muxer",
+    [("aac", "aac", "adts"), ("m4a", "aac", "ipod"), ("webm", "libopus", "webm"), ("webm", "libvorbis", "webm")],
+)
+@pytest.mark.parametrize("route", ["chat/completions", "completions", "embeddings"])
+def test_upstream_decoder_fallback_through_api(tmp_path, container, codec, muxer, route):
+    from vllm.multimodal.media.audio import load_audio
+
+    samples = (0.2 * np.sin(2 * np.pi * 440 * np.arange(8000) / 16000)).astype("<f4")
+    path = tmp_path / ("clip." + container)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "f32le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-c:a",
+            codec,
+            "-f",
+            muxer,
+            str(path),
+        ],
+        input=samples.tobytes(),
+        check=True,
+        capture_output=True,
+    )
+    payload = path.read_bytes()
+    # These containers need the upstream fallback our old SoundFile-only path skipped.
+    with pytest.raises(sf.LibsndfileError):
+        sf.read(io.BytesIO(payload))
+    expected, rate = load_audio(io.BytesIO(payload), sr=None)
+    assert np.max(np.abs(expected)) > 0.1
+    if rate != 16000:
+        import math
+
+        from scipy.signal import resample_poly
+
+        divisor = math.gcd(rate, 16000)
+        expected = resample_poly(expected, 16000 // divisor, rate // divisor).astype(np.float32)
+
+    class DecodingEngine(Engine):
+        def decide(self, wave, threshold, mode="auto"):
+            np.testing.assert_allclose(wave, expected, rtol=0, atol=np.finfo(np.float32).eps)
+            return super().decide(wave, threshold, mode)
+
+    audio = {"format": container, "data": base64.b64encode(payload).decode()}
+    if route == "chat/completions":
+        request = chat_body()
+        request["messages"][0]["content"][0]["input_audio"] = audio
+    elif route == "completions":
+        request = {**body(), "input_audio": audio}
+    else:
+        request = {"model": "test-model", "input": "audio_turn_decision", "input_audio": audio}
+    with TestClient(build_decision_app(args(), DecodingEngine())) as client:
+        response = client.post("/v1/" + route, json=request, headers={"Authorization": "Bearer test-secret"})
+        assert response.status_code == 200, response.text
+        assert response.json()["decision"]["audio_seconds"] == len(expected) / 16000
+
+
+def test_format_hint_does_not_override_decoder_detection():
+    request = chat_body()
+    request["messages"][0]["content"][0]["input_audio"]["format"] = "decoder-detects-bytes"
+    with TestClient(build_decision_app(args(), Engine())) as client:
+        response = client.post("/v1/chat/completions", json=request, headers={"Authorization": "Bearer test-secret"})
+        assert response.status_code == 200, response.text
+
+
+def test_upstream_duration_error_is_client_error_and_service_recovers():
+    encoded = io.BytesIO()
+    sf.write(encoded, np.zeros(31 * 16000), 16000, format="WAV")
+    request = chat_body()
+    request["messages"][0]["content"][0]["input_audio"]["data"] = base64.b64encode(encoded.getvalue()).decode()
+    with TestClient(build_decision_app(args(), Engine())) as client:
+        headers = {"Authorization": "Bearer test-secret"}
+        response = client.post("/v1/chat/completions", json=request, headers=headers)
+        assert response.status_code == 400, response.text
+        assert client.post("/v1/chat/completions", json=chat_body(), headers=headers).status_code == 200

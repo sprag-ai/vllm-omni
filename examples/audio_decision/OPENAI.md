@@ -112,12 +112,12 @@ label-restricted log probabilities are the calibrated policy scores. It does not
 accept `decision_mode` or `decision_threshold` overrides. The existing completion
 endpoint retains its raw-by-default experimental readout contract.
 
-Supply exactly one user message with one inline audio part. Supported `format`
-values are `wav`, `flac`, `mp3`, `ogg` (Vorbis or Opus), and `aiff`; the same
-containers work on completions and embeddings. The packaged SoundFile/libsndfile
-decoder downmixes and resamples decoded audio to mono 16 kHz. AAC, M4A and WebM
-require gateway transcoding to WAV and are not native decoder formats. An optional text part
-must be `audio_turn_decision` or the exact bundled prompt. Arbitrary instructions,
+Supply exactly one user message with one inline audio part. `format` is a
+nonempty container hint, not an allowlist: vLLM's shared `load_audio` decoder
+inspects the bytes and uses its installed SoundFile/torchcodec/PyAV backends.
+Chat, completions and embeddings all use this path. The decoder downmixes to mono;
+the decision adapter preserves the frozen model's 16 kHz resampling. An optional
+text part must be `audio_turn_decision` or the exact bundled prompt. Arbitrary instructions,
 history, tools, multiple clips and streaming are rejected. `max_tokens` and
 `max_completion_tokens`, if supplied, must both be 1; `n` must be 1 and
 `temperature` 0. `top_logprobs` supports 0 through 3 and requires `logprobs=true`
@@ -210,9 +210,10 @@ incremental audio/KV streaming.
 
 ## Audio contract and supported task
 
-Both endpoints accept an `input_audio` extension with inline base64 WAV or FLAC,
-up to 30 seconds and 12 MiB decoded upload size. Audio is downmixed and resampled
-to 16 kHz. No URL fetching, server-local file paths, transcript, labels, source IDs
+All three endpoints accept inline base64 audio supported by the installed vLLM
+audio loader, up to 30 seconds and 12 MiB after base64 decoding. The adapter also
+bounds decoded PCM memory and requires a source rate of 8–192 kHz. Audio is
+downmixed and resampled to 16 kHz. No URL fetching, server-local file paths, transcript, labels, source IDs
 or provider IDs are accepted. Every call performs one fresh audio encoder pass.
 
 Use `audio_turn_decision` or the exact bundled prompt as `prompt`/`input`.

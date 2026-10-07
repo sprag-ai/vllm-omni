@@ -12,9 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import numpy as np
-import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request
 from scipy.signal import resample_poly
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.media.audio import load_audio
 
 from .engine import DecisionEngine
 
@@ -23,16 +24,22 @@ MAX_SECONDS = 30
 
 
 def decode_audio(data):
-    with sf.SoundFile(io.BytesIO(data)) as f:
-        if (
-            f.frames == 0
-            or not 8000 <= f.samplerate <= 192000
-            or f.frames / f.samplerate > MAX_SECONDS
-            or f.channels > 8
-        ):
-            raise ValueError("Audio must contain 0–30 seconds and at most 8 channels")
-        wave = f.read(dtype="float32", always_2d=True).mean(axis=1)
-        rate = f.samplerate
+    if len(data) > MAX_BYTES:
+        raise ValueError("Audio exceeds 12 MiB")
+    # Use the same auto decoder/fallback path as vLLM's AudioMediaIO. Keep
+    # source-rate decoding so the frozen model's resampling stays unchanged.
+    try:
+        wave, rate = load_audio(
+            io.BytesIO(data),
+            sr=None,
+            mono=True,
+            max_duration_s=MAX_SECONDS,
+            max_decode_bytes=MAX_SECONDS * 192000 * 8 * np.dtype(np.float32).itemsize,
+        )
+    except VLLMValidationError as e:
+        raise ValueError(str(e)) from e
+    if wave.size == 0 or not 8000 <= rate <= 192000 or wave.size / rate > MAX_SECONDS:
+        raise ValueError("Audio must contain 0–30 seconds at 8–192 kHz")
     if not np.isfinite(wave).all():
         raise ValueError("Audio contains nonfinite samples")
     if rate != 16000:
