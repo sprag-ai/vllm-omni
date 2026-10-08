@@ -3,6 +3,7 @@
 """Validate the deliberately restricted native-audio decision CLI."""
 
 import argparse
+import math
 
 # Only options consumed by the decision engine, its HTTP launcher, or the CLI
 # parser belong here. Never infer support from an upstream parser default: most
@@ -55,12 +56,16 @@ def validate_decision_args(args: argparse.Namespace) -> None:
     decision = getattr(args, "decision_bundle", None)
     if choice and decision:
         raise ValueError("--choice-bundle and --decision-bundle are mutually exclusive")
+    visual_args = {"choice_enable_vision", "choice_max_video_seconds", "choice_max_video_frames"}
+    if not choice and visual_args & (getattr(args, "explicit_keys", None) or set()):
+        raise ValueError("Choice visual options require --choice-bundle")
     if not choice and not decision:
         return
     explicit_keys = getattr(args, "explicit_keys", None)
     if explicit_keys is None:
         raise ValueError("Decision serving requires explicit argument tracking; use the Omni TrackingArgumentParser")
-    unsupported = sorted(explicit_keys - SUPPORTED_DECISION_ARGS)
+    supported = SUPPORTED_DECISION_ARGS | visual_args if choice else SUPPORTED_DECISION_ARGS
+    unsupported = sorted(explicit_keys - supported)
     if unsupported:
         flags = ", ".join("--" + key.replace("_", "-") for key in unsupported)
         raise ValueError(
@@ -73,3 +78,12 @@ def validate_decision_args(args: argparse.Namespace) -> None:
         raise ValueError("Decision mode supports TP=1 and PP=1 only")
     if getattr(args, "headless", False) or (getattr(args, "api_server_count", None) or 1) != 1:
         raise ValueError("Decision serving requires one API server and cannot run headless")
+    if choice:
+        seconds = getattr(args, "choice_max_video_seconds", 60)
+        frames = getattr(args, "choice_max_video_frames", 1800)
+        if not math.isfinite(seconds) or seconds <= 0 or frames < 1:
+            raise ValueError("Choice video limits must be positive and finite")
+        if explicit_keys & {"choice_max_video_seconds", "choice_max_video_frames"} and not getattr(
+            args, "choice_enable_vision", False
+        ):
+            raise ValueError("Choice video limits require --choice-enable-vision")

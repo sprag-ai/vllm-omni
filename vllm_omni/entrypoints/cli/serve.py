@@ -342,6 +342,23 @@ class OmniServeCommand(CLISubcommand):
             help="Named Choice adapter/calibration bundle; serves /v1/systemone and a chat compatibility wrapper.",
         )
         omni_config_group.add_argument(
+            "--choice-enable-vision",
+            action="store_true",
+            help="Load the vision tower for Choice/Noul/Score image and video requests (off by default).",
+        )
+        omni_config_group.add_argument(
+            "--choice-max-video-seconds",
+            type=float,
+            default=60,
+            help="Maximum source video duration in Choice mode (default: 60 seconds).",
+        )
+        omni_config_group.add_argument(
+            "--choice-max-video-frames",
+            type=int,
+            default=1800,
+            help="Maximum source video frame count in Choice mode (default: 1800).",
+        )
+        omni_config_group.add_argument(
             "--decision-bundle",
             type=str,
             default=None,
