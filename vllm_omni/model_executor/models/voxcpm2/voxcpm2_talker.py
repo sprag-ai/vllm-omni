@@ -734,6 +734,14 @@ class _CFMBufferManager:
         return self.t_span_10 if n == 10 else self._make_t_span(n)
 
 
+def _copy_rows(dst: torch.Tensor, rows: list[torch.Tensor]) -> None:
+    if len({row.dtype for row in rows}) == 1 and len({row.device for row in rows}) == 1:
+        dst[: len(rows)].copy_(torch.stack(rows, dim=0))
+        return
+    for i, row in enumerate(rows):
+        dst[i].copy_(row)
+
+
 def _optimized_solve_euler(
     cfm_module: nn.Module,
     mu: torch.Tensor,
@@ -1907,14 +1915,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     state.is_stopping = True
 
         self._perf.start("unified.copy_inputs")
-        for i, state in enumerate(states):
-            pfe = state.prev_feat_embed
-            g.prev_feat_embed[i].copy_(pfe.squeeze(0) if pfe.ndim > 1 else pfe)
-            pfc = state.curr_prefix_feat_cond
-            if pfc.ndim == 2:
-                g.prefix_feat_cond[i].copy_(pfc)
-            else:
-                g.prefix_feat_cond[i].copy_(pfc.squeeze(0))
+        prev_feat_embeds = [
+            state.prev_feat_embed.squeeze(0) if state.prev_feat_embed.ndim > 1 else state.prev_feat_embed
+            for state in states
+        ]
+        prefix_feat_conds = [
+            state.curr_prefix_feat_cond
+            if state.curr_prefix_feat_cond.ndim == 2
+            else state.curr_prefix_feat_cond.squeeze(0)
+            for state in states
+        ]
+        # One stacked copy per buffer replaces a copy kernel per request; mixed dtypes or devices fall back.
+        _copy_rows(g.prev_feat_embed, prev_feat_embeds)
+        _copy_rows(g.prefix_feat_cond, prefix_feat_conds)
 
         g.input_embeds[:num_reqs].copy_(inputs_embeds[:num_reqs])
         g.positions[:num_reqs].copy_(positions[:num_reqs])
@@ -1947,14 +1960,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.start("unified.commit")
         with torch.no_grad():
             all_stop_logits = self._stop_fn(g.lm_hidden[:num_reqs])
+        next_embeds = g.next_feat_embed[:num_reqs].clone()
+        latents = torch.empty(
+            (num_reqs, g.cfm_output.shape[2], g.cfm_output.shape[1]), device=g.cfm_output.device, dtype=torch.float32
+        )
+        latents.copy_(g.cfm_output[:num_reqs].transpose(1, 2))
         for i, state in enumerate(states):
             stop_logits_i = all_stop_logits[i : i + 1]
             if not commit_mask[i]:
                 state.precomputed_stop_logits = stop_logits_i
                 continue
-            next_embed_i = g.next_feat_embed[i : i + 1].clone()
             cfm_out_i = g.cfm_output[i : i + 1].transpose(1, 2)
-            self._commit_decode_state(state, stop_logits_i, next_embed_i, cfm_out_i)
+            self._commit_decode_state(state, stop_logits_i, next_embeds[i : i + 1], cfm_out_i)
+            state.last_audio_patch_gpu = latents[i : i + 1]
         self._perf.stop("unified.commit")
 
         self._perf.start("unified.audio")
@@ -3036,28 +3054,41 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         )
 
         if self._results_queue:
+            # Constant rows are written in one host-built block and stop-logit rows in one indexed write,
+            # instead of two scalar device writes per request.
+            head = [[float("-inf"), float("-inf")] for _ in range(bsz)]
+            constant_rows = False
+            stop_rows: list[int] = []
+            stop_values: list[torch.Tensor] = []
             for i, (req_id, stop_logits) in enumerate(self._results_queue):
                 if i >= bsz:
                     break
                 state = self._active_states.get(req_id)
                 if stop_logits is not None:
                     if state is not None and state.is_stopping:
-                        logits[i, 0] = 0.0
-                        logits[i, 1] = 1.0
+                        head[i] = [0.0, 1.0]
+                        constant_rows = True
                         state.precomputed_stop_logits = None
                         state.precomputed_is_stopping = None
                     else:
-                        logits[i, 0] = stop_logits[0, 0]
-                        logits[i, 1] = stop_logits[0, 1]
+                        stop_rows.append(i)
+                        stop_values.append(stop_logits[0, :2])
                         if state is not None:
                             if state.precomputed_is_stopping is not None:
                                 state.is_stopping = state.precomputed_is_stopping
                             state.precomputed_stop_logits = None
                             state.precomputed_is_stopping = None
                 elif state and state.prefill_completed:
-                    logits[i, 1] = 1.0
+                    head[i][1] = 1.0
+                    constant_rows = True
                 else:
-                    logits[i, 0] = 1.0
+                    head[i][0] = 1.0
+                    constant_rows = True
+            if constant_rows:
+                logits[:, :2] = torch.tensor(head, dtype=torch.float32).to(device=logits.device, dtype=logits.dtype)
+            if stop_rows:
+                rows = torch.tensor(stop_rows, dtype=torch.long).to(logits.device, non_blocking=True)
+                logits[rows, :2] = torch.stack([value.to(logits.dtype) for value in stop_values], dim=0)
             self._results_queue.clear()
         else:
             logits[:, 0] = 1.0
@@ -3137,6 +3168,27 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return self._multichar_zh_split
 
     # -------------------- preprocess / postprocess --------------------
+
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Batch the decode branch of ``preprocess`` for a contiguous run of one-token decode requests."""
+        dev = input_ids.device
+        embeds: list[torch.Tensor] = []
+        for info in req_infos:
+            req_id = info.get("request_id", "default")
+            state = self._active_states.get(req_id)
+            curr = state.curr_embed_for_next if state else None
+            if curr is not None:
+                req_embeds = curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
+            else:
+                req_embeds = torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
+            self._pending_requests.append((req_id, False, req_embeds, 1))
+            embeds.append(req_embeds)
+        return input_ids, torch.cat(embeds, dim=0), [{} for _ in req_infos]
 
     def preprocess(
         self,
