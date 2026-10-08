@@ -15,6 +15,7 @@ SUPPORTED_DECISION_ARGS = frozenset(
         "model",
         "model_tag",
         "decision_bundle",
+        "choice_bundle",
         "decision_max_pending",
         "gpu_memory_utilization",
         "max_num_seqs",
@@ -50,7 +51,11 @@ SUPPORTED_DECISION_ARGS = frozenset(
 
 
 def validate_decision_args(args: argparse.Namespace) -> None:
-    if not getattr(args, "decision_bundle", None):
+    choice = getattr(args, "choice_bundle", None)
+    decision = getattr(args, "decision_bundle", None)
+    if choice and decision:
+        raise ValueError("--choice-bundle and --decision-bundle are mutually exclusive")
+    if not choice and not decision:
         return
     explicit_keys = getattr(args, "explicit_keys", None)
     if explicit_keys is None:
@@ -59,8 +64,8 @@ def validate_decision_args(args: argparse.Namespace) -> None:
     if unsupported:
         flags = ", ".join("--" + key.replace("_", "-") for key in unsupported)
         raise ValueError(
-            f"Unsupported options with --decision-bundle: {flags}. "
-            "Decision engine settings are frozen (BF16, max-model-len=2048, eager, seed=17); "
+            f"Unsupported options with {'--choice-bundle' if choice else '--decision-bundle'}: {flags}. "
+            "Engine settings are fixed (BF16, eager, seed=17; context 2048 for decisions, 8192 for Choice); "
             "configurable engine options are --gpu-memory-utilization, --max-num-seqs and "
             "--max-num-batched-tokens. Remove the unsupported options."
         )

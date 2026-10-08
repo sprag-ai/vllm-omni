@@ -336,6 +336,12 @@ class OmniServeCommand(CLISubcommand):
         )
 
         omni_config_group.add_argument(
+            "--choice-bundle",
+            type=str,
+            default=None,
+            help="Named Choice adapter/calibration bundle; serves /v1/systemone and a chat compatibility wrapper.",
+        )
+        omni_config_group.add_argument(
             "--decision-bundle",
             type=str,
             default=None,
