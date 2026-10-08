@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError
+
 
 @dataclass
 class VisualEvidence:
@@ -80,7 +82,7 @@ def decode_visual(request, processor, processor_lock=None, max_video_seconds=60,
         # Separate visual processor serialization from text/audio preparation.
         with processor_lock if processor_lock is not None else nullcontext():
             result.expansion = result.token_expansion(processor)
-    except Exception:
+    except Exception as exc:
         # Decoder diagnostics can contain untrusted file metadata.
-        raise ValueError("Invalid or unsupported visual media") from None
+        raise ChoiceInputError("Invalid or unsupported visual media") from exc
     return result

@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.audio_choice.contract import (
     scoring_question,
     target,
 )
+from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError
 
 MAX_MODEL_LEN = 8192
 MAX_PROMPT_CHARS = 131072
@@ -199,11 +200,12 @@ class AsyncChoiceEngine:
                     raise RuntimeError("Nonfinite Choice likelihood")
                 finished = True
                 return sum(terms), len(output.prompt_token_ids) - len(ids)
-            except (EngineGenerateError, VLLMClientError):
+            except (EngineGenerateError, VLLMClientError) as exc:
                 if self.llm.errored:
                     raise
-                # Native processor errors may embed uploaded data in their message.
-                raise ValueError("Invalid or unsupported model input") from None
+                if isinstance(exc, VLLMClientError) or isinstance(exc.__cause__, ValueError):
+                    raise ChoiceInputError("Invalid or unsupported model input") from exc
+                raise
             finally:
                 if not finished:
                     await asyncio.shield(self.llm.abort(request_id))

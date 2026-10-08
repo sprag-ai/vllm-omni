@@ -16,6 +16,7 @@ from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError, log_input_error
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
@@ -59,6 +60,11 @@ class ChoiceServing(DecisionServing):
             # Keep admission until decoding/inference actually completes, even if
             # the HTTP waiter disconnects. Shutdown drains these tracked tasks.
             return await asyncio.shield(task)
+        except ChoiceInputError as exc:
+            log_input_error(exc)
+            # The original chain is retained and logged above. Prevent upstream
+            # HTTP stack logging from serializing media-bearing cause messages.
+            raise HTTPException(422, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:

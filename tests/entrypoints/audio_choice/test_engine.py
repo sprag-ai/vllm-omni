@@ -347,15 +347,19 @@ def test_native_input_errors_are_redacted_and_aborted(error_type):
         aborted = []
 
         async def generate(*a):
-            raise (VLLMClientError if error_type == "client" else EngineGenerateError)("PRIVATE IMAGE DATA")
+            raise (VLLMClientError if error_type == "client" else EngineGenerateError)(
+                "PRIVATE IMAGE DATA"
+            ) from ValueError("PRIVATE ROOT CAUSE")
             yield
 
         async def abort(request_id):
             aborted.append(request_id)
 
         engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
-        with pytest.raises(ValueError, match="^Invalid or unsupported model input$"):
+        with pytest.raises(ValueError, match="^Invalid or unsupported model input$") as caught:
             await engine.score([1], [2], None)
+        assert isinstance(caught.value.__cause__, VLLMClientError if error_type == "client" else EngineGenerateError)
+        assert isinstance(caught.value.__cause__.__cause__, ValueError)
         assert len(aborted) == 1
         assert engine.slots._value == 1
 

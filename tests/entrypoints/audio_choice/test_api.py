@@ -413,9 +413,12 @@ def test_disabled_visual_http_rejects_without_decode():
         assert not engine.calls
 
 
+@pytest.mark.parametrize("log_error_stack", [False, True])
 @pytest.mark.parametrize("error_type", ["client", "generate"])
 @pytest.mark.parametrize("modality", ["image", "video"])
-def test_native_processor_error_is_422_over_http(error_type, modality, visual_processor, video_bytes):
+def test_native_processor_error_is_422_over_http(
+    error_type, modality, visual_processor, video_bytes, caplog, log_error_stack
+):
     from vllm.exceptions import VLLMClientError
     from vllm.v1.engine.exceptions import EngineGenerateError
 
@@ -432,7 +435,9 @@ def test_native_processor_error_is_422_over_http(error_type, modality, visual_pr
 
     async def generate(prompt, *a):
         if fail[0]:
-            raise (VLLMClientError if error_type == "client" else EngineGenerateError)("PRIVATE PROCESSOR DATA")
+            raise (VLLMClientError if error_type == "client" else EngineGenerateError)(
+                "PRIVATE PROCESSOR DATA"
+            ) from ValueError("PRIVATE ROOT CAUSE")
         yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
 
     async def abort(request_id):
@@ -442,10 +447,15 @@ def test_native_processor_error_is_422_over_http(error_type, modality, visual_pr
     data = io.BytesIO()
     Image.new("RGB", (56, 56)).save(data, format="PNG")
     payload = wire_body("/v1/systemone", modality, data.getvalue() if modality == "image" else video_bytes)
-    with TestClient(build_choice_app(args(), engine)) as client:
+    app_args = args()
+    app_args.log_error_stack = log_error_stack
+    with TestClient(build_choice_app(app_args, engine)) as client:
         response = client.post("/v1/systemone", json=payload, headers=HEADERS)
         assert response.status_code == 422, response.text
         assert response.json()["error"]["message"] == "Invalid or unsupported model input"
+        assert "Choice input rejected; exception chain:" in caplog.text
+        assert "ValueError" in caplog.text
+        assert "PRIVATE PROCESSOR DATA" not in caplog.text and "PRIVATE ROOT CAUSE" not in caplog.text
         assert aborted
         assert client.get("/load").json() == {"server_load": 0}
         assert client.get("/health").status_code == 200
@@ -467,3 +477,57 @@ def test_zero_frame_video_http_rejected(route, visual_processor, video_bytes, mo
         assert response.json()["error"]["message"] == "Invalid or unsupported visual media"
         assert not engine.calls
         assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("cause", [None, RuntimeError, ValueError])
+def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
+    from vllm.v1.engine.exceptions import EngineGenerateError
+
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    engine = Engine()
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.slots = asyncio.Semaphore(1)
+    engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
+    engine.score = AsyncChoiceEngine.score.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+    fail = [True]
+    aborted = []
+
+    async def generate(prompt, *a):
+        if fail[0]:
+            raise EngineGenerateError("PRIVATE FAILURE") from (cause("PRIVATE CAUSE") if cause else None)
+        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    payload = body()
+    if audio:
+        data = io.BytesIO()
+        sf.write(data, np.zeros(1600), 16000, format="WAV")
+        payload = wire_body(route, "audio", data.getvalue())
+    elif route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
+        }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == (422 if cause is ValueError else 500), response.text
+        assert "PRIVATE" not in response.text
+        assert aborted
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.get("/health").status_code == 200
+        fail[0] = False
+        assert client.post(route, json=payload, headers=HEADERS).status_code == 200
