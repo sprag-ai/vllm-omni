@@ -46,6 +46,27 @@ class ChoicePayload(DecisionRequestModel):
     def bound_work(self):
         if sum(len(q.criteria) for q in self.questions.values()) > 255:
             raise ValueError("At most 255 total criteria per request")
+        # Bound textual work separately from the larger base64-audio body limit.
+        pending = [self.state]
+        for key, question in self.questions.items():
+            pending.extend((key, question.instructions, question.criteria))
+        characters = nodes = 0
+        while pending:
+            value = pending.pop()
+            nodes += 1
+            if isinstance(value, str):
+                characters += len(value)
+            elif isinstance(value, dict):
+                if len(value) > 4096:
+                    raise ValueError("Choice text structure exceeds 4096 nodes")
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                if len(value) > 4096:
+                    raise ValueError("Choice text structure exceeds 4096 nodes")
+                pending.extend(value)
+            if nodes > 4096 or characters > 65536:
+                raise ValueError("Choice text exceeds 65536 characters or 4096 structure nodes")
         return self
 
 

@@ -17,6 +17,7 @@ from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
+from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
 
 
@@ -47,9 +48,8 @@ class ChoiceServing(DecisionServing):
             self.pending -= 1
             self.active.discard(future)
             if not future.cancelled():
-                failure = future.exception()
-                if failure is not None and not isinstance(failure, ValueError):
-                    self.errored = True
+                # Observe detached failures; engine.errored owns engine health.
+                future.exception()
 
         task.add_done_callback(done)
         try:
@@ -58,6 +58,11 @@ class ChoiceServing(DecisionServing):
             return await asyncio.shield(task)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            status = 503 if self.errored else 500
+            raise HTTPException(
+                status, "Choice engine unavailable" if status == 503 else "Choice request failed"
+            ) from exc
 
 
 def build_choice_app(args, engine):
@@ -65,11 +70,17 @@ def build_choice_app(args, engine):
     if len(names) != 1:
         raise ValueError("Choice requires exactly one served model name")
     app = build_app(args, ("generate",))
-    keep = {"/health", "/version", "/v1/models", "/load", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+    keep = {"/health", "/version", "/v1/models", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
     app.router.routes[:] = [r for r in app.router.routes if getattr(r, "path", "") in keep]
     handler = ChoiceServing(engine, names[0], getattr(args, "decision_max_pending", 16))
     request_type = create_model("BoundChoiceRequest", __base__=ChoiceRequest, model=(Literal[names[0]], ...))
     chat_type = create_model("BoundChoiceChatRequest", __base__=ChoiceChatRequest, model=(Literal[names[0]], ...))
+
+    async def load():
+        # Count actual admitted work, including disconnected HTTP waiters.
+        return {"server_load": handler.pending}
+
+    app.add_api_route("/load", load, methods=["GET"])
 
     async def system_one(request: request_type) -> ChoiceResponse:
         return await handler.evaluate(request)
@@ -120,8 +131,7 @@ def build_choice_app(args, engine):
     app.state.openai_serving_models = handler
     app.state.engine_client = handler
     app.state.log_stats = False
-    app.state.enable_server_load_tracking = True
-    app.state.server_load_metrics = 0
+    app.state.enable_server_load_tracking = False
     upstream_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -140,6 +150,7 @@ def build_choice_app(args, engine):
 
 
 async def run_choice_server(args, sock, **uvicorn_kwargs):
+    validate_decision_args(args)
     import vllm.envs as envs
     from vllm.entrypoints.launchers.launcher import serve_http
 

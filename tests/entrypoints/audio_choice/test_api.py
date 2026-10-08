@@ -202,3 +202,80 @@ def test_request_bound_and_queue_cleanup_after_disconnected_waiter():
         assert handler.pending == 0 and engine.stopped
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_request_failure_does_not_latch_healthy_engine(fatal):
+    engine = Engine()
+    original = engine.evaluate
+
+    async def fail(*a):
+        engine.errored = fatal
+        raise RuntimeError("PRIVATE INTERNAL FAILURE")
+
+    engine.evaluate = fail
+    with TestClient(build_choice_app(args(), engine), raise_server_exceptions=False) as client:
+        response = client.post("/v1/systemone", json=body(), headers=HEADERS)
+        assert response.status_code == (503 if fatal else 500)
+        assert "PRIVATE INTERNAL" not in response.text
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.get("/health").status_code == (500 if fatal else 200)
+        engine.evaluate = original
+        assert client.post("/v1/systemone", json=body(), headers=HEADERS).status_code == (503 if fatal else 200)
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+def test_load_counts_admitted_work_and_health_remains_responsive(route):
+    import httpx
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        engine = Engine()
+        original = engine.evaluate
+
+        async def delayed(*a):
+            entered.set()
+            await release.wait()
+            return await original(*a)
+
+        engine.evaluate = delayed
+        app = build_choice_app(args(), engine)
+        payload = body()
+        if route.endswith("chat/completions"):
+            payload = {
+                "model": "spev",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": json.dumps({k: v for k, v in body().items() if k != "model"})}
+                        ],
+                    }
+                ],
+            }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HEADERS
+        ) as client:
+            request = asyncio.create_task(client.post(route, json=payload))
+            await entered.wait()
+            assert (await client.get("/load")).json() == {"server_load": 1}
+            assert (await client.get("/health")).status_code == 200
+            assert (await client.post(route, json=payload)).status_code == 429
+            assert (await client.get("/load")).json() == {"server_load": 1}
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert (await client.get("/load")).json() == {"server_load": 1}
+            release.set()
+            await app.state.engine_client.close()
+            assert (await client.get("/load")).json() == {"server_load": 0}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("state", ["x" * 65537, [None] * 4097])
+def test_text_work_budget_rejected_before_inference(state):
+    engine = Engine()
+    with TestClient(build_choice_app(args(), engine)) as client:
+        assert client.post("/v1/systemone", json={**body(), "state": state}, headers=HEADERS).status_code == 422
+        assert not engine.calls

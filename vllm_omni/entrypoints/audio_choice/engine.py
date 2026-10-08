@@ -6,10 +6,14 @@ import hashlib
 import json
 import math
 import os
+import threading
 import uuid
 from pathlib import Path
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, answer, render_question, target
+
+MAX_MODEL_LEN = 8192
+MAX_PROMPT_CHARS = 131072
 
 
 def verify_bundle(root):
@@ -54,6 +58,7 @@ class AsyncChoiceEngine:
         self.processor = Qwen3OmniMoeProcessor.from_pretrained(model, local_files_only=True)
         self.tokenizer = self.processor.tokenizer
         self.slots = asyncio.Semaphore(max_num_seqs)
+        self.prepare_lock = threading.Lock()
         self.llm = AsyncLLM.from_engine_args(
             AsyncEngineArgs(
                 model=model,
@@ -64,7 +69,7 @@ class AsyncChoiceEngine:
                 tensor_parallel_size=1,
                 pipeline_parallel_size=1,
                 max_num_seqs=max_num_seqs,
-                max_model_len=8192,
+                max_model_len=MAX_MODEL_LEN,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_chunked_prefill=False,
                 async_scheduling=False,
@@ -89,16 +94,48 @@ class AsyncChoiceEngine:
             add_generation_prompt=True,
         )
 
-    async def score(self, rendered, key, wave):
+    def audio_tokens(self, wave):
+        from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        features = self.processor.feature_extractor(
+            wave, sampling_rate=16000, padding=True, truncation=False, return_attention_mask=True, return_tensors="np"
+        )
+        return int(_get_feat_extract_output_lengths(features["attention_mask"].sum(-1))[0])
+
+    def prepare(self, question, state, wave):
+        # Called off the event loop. Protect the shared HF processor/tokenizer
+        # from concurrent mutation of its internal padding/truncation settings.
+        with self.prepare_lock:
+            rendered = self.prompt(question, state, wave is not None)
+            if len(rendered) > MAX_PROMPT_CHARS:
+                raise ValueError("Choice prompt exceeds the text size limit")
+            prefix = self.tokenizer.encode(rendered, add_special_tokens=False)
+            if len(prefix) >= MAX_MODEL_LEN:
+                raise ValueError("Choice prompt exceeds the 8192-token context")
+            expanded_length = len(prefix)
+            audio_id = self.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+            if prefix.count(audio_id) != int(wave is not None):
+                raise ValueError("Choice audio placeholder count mismatch")
+            if wave is not None:
+                # Count the same feature-mask expansion used by the native
+                # processor, before submitting any candidate to the scheduler.
+                expanded_length += self.audio_tokens(wave) - 1
+            end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            candidates = {}
+            for key in question.criteria:
+                ids = self.tokenizer.encode(target(key), add_special_tokens=False) + [end_id]
+                # Reserve one token for the discarded internal generation step.
+                if expanded_length + len(ids) + 1 > MAX_MODEL_LEN:
+                    raise ValueError("Choice prompt and target exceed the 8192-token context")
+                candidates[key] = ids
+            return prefix, candidates
+
+    async def score(self, prefix, ids, wave):
         from vllm import SamplingParams
 
-        text = target(key)
-        prefix = self.tokenizer.encode(rendered, add_special_tokens=False)
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if self.tokenizer.encode(rendered + text, add_special_tokens=False) != prefix + ids:
-            raise ValueError("Choice target token boundary changed")
-        ids.append(self.tokenizer.convert_tokens_to_ids("<|im_end|>"))
-        prompt = {"prompt": rendered + text + "<|im_end|>"}
+        # Caller content was escaped before tokenization. Submit IDs directly so
+        # vLLM does not tokenize the shared text again for every candidate.
+        prompt = {"prompt_token_ids": prefix + ids}
         request_id = "choice-" + uuid.uuid4().hex
         if wave is not None:
             prompt.update(multi_modal_data={"audio": (wave, 16000)}, multi_modal_uuids={"audio": [request_id]})
@@ -127,8 +164,8 @@ class AsyncChoiceEngine:
         answers = {}
         input_tokens = 0
         for question_id, question in request.questions.items():
-            rendered = self.prompt(question, request.state, wave is not None)
-            tasks = [asyncio.create_task(self.score(rendered, key, wave)) for key in question.criteria]
+            prefix, candidates = await asyncio.to_thread(self.prepare, question, request.state, wave)
+            tasks = [asyncio.create_task(self.score(prefix, ids, wave)) for ids in candidates.values()]
             try:
                 scores = await asyncio.gather(*tasks)
             finally:

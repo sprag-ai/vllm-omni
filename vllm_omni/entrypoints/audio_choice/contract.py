@@ -50,6 +50,13 @@ class ChoiceResponse(BaseModel):
     usage: Usage
 
 
+def literal_json(value):
+    # Qwen control and multimodal tokens use angle brackets. JSON Unicode
+    # escapes preserve caller strings/keys without letting the tokenizer turn
+    # their literal spelling into template or audio control tokens.
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
 def render_question(question: ChoiceQuestion, state=None):
     # Question ID is intentionally not an argument and never reaches the model.
     payload = {"instructions": question.instructions, "criteria": question.criteria}
@@ -59,13 +66,12 @@ def render_question(question: ChoiceQuestion, state=None):
         "Evaluate the supplied evidence for this Choice question. "
         "Select exactly one named criterion. Return only a JSON object with "
         'the key "choice" and its exact criterion name as the value, then stop. '
-        "Do not return letter aliases, explanations or invented probabilities.\n"
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        "Do not return letter aliases, explanations or invented probabilities.\n" + literal_json(payload)
     )
 
 
 def target(choice: str):
-    return json.dumps({"choice": choice}, ensure_ascii=False, separators=(",", ":"))
+    return literal_json({"choice": choice})
 
 
 def answer(question: ChoiceQuestion, log_scores: dict[str, float], temperature=1.0):
