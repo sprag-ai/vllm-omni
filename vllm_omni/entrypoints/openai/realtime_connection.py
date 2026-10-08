@@ -26,6 +26,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallDelta, ToolCallStreamState, extract_deltas
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.model_executor.models.qwen3_omni.realtime_segments import segment_separator
 
 logger = init_logger(__name__)
 
@@ -34,6 +35,8 @@ logger = init_logger(__name__)
 # legitimately take a long time, but a client that has gone away must not leave
 # the generation task parked forever.
 _TOOL_RESULT_POLL_S = 0.5
+
+_SESSION_TYPES = frozenset({"realtime", "transcription"})
 
 
 @dataclass
@@ -124,6 +127,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._tool_rounds = 0
         self._speaker: str | None = None
         self._instructions: str | None = None
+        self._transcription = False
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -153,6 +157,15 @@ class RealtimeConnection(VllmRealtimeConnection):
             instructions = event.get("instructions")
             if instructions is not None:
                 self._instructions = instructions
+            session_type = event.get("session_type")
+            if session_type is not None:
+                if session_type not in _SESSION_TYPES:
+                    await self.send_error(
+                        f"session_type must be one of {sorted(_SESSION_TYPES)}, got {session_type!r}",
+                        "invalid_session_type",
+                    )
+                    return
+                self._transcription = session_type == "transcription"
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
@@ -252,6 +265,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             tools=self._tools,
             speaker=self._speaker,
             instructions=self._instructions,
+            transcription=self._transcription,
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
@@ -414,12 +428,15 @@ class RealtimeConnection(VllmRealtimeConnection):
             is_streaming=True,
         )
 
+        segment_finished = False
+
         result_gen = None
         try:
             result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
+                output_modalities=["text"] if self._transcription else None,
             )
 
             async for output in result_gen:
@@ -440,6 +457,11 @@ class RealtimeConnection(VllmRealtimeConnection):
                             request_prompt_token_ids = list(output.prompt_token_ids)
 
                     delta_text = first_output.text or ""
+                    if self._transcription and segment_finished and delta_text:
+                        delta_text = segment_separator(full_text, delta_text) + delta_text
+                        segment_finished = False
+                    if first_output.finish_reason is not None:
+                        segment_finished = True
                     full_text += delta_text
                     completion_tokens_len += len(new_token_ids)
 

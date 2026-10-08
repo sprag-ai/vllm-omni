@@ -66,6 +66,10 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.realtime_segments import (
+    SilenceAlignedBuffer,
+    continuation_prompt,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.platforms import current_omni_platform
 
@@ -74,6 +78,12 @@ _DEFAULT_AUDIO_CHUNK_S = 90
 
 _SPLIT_SEARCH_SAMPLES = 1600
 """Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
+
+_REALTIME_SEGMENT_S = 5.0
+"""Longest realtime audio segment decoded as one generation, in seconds."""
+
+_REALTIME_CUT_SEARCH_S = 1.0
+"""Span before the segment limit searched for a transcription session's quietest cut, in seconds."""
 
 
 def _audio_chunk_seconds() -> int:
@@ -362,18 +372,26 @@ class Qwen3OmniMoeForConditionalGeneration(
         tools: list[dict[str, Any]] | None = None,
         speaker: str | None = None,
         instructions: str | None = None,
+        transcription: bool = False,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
         sampling_rate = feature_extractor.sampling_rate
         tokenizer = cached_tokenizer_from_config(model_config)
 
-        # Use a small segment size for low-latency streaming.
-        segment_duration_s = 5.0
-        buffer = Qwen3ASRRealtimeBuffer(
-            sampling_rate=sampling_rate,
-            segment_duration_s=segment_duration_s,
-        )
+        buffer: Qwen3ASRRealtimeBuffer | SilenceAlignedBuffer
+        if transcription:
+            buffer = SilenceAlignedBuffer(
+                sampling_rate=sampling_rate,
+                segment_duration_s=_REALTIME_SEGMENT_S,
+                search_duration_s=_REALTIME_CUT_SEARCH_S,
+                energy_window_samples=_SPLIT_SEARCH_SAMPLES,
+            )
+        else:
+            buffer = Qwen3ASRRealtimeBuffer(
+                sampling_rate=sampling_rate,
+                segment_duration_s=_REALTIME_SEGMENT_S,
+            )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
         if tools or instructions:
@@ -419,6 +437,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+        continuation_token_ids = (
+            tokenizer.encode(continuation_prompt(audio_placeholder)) if transcription else prompt_token_ids
+        )
         # Same shape /v1/chat/completions uses (serving_chat.py): a one-element
         # list under "speaker" in additional_information, read back out by
         # talker_preprocess_prefill via payload.get("speaker").
@@ -431,25 +452,26 @@ class Qwen3OmniMoeForConditionalGeneration(
         # talker to emit duplicate audio. Defer all audio to the final
         # flush so the thinker sees one complete prompt.
         async_chunk = getattr(model_config, "async_chunk", False)
+        segments_yielded = 0
+
+        def segment_prompt(segment: np.ndarray) -> TokensPrompt:
+            return TokensPrompt(
+                prompt_token_ids=continuation_token_ids if segments_yielded else prompt_token_ids,
+                multi_modal_data={"audio": segment},
+                **extra_prompt_kwargs,
+            )
 
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
             if async_chunk:
                 while (segment := buffer.read_audio()) is not None:
-                    yield TokensPrompt(
-                        prompt_token_ids=prompt_token_ids,
-                        multi_modal_data={"audio": segment},
-                        **extra_prompt_kwargs,
-                    )
+                    yield segment_prompt(segment)
+                    segments_yielded += 1
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
-            yield TokensPrompt(
-                prompt_token_ids=prompt_token_ids,
-                multi_modal_data={"audio": remaining},
-                **extra_prompt_kwargs,
-            )
+            yield segment_prompt(remaining)
 
     # ==================== Device utilities ====================
 
