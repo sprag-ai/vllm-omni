@@ -16,6 +16,7 @@ from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError, log_input_error
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
@@ -39,6 +40,9 @@ class ChoiceServing(DecisionServing):
                 wave = await self.loop.run_in_executor(
                     self.pool, parse_audio, {"input_audio": request.input_audio.model_dump()}
                 )
+            if request.input_image is not None or request.input_video is not None:
+                visual = await self.loop.run_in_executor(self.pool, self.engine.decode_visual, request)
+                return await self.engine.evaluate(request, wave, visual=visual)
             return await self.engine.evaluate(request, wave)
 
         task = asyncio.create_task(run())
@@ -56,6 +60,11 @@ class ChoiceServing(DecisionServing):
             # Keep admission until decoding/inference actually completes, even if
             # the HTTP waiter disconnects. Shutdown drains these tracked tasks.
             return await asyncio.shield(task)
+        except ChoiceInputError as exc:
+            log_input_error(exc)
+            # The original chain is retained and logged above. Prevent upstream
+            # HTTP stack logging from serializing media-bearing cause messages.
+            raise HTTPException(422, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
@@ -125,9 +134,11 @@ def build_choice_app(args, engine):
         system_one,
         methods=["POST"],
         response_model=ChoiceResponse,
-        summary="Evaluate named Choice questions",
+        summary="Evaluate Choice, Noul and Score questions",
     )
-    app.add_api_route("/v1/chat/completions", chat, methods=["POST"], summary="Chat compatibility wrapper for Choice")
+    app.add_api_route(
+        "/v1/chat/completions", chat, methods=["POST"], summary="Chat compatibility wrapper for Choice, Noul and Score"
+    )
     app.state.openai_serving_models = handler
     app.state.engine_client = handler
     app.state.log_stats = False
@@ -159,6 +170,9 @@ async def run_choice_server(args, sock, **uvicorn_kwargs):
         args.model,
         args.choice_bundle,
         args.gpu_memory_utilization,
+        enable_vision=args.choice_enable_vision,
+        max_video_seconds=args.choice_max_video_seconds,
+        max_video_frames=args.choice_max_video_frames,
         max_num_seqs=args.max_num_seqs if "max_num_seqs" in keys else 8,
         max_num_batched_tokens=args.max_num_batched_tokens if "max_num_batched_tokens" in keys else None,
     )

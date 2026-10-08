@@ -4,6 +4,7 @@ import base64
 import copy
 import io
 import json
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,8 +12,9 @@ import pytest
 import soundfile as sf
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, answer
+from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, primitive_answer, scoring_question
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
 
@@ -59,12 +61,13 @@ class Engine:
         self.calls = []
         self.stopped = False
 
-    async def evaluate(self, request, wave):
+    async def evaluate(self, request, wave, visual=None):
         self.calls.append((request, wave))
+        self.visual = visual
         return ChoiceResponse(
             model="spev-choice-test",
             answers={
-                key: answer(q, {name: -float(i) for i, name in enumerate(q.criteria)})
+                key: primitive_answer(q, {name: -float(i) for i, name in enumerate(scoring_question(q).criteria)})
                 for key, q in request.questions.items()
             },
             usage=Usage(input_tokens=42, output_tokens=0),
@@ -115,7 +118,7 @@ def test_native_route_auth_wire_response_and_openapi():
         {"stream": True},
         {"temperature": 0.5},
         {"max_tokens": 1},
-        {"questions": {"q": {"type": "noul", "instructions": "Is it urgent?"}}},
+        {"questions": {"q": {"type": "unknown", "instructions": "Is it urgent?"}}},
         {"questions": {"q": {"instructions": "Decide", "criteria": {"a": None, "b": None}}}},
         {"questions": {"q": {"type": "choice", "instructions": "Decide", "criteria": {"a": None}}}},
         {"questions": {"q": {"type": "choice", "instructions": "Decide", "criteria": {"a": True, "b": None}}}},
@@ -279,3 +282,252 @@ def test_text_work_budget_rejected_before_inference(state):
     with TestClient(build_choice_app(args(), engine)) as client:
         assert client.post("/v1/systemone", json={**body(), "state": state}, headers=HEADERS).status_code == 422
         assert not engine.calls
+
+
+def test_native_mixed_primitives_have_discriminated_responses():
+    b = body()
+    b["questions"].update(
+        {
+            "assertion": {"type": "noul", "instructions": "Is it urgent?"},
+            "rating": {"type": "score", "instructions": "Urgency", "criteria": ["routine", "urgent"]},
+        }
+    )
+    engine = Engine()
+    with TestClient(build_choice_app(args(), engine)) as client:
+        r = client.post("/v1/systemone", json=b, headers=HEADERS)
+        assert r.status_code == 200, r.text
+        answers = r.json()["answers"]
+        assert set(answers["assertion"]) == {"type", "noul"}
+        assert set(answers["rating"]) == {"type", "score", "confidence", "legend", "probabilities"}
+        ChoiceResponse.model_validate(r.json())
+
+
+def visual_engine(processor):
+    import threading
+
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    engine = Engine()
+    engine.enable_vision = True
+    engine.processor = processor
+    engine.visual_lock = threading.Lock()
+    engine.max_video_seconds, engine.max_video_frames = 60, 1800
+    engine.decode_visual = lambda request: AsyncChoiceEngine.decode_visual(engine, request)
+    return engine
+
+
+def wire_body(route, modality, data):
+    payload = body()
+    media = {"format": "hint", "data": base64.b64encode(data).decode()}
+    if route == "/v1/systemone":
+        return {**payload, "input_" + modality: media}
+    return {
+        "model": "spev",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})},
+                    {"type": "input_" + modality, "input_" + modality: media},
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_visual_http_decode_redaction_and_recovery(route, modality, visual_processor, video_bytes):
+    data = io.BytesIO()
+    Image.new("RGB", (56, 56), "red").save(data, format="PNG")
+    engine = visual_engine(visual_processor)
+    with TestClient(build_choice_app(args(), engine)) as client:
+        invalid = client.post(route, json=wire_body(route, modality, b"PRIVATE MEDIA"), headers=HEADERS)
+        assert invalid.status_code == 422, invalid.text
+        assert invalid.json()["error"]["message"] == "Invalid or unsupported visual media"
+        assert not engine.calls
+        valid = client.post(
+            route,
+            json=wire_body(route, modality, data.getvalue() if modality == "image" else video_bytes),
+            headers=HEADERS,
+        )
+        assert valid.status_code == 200, valid.text
+        assert getattr(engine.visual, modality) is not None
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("modality", ["audio", "image", "video"])
+def test_chat_duplicate_media_rejected(modality):
+    payload = wire_body("/v1/chat/completions", modality, b"private")
+    payload["messages"][0]["content"].append(copy.deepcopy(payload["messages"][0]["content"][1]))
+    engine = Engine()
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post("/v1/chat/completions", json=payload, headers=HEADERS)
+        assert response.status_code == 422
+        assert not engine.calls
+
+
+def test_visual_decode_and_preflight_once_for_sixteen_questions(visual_processor, monkeypatch):
+    from vllm_omni.entrypoints.audio_choice.media import VisualEvidence
+
+    count = []
+    original = VisualEvidence.token_expansion
+
+    def measured(self, processor):
+        count.append(1)
+        return original(self, processor)
+
+    monkeypatch.setattr(VisualEvidence, "token_expansion", measured)
+    data = io.BytesIO()
+    Image.new("RGB", (56, 56)).save(data, format="PNG")
+    payload = wire_body("/v1/systemone", "image", data.getvalue())
+    payload["questions"] = {str(i): body()["questions"]["routing"] for i in range(16)}
+    engine = visual_engine(visual_processor)
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.tokenizer = visual_processor.tokenizer
+    engine.prepare_lock = threading.Lock()
+    engine.prompt = AsyncChoiceEngine.prompt.__get__(engine)
+    engine.prepare = AsyncChoiceEngine.prepare.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+
+    async def score(*a):
+        return 0.0, 100
+
+    engine.score = score
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post("/v1/systemone", json=payload, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        assert len(response.json()["answers"]) == 16
+        assert count == [1]
+
+
+def test_disabled_visual_http_rejects_without_decode():
+    engine = visual_engine(None)
+    engine.enable_vision = False
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post("/v1/systemone", json=wire_body("/v1/systemone", "image", b"private"), headers=HEADERS)
+        assert response.status_code == 422 and "choice-enable-vision" in response.text
+        assert not engine.calls
+
+
+@pytest.mark.parametrize("log_error_stack", [False, True])
+@pytest.mark.parametrize("error_type", ["client", "generate"])
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_native_processor_error_is_422_over_http(
+    error_type, modality, visual_processor, video_bytes, caplog, log_error_stack
+):
+    from vllm.exceptions import VLLMClientError
+    from vllm.v1.engine.exceptions import EngineGenerateError
+
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    engine = visual_engine(visual_processor)
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.slots = asyncio.Semaphore(1)
+    engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
+    engine.score = AsyncChoiceEngine.score.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+    fail = [True]
+    aborted = []
+
+    async def generate(prompt, *a):
+        if fail[0]:
+            raise (VLLMClientError if error_type == "client" else EngineGenerateError)(
+                "PRIVATE PROCESSOR DATA"
+            ) from ValueError("PRIVATE ROOT CAUSE")
+        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    data = io.BytesIO()
+    Image.new("RGB", (56, 56)).save(data, format="PNG")
+    payload = wire_body("/v1/systemone", modality, data.getvalue() if modality == "image" else video_bytes)
+    app_args = args()
+    app_args.log_error_stack = log_error_stack
+    with TestClient(build_choice_app(app_args, engine)) as client:
+        response = client.post("/v1/systemone", json=payload, headers=HEADERS)
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["message"] == "Invalid or unsupported model input"
+        assert "Choice input rejected; exception chain:" in caplog.text
+        assert "ValueError" in caplog.text
+        assert "PRIVATE PROCESSOR DATA" not in caplog.text and "PRIVATE ROOT CAUSE" not in caplog.text
+        assert aborted
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.get("/health").status_code == 200
+        fail[0] = False
+        assert client.post("/v1/systemone", json=payload, headers=HEADERS).status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+def test_zero_frame_video_http_rejected(route, visual_processor, video_bytes, monkeypatch):
+    from vllm.multimodal.media import MediaWithBytes, VideoMediaIO
+
+    monkeypatch.setattr(
+        VideoMediaIO, "load_bytes", lambda *a: MediaWithBytes((np.zeros((0, 28, 28, 3)), {}), b"private")
+    )
+    engine = visual_engine(visual_processor)
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=wire_body(route, "video", video_bytes), headers=HEADERS)
+        assert response.status_code == 422
+        assert response.json()["error"]["message"] == "Invalid or unsupported visual media"
+        assert not engine.calls
+        assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("cause", [None, RuntimeError, ValueError])
+def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
+    from vllm.v1.engine.exceptions import EngineGenerateError
+
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    engine = Engine()
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.slots = asyncio.Semaphore(1)
+    engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
+    engine.score = AsyncChoiceEngine.score.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+    fail = [True]
+    aborted = []
+
+    async def generate(prompt, *a):
+        if fail[0]:
+            raise EngineGenerateError("PRIVATE FAILURE") from (cause("PRIVATE CAUSE") if cause else None)
+        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    payload = body()
+    if audio:
+        data = io.BytesIO()
+        sf.write(data, np.zeros(1600), 16000, format="WAV")
+        payload = wire_body(route, "audio", data.getvalue())
+    elif route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
+        }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == (422 if cause is ValueError else 500), response.text
+        assert "PRIVATE" not in response.text
+        assert aborted
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.get("/health").status_code == 200
+        fail[0] = False
+        assert client.post(route, json=payload, headers=HEADERS).status_code == 200

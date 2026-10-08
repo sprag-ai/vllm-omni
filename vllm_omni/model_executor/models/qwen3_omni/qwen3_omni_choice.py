@@ -31,8 +31,6 @@ class Qwen3OmniChoiceThinker(Qwen3OmniMoeThinkerForConditionalGeneration):
             raise ValueError("Choice FP32 adapter requires TP=1 and PP=1")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.choice_root = Path(vllm_config.model_config.hf_config.choice_bundle)
-        self.use_deepstack = False
-        self.deepstack_input_embeds = []
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
