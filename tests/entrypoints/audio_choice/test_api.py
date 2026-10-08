@@ -12,7 +12,7 @@ import soundfile as sf
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, answer
+from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, primitive_answer, scoring_question
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
 
@@ -64,7 +64,7 @@ class Engine:
         return ChoiceResponse(
             model="spev-choice-test",
             answers={
-                key: answer(q, {name: -float(i) for i, name in enumerate(q.criteria)})
+                key: primitive_answer(q, {name: -float(i) for i, name in enumerate(scoring_question(q).criteria)})
                 for key, q in request.questions.items()
             },
             usage=Usage(input_tokens=42, output_tokens=0),
@@ -115,7 +115,7 @@ def test_native_route_auth_wire_response_and_openapi():
         {"stream": True},
         {"temperature": 0.5},
         {"max_tokens": 1},
-        {"questions": {"q": {"type": "noul", "instructions": "Is it urgent?"}}},
+        {"questions": {"q": {"type": "unknown", "instructions": "Is it urgent?"}}},
         {"questions": {"q": {"instructions": "Decide", "criteria": {"a": None, "b": None}}}},
         {"questions": {"q": {"type": "choice", "instructions": "Decide", "criteria": {"a": None}}}},
         {"questions": {"q": {"type": "choice", "instructions": "Decide", "criteria": {"a": True, "b": None}}}},
@@ -279,3 +279,21 @@ def test_text_work_budget_rejected_before_inference(state):
     with TestClient(build_choice_app(args(), engine)) as client:
         assert client.post("/v1/systemone", json={**body(), "state": state}, headers=HEADERS).status_code == 422
         assert not engine.calls
+
+
+def test_native_mixed_primitives_have_discriminated_responses():
+    b = body()
+    b["questions"].update(
+        {
+            "assertion": {"type": "noul", "instructions": "Is it urgent?"},
+            "rating": {"type": "score", "instructions": "Urgency", "criteria": ["routine", "urgent"]},
+        }
+    )
+    engine = Engine()
+    with TestClient(build_choice_app(args(), engine)) as client:
+        r = client.post("/v1/systemone", json=b, headers=HEADERS)
+        assert r.status_code == 200, r.text
+        answers = r.json()["answers"]
+        assert set(answers["assertion"]) == {"type", "noul"}
+        assert set(answers["rating"]) == {"type", "score", "confidence", "legend", "probabilities"}
+        ChoiceResponse.model_validate(r.json())

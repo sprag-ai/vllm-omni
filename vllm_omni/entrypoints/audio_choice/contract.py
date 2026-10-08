@@ -17,6 +17,71 @@ class ChoiceQuestion(BaseModel):
     criteria: dict[str, Description | None] = Field(min_length=2, max_length=255)
 
 
+class NoulQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["noul"] = "noul"
+    instructions: Description
+    criteria: dict[Literal["true", "false"], Description] | None = Field(default=None, min_length=2, max_length=2)
+
+
+class ScoreQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["score"] = "score"
+    instructions: Description
+    criteria: list[Description] = Field(min_length=2, max_length=10)
+
+
+Question = Annotated[ChoiceQuestion | NoulQuestion | ScoreQuestion, Field(discriminator="type")]
+
+
+def scoring_question(question: Question) -> ChoiceQuestion:
+    if isinstance(question, ChoiceQuestion):
+        return question
+    if isinstance(question, NoulQuestion):
+        criteria = question.criteria or {"true": "The assertion is true.", "false": "The assertion is false."}
+    else:
+        criteria = {str(i): description for i, description in enumerate(question.criteria)}
+    return ChoiceQuestion(instructions=question.instructions, criteria=criteria)
+
+
+class NoulAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["noul"] = "noul"
+    noul: Probability
+
+
+class ScoreAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["score"] = "score"
+    score: float = Field(ge=0, le=9, allow_inf_nan=False)
+    confidence: Probability
+    legend: dict[str, Description]
+    probabilities: dict[str, Probability]
+
+    @model_validator(mode="after")
+    def valid_distribution(self):
+        n = len(self.legend)
+        keys = {str(i) for i in range(n)}
+        if not 2 <= n <= 10 or set(self.legend) != keys or set(self.probabilities) != keys:
+            raise ValueError("Score levels must be consecutive from zero")
+        values = [self.probabilities[str(i)] for i in range(n)]
+        if abs(sum(values) - 1) > 1e-7:
+            raise ValueError("Probabilities must sum to one")
+        if abs(self.score - sum(i * p for i, p in enumerate(values))) > 1e-7:
+            raise ValueError("Score must equal the expected level")
+        if abs(self.confidence - score_confidence(values)) > 1e-7:
+            raise ValueError("Confidence must follow the documented Score formula")
+        return self
+
+
+def score_confidence(probabilities):
+    n = len(probabilities)
+    peak = probabilities.index(max(probabilities))
+    spread = sum(p * abs(i - peak) for i, p in enumerate(probabilities))
+    even_spread = sum(abs(i - (n - 1) / 2) for i in range(n)) / n
+    return max(0.0, 1 - spread / even_spread)
+
+
 class ChoiceAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     type: Literal["choice"] = "choice"
@@ -46,7 +111,9 @@ class Usage(BaseModel):
 class ChoiceResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     model: str
-    answers: dict[str, ChoiceAnswer] = Field(min_length=1)
+    answers: dict[str, Annotated[ChoiceAnswer | NoulAnswer | ScoreAnswer, Field(discriminator="type")]] = Field(
+        min_length=1
+    )
     usage: Usage
 
 
@@ -91,3 +158,18 @@ def answer(question: ChoiceQuestion, log_scores: dict[str, float], temperature=1
     n = len(probabilities)
     confidence = max(0.0, min(1.0, (probabilities[choice] - 1 / n) / (1 - 1 / n)))
     return ChoiceAnswer(choice=choice, probabilities=probabilities, confidence=confidence)
+
+
+def primitive_answer(question: Question, log_scores, temperature=1.0):
+    result = answer(scoring_question(question), log_scores, temperature)
+    if isinstance(question, NoulQuestion):
+        return NoulAnswer(noul=result.probabilities["true"])
+    if isinstance(question, ScoreQuestion):
+        values = [result.probabilities[str(i)] for i in range(len(question.criteria))]
+        return ScoreAnswer(
+            score=sum(i * p for i, p in enumerate(values)),
+            confidence=score_confidence(values),
+            probabilities=result.probabilities,
+            legend={str(i): description for i, description in enumerate(question.criteria)},
+        )
+    return result

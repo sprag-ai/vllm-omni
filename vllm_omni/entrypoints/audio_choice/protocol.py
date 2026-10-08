@@ -7,7 +7,13 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from vllm_omni.entrypoints.audio_choice.contract import ChoiceQuestion, Description
+from vllm_omni.entrypoints.audio_choice.contract import (
+    ChoiceQuestion,
+    Description,
+    NoulQuestion,
+    ScoreQuestion,
+    scoring_question,
+)
 from vllm_omni.entrypoints.openai.decision_protocol import (
     DecisionInputAudio,
     DecisionRequestModel,
@@ -17,6 +23,17 @@ from vllm_omni.entrypoints.openai.decision_protocol import (
 
 class PublicChoiceQuestion(ChoiceQuestion):
     type: Literal["choice"]
+
+
+class PublicNoulQuestion(NoulQuestion):
+    type: Literal["noul"]
+
+
+class PublicScoreQuestion(ScoreQuestion):
+    type: Literal["score"]
+
+
+PublicQuestion = Annotated[PublicChoiceQuestion | PublicNoulQuestion | PublicScoreQuestion, Field(discriminator="type")]
 
 
 class ChoiceInputAudio(DecisionInputAudio):
@@ -33,6 +50,31 @@ class ChoiceInputAudio(DecisionInputAudio):
         return data
 
 
+class ChoiceInputMedia(DecisionRequestModel):
+    data: str = Field(min_length=1, max_length=16 * 1024 * 1024)
+    format: str = Field(min_length=1)
+
+    @field_validator("data")
+    @classmethod
+    def valid_base64(cls, data):
+        try:
+            if not base64.b64decode(data, validate=True):
+                raise ValueError("Empty media payload")
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Expected nonempty base64 media bytes") from exc
+        return data
+
+
+class ChoiceImagePart(DecisionRequestModel):
+    type: Literal["input_image"]
+    input_image: ChoiceInputMedia
+
+
+class ChoiceVideoPart(DecisionRequestModel):
+    type: Literal["input_video"]
+    input_video: ChoiceInputMedia
+
+
 class ChoiceAudioPart(DecisionRequestModel):
     type: Literal["input_audio"]
     input_audio: ChoiceInputAudio
@@ -40,11 +82,11 @@ class ChoiceAudioPart(DecisionRequestModel):
 
 class ChoicePayload(DecisionRequestModel):
     state: Description
-    questions: dict[str, PublicChoiceQuestion] = Field(min_length=1, max_length=16)
+    questions: dict[str, PublicQuestion] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")
     def bound_work(self):
-        if sum(len(q.criteria) for q in self.questions.values()) > 255:
+        if sum(len(scoring_question(q).criteria) for q in self.questions.values()) > 255:
             raise ValueError("At most 255 total criteria per request")
         # Bound textual work separately from the larger base64-audio body limit.
         pending = [self.state]
@@ -73,16 +115,21 @@ class ChoicePayload(DecisionRequestModel):
 class ChoiceRequest(ChoicePayload):
     model: str = Field(min_length=1)
     input_audio: ChoiceInputAudio | None = None
+    input_image: ChoiceInputMedia | None = None
+    input_video: ChoiceInputMedia | None = None
 
 
 class ChoiceMessage(DecisionRequestModel):
     role: Literal["user"]
-    content: list[Annotated[ChoiceAudioPart | DecisionTextPart, Field(discriminator="type")]] = Field(
-        min_length=1, max_length=2
-    )
+    content: list[
+        Annotated[ChoiceAudioPart | ChoiceImagePart | ChoiceVideoPart | DecisionTextPart, Field(discriminator="type")]
+    ] = Field(min_length=1, max_length=4)
 
     @model_validator(mode="after")
     def validate_parts(self):
+        kinds = [p.type for p in self.content]
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("At most one part of each type is supported")
         texts = [p for p in self.content if isinstance(p, DecisionTextPart)]
         if len(texts) != 1:
             raise ValueError("Exactly one text part containing a ChoicePayload JSON object is required")
@@ -105,7 +152,5 @@ class ChoiceChatRequest(DecisionRequestModel):
     def to_choice(self):
         parts = self.messages[0].content
         payload = ChoicePayload.model_validate_json(next(p.text for p in parts if isinstance(p, DecisionTextPart)))
-        audio = next((p.input_audio for p in parts if isinstance(p, ChoiceAudioPart)), None)
-        return ChoiceRequest(
-            model=self.model, input_audio=audio.model_dump() if audio is not None else None, **payload.model_dump()
-        )
+        media = {p.type: getattr(p, p.type) for p in parts if not isinstance(p, DecisionTextPart)}
+        return ChoiceRequest(model=self.model, **media, **payload.model_dump())

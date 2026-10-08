@@ -16,6 +16,7 @@ from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+from vllm_omni.entrypoints.audio_choice.media import decode_visual
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
@@ -39,6 +40,9 @@ class ChoiceServing(DecisionServing):
                 wave = await self.loop.run_in_executor(
                     self.pool, parse_audio, {"input_audio": request.input_audio.model_dump()}
                 )
+            if request.input_image is not None or request.input_video is not None:
+                visual = await self.loop.run_in_executor(self.pool, decode_visual, request)
+                return await self.engine.evaluate(request, wave, visual=visual)
             return await self.engine.evaluate(request, wave)
 
         task = asyncio.create_task(run())
@@ -125,7 +129,7 @@ def build_choice_app(args, engine):
         system_one,
         methods=["POST"],
         response_model=ChoiceResponse,
-        summary="Evaluate named Choice questions",
+        summary="Evaluate Choice, Noul and Score questions",
     )
     app.add_api_route("/v1/chat/completions", chat, methods=["POST"], summary="Chat compatibility wrapper for Choice")
     app.state.openai_serving_models = handler

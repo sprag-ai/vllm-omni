@@ -10,7 +10,14 @@ import threading
 import uuid
 from pathlib import Path
 
-from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, answer, render_question, target
+from vllm_omni.entrypoints.audio_choice.contract import (
+    ChoiceResponse,
+    Usage,
+    primitive_answer,
+    render_question,
+    scoring_question,
+    target,
+)
 
 MAX_MODEL_LEN = 8192
 MAX_PROMPT_CHARS = 131072
@@ -75,15 +82,17 @@ class AsyncChoiceEngine:
                 async_scheduling=False,
                 enable_prefix_caching=False,
                 gpu_memory_utilization=gpu_memory_utilization,
-                limit_mm_per_prompt={"audio": 1, "image": 0, "video": 0},
+                limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
                 mm_processor_cache_gb=0,
                 seed=17,
                 disable_log_stats=True,
             )
         )
 
-    def prompt(self, question, state, has_audio):
+    def prompt(self, question, state, has_audio, visual=None):
         content = [{"type": "audio", "audio": "provided-array"}] if has_audio else []
+        if visual is not None:
+            content.extend(visual.content())
         content.append({"type": "text", "text": render_question(question, state)})
         return self.processor.apply_chat_template(
             [
@@ -102,11 +111,11 @@ class AsyncChoiceEngine:
         )
         return int(_get_feat_extract_output_lengths(features["attention_mask"].sum(-1))[0])
 
-    def prepare(self, question, state, wave):
+    def prepare(self, question, state, wave, visual=None):
         # Called off the event loop. Protect the shared HF processor/tokenizer
         # from concurrent mutation of its internal padding/truncation settings.
         with self.prepare_lock:
-            rendered = self.prompt(question, state, wave is not None)
+            rendered = self.prompt(question, state, wave is not None, visual)
             if len(rendered) > MAX_PROMPT_CHARS:
                 raise ValueError("Choice prompt exceeds the text size limit")
             prefix = self.tokenizer.encode(rendered, add_special_tokens=False)
@@ -120,6 +129,12 @@ class AsyncChoiceEngine:
                 # Count the same feature-mask expansion used by the native
                 # processor, before submitting any candidate to the scheduler.
                 expanded_length += self.audio_tokens(wave) - 1
+            if visual is not None:
+                for modality in ("image", "video"):
+                    token_id = self.tokenizer.convert_tokens_to_ids(f"<|{modality}_pad|>")
+                    if prefix.count(token_id) != int(getattr(visual, modality) is not None):
+                        raise ValueError(f"Choice {modality} placeholder count mismatch")
+                expanded_length += visual.token_expansion(self.processor)
             end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
             candidates = {}
             for key in question.criteria:
@@ -130,15 +145,18 @@ class AsyncChoiceEngine:
                 candidates[key] = ids
             return prefix, candidates
 
-    async def score(self, prefix, ids, wave):
+    async def score(self, prefix, ids, wave, visual=None):
         from vllm import SamplingParams
 
         # Caller content was escaped before tokenization. Submit IDs directly so
         # vLLM does not tokenize the shared text again for every candidate.
         prompt = {"prompt_token_ids": prefix + ids}
         request_id = "choice-" + uuid.uuid4().hex
+        mm_data = visual.multimodal_data() if visual is not None else {}
         if wave is not None:
-            prompt.update(multi_modal_data={"audio": (wave, 16000)}, multi_modal_uuids={"audio": [request_id]})
+            mm_data["audio"] = (wave, 16000)
+        if mm_data:
+            prompt.update(multi_modal_data=mm_data, multi_modal_uuids={key: [request_id + key] for key in mm_data})
         async with self.slots:
             finished = False
             try:
@@ -160,12 +178,13 @@ class AsyncChoiceEngine:
                 if not finished:
                     await asyncio.shield(self.llm.abort(request_id))
 
-    async def evaluate(self, request, wave=None):
+    async def evaluate(self, request, wave=None, visual=None):
         answers = {}
         input_tokens = 0
         for question_id, question in request.questions.items():
-            prefix, candidates = await asyncio.to_thread(self.prepare, question, request.state, wave)
-            tasks = [asyncio.create_task(self.score(prefix, ids, wave)) for ids in candidates.values()]
+            candidate_question = scoring_question(question)
+            prefix, candidates = await asyncio.to_thread(self.prepare, candidate_question, request.state, wave, visual)
+            tasks = [asyncio.create_task(self.score(prefix, ids, wave, visual)) for ids in candidates.values()]
             try:
                 scores = await asyncio.gather(*tasks)
             finally:
@@ -173,8 +192,10 @@ class AsyncChoiceEngine:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-            answers[question_id] = answer(
-                question, dict(zip(question.criteria, [s[0] for s in scores])), self.temperature
+            # The fitted temperature covers Choice only; new primitives start at identity.
+            temperature = self.temperature if question.type == "choice" and visual is None else 1.0
+            answers[question_id] = primitive_answer(
+                question, dict(zip(candidate_question.criteria, [s[0] for s in scores])), temperature
             )
             # Logical input usage: one shared question prompt; targets are scored, not generated.
             input_tokens += scores[0][1]

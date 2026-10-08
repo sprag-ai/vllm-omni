@@ -35,12 +35,12 @@ def test_question_ids_never_reach_model_and_named_scores_supply_probabilities():
         engine.temperature = 2
         prompts = []
 
-        def prepare(q, state, wave):
+        def prepare(q, state, wave, visual=None):
             return render_question(q, state), {key: key for key in q.criteria}
 
         engine.prepare = prepare
 
-        async def score(rendered, key, wave):
+        async def score(rendered, key, wave, visual=None):
             prompts.append(rendered)
             return ({"billing": 0.0, "technical": -2.0}[key], 123)
 
@@ -65,7 +65,7 @@ def test_failed_candidate_cancels_and_drains_other_candidates():
         entered = asyncio.Event()
         cleaned = asyncio.Event()
 
-        async def score(rendered, key, wave):
+        async def score(rendered, key, wave, visual=None):
             if key == "billing":
                 await entered.wait()
                 raise RuntimeError("failed scoring")
@@ -247,5 +247,76 @@ def test_score_submits_token_ids_without_retokenization():
         assert value == (-0.5, 1)
         assert seen == [{"prompt_token_ids": [10, 11, 90002]}]
         assert engine.tokenizer.calls == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_visual_expansion_is_in_context_budget(modality):
+    engine = preparing_engine()
+    tokens = {"<|audio_pad|>": 90001, "<|im_end|>": 90002, "<|image_pad|>": 90003, "<|video_pad|>": 90004}
+    engine.tokenizer.convert_tokens_to_ids = tokens.__getitem__
+    engine.tokenizer.encode = lambda text, **kw: (
+        [tokens[f"<|{modality}_pad|>"]] + [10] * 8100 if text == "shared prompt" else [11]
+    )
+    visual = SimpleNamespace(
+        image=object() if modality == "image" else None,
+        video=object() if modality == "video" else None,
+        token_expansion=lambda processor: 100,
+    )
+    engine.processor = object()
+    with pytest.raises(ValueError, match="prompt and target"):
+        engine.prepare(next(iter(request().questions.values())), "state", None, visual)
+
+
+def test_visual_payload_reaches_async_llm():
+    from vllm_omni.entrypoints.audio_choice.media import VisualEvidence
+
+    async def run():
+        engine = preparing_engine()
+        engine.slots = asyncio.Semaphore(1)
+        seen = []
+        image, video, wave = object(), object(), [0.0]
+
+        async def generate(prompt, params, request_id):
+            seen.append(prompt)
+            yield SimpleNamespace(
+                prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}]
+            )
+
+        engine.llm = SimpleNamespace(generate=generate)
+        assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (-0.5, 1)
+        assert seen[0]["multi_modal_data"] == {"image": [image], "video": [video], "audio": (wave, 16000)}
+        assert set(seen[0]["multi_modal_uuids"]) == {"image", "video", "audio"}
+
+    asyncio.run(run())
+
+
+def test_new_primitives_and_visual_evidence_do_not_inherit_choice_temperature():
+    async def run():
+        engine = object.__new__(AsyncChoiceEngine)
+        engine.config = {"model": "test"}
+        engine.temperature = 2
+        engine.prepare = lambda question, *args: ([], {key: [i] for i, key in enumerate(question.criteria)})
+
+        async def score(prefix, ids, *args):
+            return -2.0 * ids[0], 12
+
+        engine.score = score
+        ordinary = await engine.evaluate(request())
+        visual = await engine.evaluate(request(), visual=object())
+        assert ordinary.answers["routing"].probabilities["billing"] == pytest.approx(0.7310585786)
+        assert visual.answers["routing"].probabilities["billing"] == pytest.approx(0.8807970780)
+        mixed = ChoiceRequest(
+            model="spev",
+            state={},
+            questions={
+                "n": {"type": "noul", "instructions": "True?"},
+                "s": {"type": "score", "instructions": "Level?", "criteria": ["low", "high"]},
+            },
+        )
+        out = await engine.evaluate(mixed)
+        assert out.answers["n"].noul == pytest.approx(0.8807970780)
+        assert out.answers["s"].score == pytest.approx(0.1192029220)
 
     asyncio.run(run())
