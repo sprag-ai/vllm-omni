@@ -42,7 +42,7 @@ def test_question_ids_never_reach_model_and_named_scores_supply_probabilities():
 
         async def score(rendered, key, wave, visual=None):
             prompts.append(rendered)
-            return ({"billing": 0.0, "technical": -2.0}[key], 123)
+            return ({"billing": 0.0, "technical": -2.0}[key], 123, {})
 
         engine.score = score
         one = await engine.evaluate(request("PRIVATE-CALLER-ID"))
@@ -215,7 +215,7 @@ def test_prepare_runs_off_event_loop():
         engine.prepare = slow
 
         async def score(*a):
-            return 0.0, 12
+            return 0.0, 12, {}
 
         engine.score = score
         task = asyncio.create_task(engine.evaluate(request()))
@@ -244,7 +244,7 @@ def test_score_submits_token_ids_without_retokenization():
 
         engine.llm = SimpleNamespace(generate=generate)
         value = await engine.score([10], [11, 90002], None)
-        assert value == (-0.5, 1)
+        assert value == (-0.5, 1, {})
         assert seen == [{"prompt_token_ids": [10, 11, 90002]}]
         assert engine.tokenizer.calls == []
 
@@ -277,15 +277,25 @@ def test_visual_payload_reaches_async_llm():
         engine.slots = asyncio.Semaphore(1)
         seen = []
         image, video, wave = object(), object(), [0.0]
+        engine.tokenizer.convert_tokens_to_ids = {
+            "<|audio_pad|>": 90001,
+            "<|image_pad|>": 90003,
+            "<|video_pad|>": 90004,
+        }.__getitem__
 
         async def generate(prompt, params, request_id):
             seen.append(prompt)
             yield SimpleNamespace(
-                prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}]
+                prompt_token_ids=[90001, 90003, 90004, 10, 11],
+                prompt_logprobs=[None, None, None, None, {11: SimpleNamespace(logprob=-0.5)}],
             )
 
         engine.llm = SimpleNamespace(generate=generate)
-        assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (-0.5, 1)
+        assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (
+            -0.5,
+            4,
+            {"image": 1, "video": 1, "audio": 1},
+        )
         assert seen[0]["multi_modal_data"] == {"image": [image], "video": [video], "audio": (wave, 16000)}
         assert set(seen[0]["multi_modal_uuids"]) == {"image", "video", "audio"}
 
@@ -300,7 +310,7 @@ def test_new_primitives_and_visual_evidence_do_not_inherit_choice_temperature():
         engine.prepare = lambda question, *args: ([], {key: [i] for i, key in enumerate(question.criteria)})
 
         async def score(prefix, ids, *args):
-            return -2.0 * ids[0], 12
+            return -2.0 * ids[0], 12, {}
 
         engine.score = score
         ordinary = await engine.evaluate(request())
@@ -430,5 +440,56 @@ def test_visual_preflight_does_not_hold_text_preparation_lock(visual_processor, 
         finally:
             release.set()
         await task
+
+    asyncio.run(run())
+
+
+def test_modality_usage_comes_from_expanded_ids_excluding_candidate_target():
+    from vllm_omni.entrypoints.audio_choice.media import VisualEvidence
+
+    async def run():
+        engine = preparing_engine()
+        engine.slots = asyncio.Semaphore(1)
+        pads = {"<|audio_pad|>": 91, "<|image_pad|>": 92, "<|video_pad|>": 93}
+        engine.tokenizer.convert_tokens_to_ids = pads.__getitem__
+        shared = [10, 91, 91, 92, 92, 92, 93, 93, 93, 93, 11]
+        target_ids = [21, 22]
+
+        async def generate(*a):
+            yield SimpleNamespace(
+                prompt_token_ids=shared + target_ids,
+                prompt_logprobs=[None] * len(shared)
+                + [{21: SimpleNamespace(logprob=-0.2)}, {22: SimpleNamespace(logprob=-0.3)}],
+            )
+
+        engine.llm = SimpleNamespace(generate=generate)
+        score, total, counts = await engine.score([10], target_ids, [0.0], VisualEvidence(object(), object()))
+        assert score == -0.5
+        assert total == len(shared)
+        assert counts == {"audio": 2, "image": 3, "video": 4}
+        assert total - sum(counts.values()) == 2
+
+    asyncio.run(run())
+
+
+def test_usage_counts_shared_prompt_once_per_question_not_per_candidate():
+    async def run():
+        engine = object.__new__(AsyncChoiceEngine)
+        engine.config, engine.temperature = {"model": "test"}, 1
+        engine.prepare = lambda q, *a: ([], {key: [i] for i, key in enumerate(q.criteria)})
+
+        async def score(*a):
+            return -1.0, 17, {"audio": 2, "image": 3, "video": 4}
+
+        engine.score = score
+        req = request()
+        req.questions["second"] = next(iter(req.questions.values()))
+        out = await engine.evaluate(req)
+        assert out.usage.input_tokens == 34
+        assert out.usage.output_tokens == 0
+        assert out.usage.input_tokens_details.model_dump() == {
+            "cached_tokens": 0,
+            "multimodal_tokens": {"audio": 4, "image": 6, "video": 8},
+        }
 
     asyncio.run(run())

@@ -114,6 +114,7 @@ def build_choice_app(args, engine):
                 "prompt_tokens": result.usage.input_tokens,
                 "completion_tokens": result.usage.output_tokens,
                 "total_tokens": result.usage.input_tokens + result.usage.output_tokens,
+                "prompt_tokens_details": result.usage.input_tokens_details.model_dump(),
             },
         }
 

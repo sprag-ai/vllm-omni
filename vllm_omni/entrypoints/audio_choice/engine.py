@@ -12,6 +12,8 @@ from pathlib import Path
 
 from vllm_omni.entrypoints.audio_choice.contract import (
     ChoiceResponse,
+    InputTokensDetails,
+    MultimodalTokens,
     Usage,
     primitive_answer,
     render_question,
@@ -198,8 +200,16 @@ class AsyncChoiceEngine:
                 terms = [entry[token].logprob for entry, token in zip(output.prompt_logprobs[-len(ids) :], ids)]
                 if not all(math.isfinite(x) for x in terms):
                     raise RuntimeError("Nonfinite Choice likelihood")
+                shared_ids = output.prompt_token_ids[: -len(ids)]
+                modalities = {}
+                for modality in mm_data:
+                    token_id = self.tokenizer.convert_tokens_to_ids(f"<|{modality}_pad|>")
+                    count = shared_ids.count(token_id)
+                    if count < 1:
+                        raise RuntimeError(f"Missing expanded {modality} tokens in Choice prompt")
+                    modalities[modality] = count
                 finished = True
-                return sum(terms), len(output.prompt_token_ids) - len(ids)
+                return sum(terms), len(shared_ids), modalities
             except (EngineGenerateError, VLLMClientError) as exc:
                 if self.llm.errored:
                     raise
@@ -213,6 +223,7 @@ class AsyncChoiceEngine:
     async def evaluate(self, request, wave=None, visual=None):
         answers = {}
         input_tokens = 0
+        multimodal_tokens = {}
         for question_id, question in request.questions.items():
             candidate_question = scoring_question(question)
             prefix, candidates = await asyncio.to_thread(self.prepare, candidate_question, request.state, wave, visual)
@@ -231,8 +242,18 @@ class AsyncChoiceEngine:
             )
             # Logical input usage: one shared question prompt; targets are scored, not generated.
             input_tokens += scores[0][1]
+            for modality, count in scores[0][2].items():
+                multimodal_tokens[modality] = multimodal_tokens.get(modality, 0) + count
         return ChoiceResponse(
-            model=self.config["model"], answers=answers, usage=Usage(input_tokens=input_tokens, output_tokens=0)
+            model=self.config["model"],
+            answers=answers,
+            usage=Usage(
+                input_tokens=input_tokens,
+                output_tokens=0,
+                input_tokens_details=InputTokensDetails(
+                    multimodal_tokens=MultimodalTokens(**multimodal_tokens) if multimodal_tokens else None
+                ),
+            ),
         )
 
     @property

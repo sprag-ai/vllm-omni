@@ -438,7 +438,13 @@ def test_native_processor_error_is_422_over_http(
             raise (VLLMClientError if error_type == "client" else EngineGenerateError)(
                 "PRIVATE PROCESSOR DATA"
             ) from ValueError("PRIVATE ROOT CAUSE")
-        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
+        pads = engine.tokenizer
+        media_ids = [pads.convert_tokens_to_ids(f"<|{key}_pad|>") for key in prompt.get("multi_modal_data", {})]
+        prefix = [10] + media_ids
+        yield SimpleNamespace(
+            prompt_token_ids=prefix + [11],
+            prompt_logprobs=[None] * len(prefix) + [{11: SimpleNamespace(logprob=-0.5)}],
+        )
 
     async def abort(request_id):
         aborted.append(request_id)
@@ -489,6 +495,10 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
 
     engine = Engine()
     engine.config, engine.temperature = {"model": "test"}, 1
+    if not hasattr(engine, "tokenizer"):
+        engine.tokenizer = SimpleNamespace(
+            convert_tokens_to_ids={"<|audio_pad|>": 91, "<|image_pad|>": 92, "<|video_pad|>": 93}.__getitem__
+        )
     engine.slots = asyncio.Semaphore(1)
     engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
     engine.score = AsyncChoiceEngine.score.__get__(engine)
@@ -499,7 +509,13 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
     async def generate(prompt, *a):
         if fail[0]:
             raise EngineGenerateError("PRIVATE FAILURE") from (cause("PRIVATE CAUSE") if cause else None)
-        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
+        pads = engine.tokenizer
+        media_ids = [pads.convert_tokens_to_ids(f"<|{key}_pad|>") for key in prompt.get("multi_modal_data", {})]
+        prefix = [10] + media_ids
+        yield SimpleNamespace(
+            prompt_token_ids=prefix + [11],
+            prompt_logprobs=[None] * len(prefix) + [{11: SimpleNamespace(logprob=-0.5)}],
+        )
 
     async def abort(request_id):
         aborted.append(request_id)
@@ -531,3 +547,41 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
         assert client.get("/health").status_code == 200
         fail[0] = False
         assert client.post(route, json=payload, headers=HEADERS).status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+def test_modality_usage_details_survive_both_http_transports(route):
+    from vllm_omni.entrypoints.audio_choice.contract import InputTokensDetails, MultimodalTokens
+
+    engine = Engine()
+    original = engine.evaluate
+
+    async def evaluate(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        result.usage.input_tokens_details = InputTokensDetails(
+            multimodal_tokens=MultimodalTokens(audio=2, image=3, video=4)
+        )
+        return result
+
+    engine.evaluate = evaluate
+    payload = body()
+    if route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
+        }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        key = "input_tokens_details" if route == "/v1/systemone" else "prompt_tokens_details"
+        assert response.json()["usage"][key] == {
+            "cached_tokens": 0,
+            "multimodal_tokens": {"audio": 2, "image": 3, "video": 4},
+        }

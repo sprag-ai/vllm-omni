@@ -95,6 +95,22 @@ Invalid requests return 422 with field locations but no submitted input echoed i
 
 `/v1/chat/completions` remains an explicitly labeled compatibility wrapper: one user message with one text part containing a JSON `{"state": ..., "questions": ...}` object, and optionally one part for each media type: `input_audio`, `input_image`, `input_video`, each with its corresponding named payload field. Its `message.content` is the entire native response serialized as JSON. TypeSafe clients should use `/v1/systemone` directly.
 
+## Usage attribution
+
+`usage.input_tokens` counts each shared question prompt once after vLLM expands its media placeholders.
+`usage.input_tokens_details` reports `cached_tokens: 0` (prefix caching is disabled) and
+`multimodal_tokens` with `audio`, `image` and `video` counts. A modality absent from the request is
+`null`; text-only prompts report `multimodal_tokens: null`. Counts come from the completed expanded
+prompt token IDs, not source resolution, frame-rate estimates or preflight geometry. Video soundtrack
+is not included; separately supplied audio is counted on the audio modality.
+
+For several questions, totals and modality counts sum across their shared prompts. Candidate target
+suffixes and discarded internal output samples are excluded; adding criteria does not multiply usage.
+Input text attribution is the input total minus the modality counts. These are model token quantities,
+not a billing policy or an assertion that source-resolution billing equals processor tokenization.
+The chat wrapper exposes the same details as `usage.prompt_tokens_details` and includes the native
+usage inside its JSON message content.
+
 ## Runtime scope
 
 This uses AsyncLLM and the native Qwen3-Omni Thinker with the trained FP32 Q/V adapter. It scores each complete named JSON target, including the end marker, through prompt log probabilities. Prompt preparation runs off the event loop. Caller angle brackets are JSON-escaped, preserving their values without allowing literal special tokens to become conversation or audio markers. This prevents structural token injection; it is not a guarantee against semantic prompt injection. The shared prefix is tokenized once per question and submitted as token IDs. The 8192-token budget includes expanded audio, image and video placeholders, each target and the discarded sample, and is checked before candidate scheduling. Candidates can batch through the scheduler; each candidate still repeats model prefill and media processing. This is more work than the old fixed three-class early-exit policy and inherits no latency claim from it.
