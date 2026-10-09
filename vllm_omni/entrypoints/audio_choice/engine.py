@@ -12,6 +12,8 @@ from pathlib import Path
 
 from vllm_omni.entrypoints.audio_choice.contract import (
     ChoiceResponse,
+    InputTokensDetails,
+    MultimodalTokens,
     Usage,
     primitive_answer,
     render_question,
@@ -171,6 +173,7 @@ class AsyncChoiceEngine:
 
     async def score(self, prefix, ids, wave, visual=None):
         from vllm import SamplingParams
+        from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts
         from vllm.exceptions import VLLMClientError
         from vllm.v1.engine.exceptions import EngineGenerateError
 
@@ -186,9 +189,15 @@ class AsyncChoiceEngine:
         async with self.slots:
             finished = False
             try:
+                # Use the same rendered input and modality accounting as upstream chat.
+                # AsyncLLM accepts EngineInput without repeating media preprocessing.
+                (engine_input,) = await self.llm.renderer.render_cmpl_async([prompt])
+                modalities = _get_mm_token_counts(engine_input)
                 output = None
                 async for update in self.llm.generate(
-                    prompt, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True, prompt_logprobs=0), request_id
+                    engine_input,
+                    SamplingParams(temperature=0, max_tokens=1, ignore_eos=True, prompt_logprobs=0),
+                    request_id,
                 ):
                     output = update
                 if output is None or output.prompt_logprobs is None:
@@ -198,12 +207,13 @@ class AsyncChoiceEngine:
                 terms = [entry[token].logprob for entry, token in zip(output.prompt_logprobs[-len(ids) :], ids)]
                 if not all(math.isfinite(x) for x in terms):
                     raise RuntimeError("Nonfinite Choice likelihood")
+                shared_ids = output.prompt_token_ids[: -len(ids)]
                 finished = True
-                return sum(terms), len(output.prompt_token_ids) - len(ids)
-            except (EngineGenerateError, VLLMClientError) as exc:
+                return sum(terms), len(shared_ids), modalities
+            except (EngineGenerateError, VLLMClientError, ValueError) as exc:
                 if self.llm.errored:
                     raise
-                if isinstance(exc, VLLMClientError) or isinstance(exc.__cause__, ValueError):
+                if isinstance(exc, (VLLMClientError, ValueError)) or isinstance(exc.__cause__, ValueError):
                     raise ChoiceInputError("Invalid or unsupported model input") from exc
                 raise
             finally:
@@ -213,6 +223,7 @@ class AsyncChoiceEngine:
     async def evaluate(self, request, wave=None, visual=None):
         answers = {}
         input_tokens = 0
+        multimodal_tokens = {}
         for question_id, question in request.questions.items():
             candidate_question = scoring_question(question)
             prefix, candidates = await asyncio.to_thread(self.prepare, candidate_question, request.state, wave, visual)
@@ -231,8 +242,18 @@ class AsyncChoiceEngine:
             )
             # Logical input usage: one shared question prompt; targets are scored, not generated.
             input_tokens += scores[0][1]
+            for modality, count in scores[0][2].items():
+                multimodal_tokens[modality] = multimodal_tokens.get(modality, 0) + count
         return ChoiceResponse(
-            model=self.config["model"], answers=answers, usage=Usage(input_tokens=input_tokens, output_tokens=0)
+            model=self.config["model"],
+            answers=answers,
+            usage=Usage(
+                input_tokens=input_tokens,
+                output_tokens=0,
+                input_tokens_details=InputTokensDetails(
+                    multimodal_tokens=MultimodalTokens(**multimodal_tokens) if multimodal_tokens else None
+                ),
+            ),
         )
 
     @property

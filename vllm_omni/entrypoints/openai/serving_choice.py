@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import create_model
 from vllm.entrypoints.openai.api_server import build_app
+from vllm.entrypoints.openai.chat_completion.serving import _make_prompt_tokens_details
 from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
@@ -64,8 +65,13 @@ class ChoiceServing(DecisionServing):
             log_input_error(exc)
             # The original chain is retained and logged above. Prevent upstream
             # HTTP stack logging from serializing media-bearing cause messages.
-            raise HTTPException(422, str(exc)) from None
+            status = 503 if self.errored else 422
+            message = "Choice engine unavailable" if self.errored else str(exc)
+            raise HTTPException(status, message) from None
         except ValueError as exc:
+            if self.errored:
+                log_input_error(exc)
+                raise HTTPException(503, "Choice engine unavailable") from None
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
             status = 503 if self.errored else 500
@@ -114,6 +120,14 @@ def build_choice_app(args, engine):
                 "prompt_tokens": result.usage.input_tokens,
                 "completion_tokens": result.usage.output_tokens,
                 "total_tokens": result.usage.input_tokens + result.usage.output_tokens,
+                "prompt_tokens_details": _make_prompt_tokens_details(
+                    True,
+                    result.usage.input_tokens_details.cached_tokens,
+                    0,
+                    result.usage.input_tokens_details.multimodal_tokens.model_dump(exclude_none=True)
+                    if result.usage.input_tokens_details.multimodal_tokens is not None
+                    else None,
+                ).model_dump(),
             },
         }
 

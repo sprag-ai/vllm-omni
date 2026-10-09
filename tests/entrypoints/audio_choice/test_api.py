@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tests.entrypoints.audio_choice.helpers import fake_llm
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, primitive_answer, scoring_question
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
@@ -443,7 +444,7 @@ def test_native_processor_error_is_422_over_http(
     async def abort(request_id):
         aborted.append(request_id)
 
-    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    engine.llm = fake_llm(generate=generate, abort=abort, errored=False)
     data = io.BytesIO()
     Image.new("RGB", (56, 56)).save(data, format="PNG")
     payload = wire_body("/v1/systemone", modality, data.getvalue() if modality == "image" else video_bytes)
@@ -453,7 +454,7 @@ def test_native_processor_error_is_422_over_http(
         response = client.post("/v1/systemone", json=payload, headers=HEADERS)
         assert response.status_code == 422, response.text
         assert response.json()["error"]["message"] == "Invalid or unsupported model input"
-        assert "Choice input rejected; exception chain:" in caplog.text
+        assert "Choice request failed; exception chain:" in caplog.text
         assert "ValueError" in caplog.text
         assert "PRIVATE PROCESSOR DATA" not in caplog.text and "PRIVATE ROOT CAUSE" not in caplog.text
         assert aborted
@@ -504,7 +505,7 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
     async def abort(request_id):
         aborted.append(request_id)
 
-    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    engine.llm = fake_llm(generate=generate, abort=abort, errored=False)
     payload = body()
     if audio:
         data = io.BytesIO()
@@ -531,3 +532,97 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
         assert client.get("/health").status_code == 200
         fail[0] = False
         assert client.post(route, json=payload, headers=HEADERS).status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+@pytest.mark.parametrize("counts", [{"audio": 2, "image": 3, "video": 4}, {"image": 3}, {}])
+def test_modality_usage_details_survive_both_http_transports(route, counts):
+    from vllm_omni.entrypoints.audio_choice.contract import InputTokensDetails, MultimodalTokens
+
+    engine = Engine()
+    original = engine.evaluate
+
+    async def evaluate(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        result.usage.input_tokens_details = InputTokensDetails(
+            multimodal_tokens=MultimodalTokens(**counts) if counts else None
+        )
+        return result
+
+    engine.evaluate = evaluate
+    payload = body()
+    if route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
+        }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        key = "input_tokens_details" if route == "/v1/systemone" else "prompt_tokens_details"
+        expected = {"cached_tokens": 0, "multimodal_tokens": counts or None}
+        if route.endswith("chat/completions"):
+            expected["created_cache_tokens"] = 0
+        elif counts:
+            expected["multimodal_tokens"] = {modality: counts.get(modality) for modality in ("audio", "image", "video")}
+        assert response.json()["usage"][key] == expected
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+def test_renderer_value_error_after_engine_failure_is_redacted_503(route, caplog):
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    class FailingEngine(Engine):
+        @property
+        def errored(self):
+            return self.llm.errored
+
+    engine = FailingEngine()
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.slots = asyncio.Semaphore(1)
+    engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
+    engine.score = AsyncChoiceEngine.score.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+    aborted = []
+
+    async def render(prompts):
+        engine.llm.errored = True
+        raise ValueError("PRIVATE PROCESSOR DATA")
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    engine.llm = fake_llm(abort=abort)
+    engine.llm.renderer.render_cmpl_async = render
+    payload = body()
+    if route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
+        }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["message"] == "Choice engine unavailable"
+        assert "PRIVATE PROCESSOR DATA" not in response.text
+        assert "PRIVATE PROCESSOR DATA" not in caplog.text
+        assert "ValueError" in caplog.text
+        assert "Choice request failed; exception chain:" in caplog.text
+        assert "Choice input rejected" not in caplog.text
+        assert aborted
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.post(route, json=payload, headers=HEADERS).status_code == 503
