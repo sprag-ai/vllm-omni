@@ -21,4 +21,4 @@ def log_input_error(error):
         locations = [f"{f.filename}:{f.lineno} in {f.name}" for f in traceback.extract_tb(error.__traceback__)]
         chain.append(f"{type(error).__name__}: " + ", ".join(locations))
         error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
-    logger.warning("Choice input rejected; exception chain: %s", " <- ".join(chain))
+    logger.warning("Choice request failed; exception chain: %s", " <- ".join(chain))

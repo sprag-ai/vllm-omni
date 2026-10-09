@@ -454,7 +454,7 @@ def test_native_processor_error_is_422_over_http(
         response = client.post("/v1/systemone", json=payload, headers=HEADERS)
         assert response.status_code == 422, response.text
         assert response.json()["error"]["message"] == "Invalid or unsupported model input"
-        assert "Choice input rejected; exception chain:" in caplog.text
+        assert "Choice request failed; exception chain:" in caplog.text
         assert "ValueError" in caplog.text
         assert "PRIVATE PROCESSOR DATA" not in caplog.text and "PRIVATE ROOT CAUSE" not in caplog.text
         assert aborted
@@ -570,8 +570,6 @@ def test_modality_usage_details_survive_both_http_transports(route, counts):
         expected = {"cached_tokens": 0, "multimodal_tokens": counts or None}
         if route.endswith("chat/completions"):
             expected["created_cache_tokens"] = 0
-            if counts:
-                assert sum(response.json()["usage"][key]["multimodal_tokens"].values()) == sum(counts.values())
         elif counts:
             expected["multimodal_tokens"] = {modality: counts.get(modality) for modality in ("audio", "image", "video")}
         assert response.json()["usage"][key] == expected
@@ -623,6 +621,8 @@ def test_renderer_value_error_after_engine_failure_is_redacted_503(route, caplog
         assert "PRIVATE PROCESSOR DATA" not in response.text
         assert "PRIVATE PROCESSOR DATA" not in caplog.text
         assert "ValueError" in caplog.text
+        assert "Choice request failed; exception chain:" in caplog.text
+        assert "Choice input rejected" not in caplog.text
         assert aborted
         assert client.get("/load").json() == {"server_load": 0}
         assert client.post(route, json=payload, headers=HEADERS).status_code == 503
