@@ -231,7 +231,7 @@ class DecisionsRequest(DecisionObject):
     model: str = Field(min_length=1, description="model identifier or alias")
     input: DecisionInput = Field(description="shared text or user evidence messages")
     questions: list[DecisionQuestion] = Field(min_length=1, description="questions in answer order")
-    safety_identifier: str | None = Field(default=None, max_length=64, description="opaque end-user safety identifier")
+    safety_identifier: str | None = Field(default=None, max_length=128, description="opaque end-user safety identifier")
     input_audio: ChoiceInputAudio | None = Field(
         default=None, description="Sprag extension: inline native audio evidence"
     )
