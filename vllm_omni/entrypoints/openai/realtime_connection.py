@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
@@ -37,6 +38,21 @@ logger = init_logger(__name__)
 _TOOL_RESULT_POLL_S = 0.5
 
 _SESSION_TYPES = frozenset({"realtime", "transcription"})
+
+
+def _declared_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return the entries of ``kwargs`` that ``fn`` declares, or all of them when it takes ``**kwargs``.
+
+    A set value the function does not declare is dropped with a one-time warning.
+    """
+    parameters = inspect.signature(fn).parameters
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+    declared = {name: value for name, value in kwargs.items() if name in parameters}
+    dropped = sorted(name for name, value in kwargs.items() if name not in declared and value)
+    if dropped:
+        logger.warning_once("%s does not accept %s; ignoring them", fn.__qualname__, ", ".join(dropped))
+    return declared
 
 
 @dataclass
@@ -265,14 +281,18 @@ class RealtimeConnection(VllmRealtimeConnection):
         no seam for extra per-connection state like these, so this
         reimplements its (short) body directly rather than patching upstream
         vLLM."""
-        stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream,
-            input_stream,
-            self.serving.model_config,
-            tools=self._tools,
-            speaker=self._speaker,
-            instructions=self._instructions,
-            transcription=transcription,
+        buffer_realtime_audio = self.serving.model_cls.buffer_realtime_audio
+        session_kwargs = _declared_kwargs(
+            buffer_realtime_audio,
+            {
+                "tools": self._tools,
+                "speaker": self._speaker,
+                "instructions": self._instructions,
+                "transcription": transcription,
+            },
+        )
+        stream_input_iter = buffer_realtime_audio(
+            audio_stream, input_stream, self.serving.model_config, **session_kwargs
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
