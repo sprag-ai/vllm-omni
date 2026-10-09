@@ -196,3 +196,15 @@ def test_unsupported_images_are_explicitly_rejected(parts):
 def test_native_work_limits_still_apply(change):
     with pytest.raises(ValidationError):
         to_choice(DecisionsRequest.model_validate({**payload(), **change}))
+
+
+@pytest.mark.parametrize("length", [64, 65, 128, 129])
+def test_safety_identifier_limit(length):
+    data = {**payload(), "safety_identifier": "x" * length}
+    if length > 128:
+        with pytest.raises(ValidationError):
+            DecisionsRequest.model_validate(data)
+    else:
+        request = DecisionsRequest.model_validate(data)
+        assert request.safety_identifier == "x" * length
+        assert to_choice(request).model_dump() == to_choice(DecisionsRequest.model_validate(payload())).model_dump()
