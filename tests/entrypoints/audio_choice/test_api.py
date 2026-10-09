@@ -14,17 +14,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tests.entrypoints.audio_choice.helpers import fake_llm
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, primitive_answer, scoring_question
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
-
-
-async def render_inputs(prompts):
-    return [dict(prompt, type="token") for prompt in prompts]
-
-
-def fake_llm(**kwargs):
-    return SimpleNamespace(renderer=SimpleNamespace(render_cmpl_async=render_inputs), **kwargs)
 
 
 def args():
@@ -446,13 +439,7 @@ def test_native_processor_error_is_422_over_http(
             raise (VLLMClientError if error_type == "client" else EngineGenerateError)(
                 "PRIVATE PROCESSOR DATA"
             ) from ValueError("PRIVATE ROOT CAUSE")
-        pads = engine.tokenizer
-        media_ids = [pads.convert_tokens_to_ids(f"<|{key}_pad|>") for key in prompt.get("multi_modal_data", {})]
-        prefix = [10] + media_ids
-        yield SimpleNamespace(
-            prompt_token_ids=prefix + [11],
-            prompt_logprobs=[None] * len(prefix) + [{11: SimpleNamespace(logprob=-0.5)}],
-        )
+        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
 
     async def abort(request_id):
         aborted.append(request_id)
@@ -503,10 +490,6 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
 
     engine = Engine()
     engine.config, engine.temperature = {"model": "test"}, 1
-    if not hasattr(engine, "tokenizer"):
-        engine.tokenizer = SimpleNamespace(
-            convert_tokens_to_ids={"<|audio_pad|>": 91, "<|image_pad|>": 92, "<|video_pad|>": 93}.__getitem__
-        )
     engine.slots = asyncio.Semaphore(1)
     engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
     engine.score = AsyncChoiceEngine.score.__get__(engine)
@@ -517,13 +500,7 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
     async def generate(prompt, *a):
         if fail[0]:
             raise EngineGenerateError("PRIVATE FAILURE") from (cause("PRIVATE CAUSE") if cause else None)
-        pads = engine.tokenizer
-        media_ids = [pads.convert_tokens_to_ids(f"<|{key}_pad|>") for key in prompt.get("multi_modal_data", {})]
-        prefix = [10] + media_ids
-        yield SimpleNamespace(
-            prompt_token_ids=prefix + [11],
-            prompt_logprobs=[None] * len(prefix) + [{11: SimpleNamespace(logprob=-0.5)}],
-        )
+        yield SimpleNamespace(prompt_token_ids=[10, 11], prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}])
 
     async def abort(request_id):
         aborted.append(request_id)
@@ -558,7 +535,8 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
 
 
 @pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
-def test_modality_usage_details_survive_both_http_transports(route):
+@pytest.mark.parametrize("counts", [{"audio": 2, "image": 3, "video": 4}, {"image": 3}, {}])
+def test_modality_usage_details_survive_both_http_transports(route, counts):
     from vllm_omni.entrypoints.audio_choice.contract import InputTokensDetails, MultimodalTokens
 
     engine = Engine()
@@ -567,7 +545,7 @@ def test_modality_usage_details_survive_both_http_transports(route):
     async def evaluate(*args, **kwargs):
         result = await original(*args, **kwargs)
         result.usage.input_tokens_details = InputTokensDetails(
-            multimodal_tokens=MultimodalTokens(audio=2, image=3, video=4)
+            multimodal_tokens=MultimodalTokens(**counts) if counts else None
         )
         return result
 
@@ -589,7 +567,62 @@ def test_modality_usage_details_survive_both_http_transports(route):
         response = client.post(route, json=payload, headers=HEADERS)
         assert response.status_code == 200, response.text
         key = "input_tokens_details" if route == "/v1/systemone" else "prompt_tokens_details"
-        assert response.json()["usage"][key] == {
-            "cached_tokens": 0,
-            "multimodal_tokens": {"audio": 2, "image": 3, "video": 4},
+        expected = {"cached_tokens": 0, "multimodal_tokens": counts or None}
+        if route.endswith("chat/completions"):
+            expected["created_cache_tokens"] = 0
+            if counts:
+                assert sum(response.json()["usage"][key]["multimodal_tokens"].values()) == sum(counts.values())
+        elif counts:
+            expected["multimodal_tokens"] = {modality: counts.get(modality) for modality in ("audio", "image", "video")}
+        assert response.json()["usage"][key] == expected
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/chat/completions"])
+def test_renderer_value_error_after_engine_failure_is_redacted_503(route, caplog):
+    from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
+
+    class FailingEngine(Engine):
+        @property
+        def errored(self):
+            return self.llm.errored
+
+    engine = FailingEngine()
+    engine.config, engine.temperature = {"model": "test"}, 1
+    engine.slots = asyncio.Semaphore(1)
+    engine.prepare = lambda question, *a: ([10], {key: [11] for key in question.criteria})
+    engine.score = AsyncChoiceEngine.score.__get__(engine)
+    engine.evaluate = AsyncChoiceEngine.evaluate.__get__(engine)
+    aborted = []
+
+    async def render(prompts):
+        engine.llm.errored = True
+        raise ValueError("PRIVATE PROCESSOR DATA")
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    engine.llm = fake_llm(abort=abort)
+    engine.llm.renderer.render_cmpl_async = render
+    payload = body()
+    if route.endswith("chat/completions"):
+        payload = {
+            "model": "spev",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": json.dumps({k: v for k, v in payload.items() if k != "model"})}
+                    ],
+                }
+            ],
         }
+    with TestClient(build_choice_app(args(), engine)) as client:
+        response = client.post(route, json=payload, headers=HEADERS)
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["message"] == "Choice engine unavailable"
+        assert "PRIVATE PROCESSOR DATA" not in response.text
+        assert "PRIVATE PROCESSOR DATA" not in caplog.text
+        assert "ValueError" in caplog.text
+        assert aborted
+        assert client.get("/load").json() == {"server_load": 0}
+        assert client.post(route, json=payload, headers=HEADERS).status_code == 503

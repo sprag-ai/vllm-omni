@@ -7,18 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.entrypoints.audio_choice.helpers import fake_llm
 from vllm_omni.entrypoints.audio_choice.contract import render_question
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine, verify_bundle
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
-
-
-async def render_inputs(prompts):
-    return [dict(prompt, type="token") for prompt in prompts]
-
-
-def fake_llm(**kwargs):
-    kwargs.setdefault("errored", False)
-    return SimpleNamespace(renderer=SimpleNamespace(render_cmpl_async=render_inputs), **kwargs)
 
 
 def request(question_id="routing"):
@@ -286,25 +278,16 @@ def test_visual_payload_reaches_async_llm():
         engine.slots = asyncio.Semaphore(1)
         seen = []
         image, video, wave = object(), object(), [0.0]
-        engine.tokenizer.convert_tokens_to_ids = {
-            "<|audio_pad|>": 90001,
-            "<|image_pad|>": 90003,
-            "<|video_pad|>": 90004,
-        }.__getitem__
 
         async def generate(prompt, params, request_id):
             seen.append(prompt)
             yield SimpleNamespace(
-                prompt_token_ids=[90001, 90003, 90004, 10, 11],
-                prompt_logprobs=[None, None, None, None, {11: SimpleNamespace(logprob=-0.5)}],
+                prompt_token_ids=[10, 11],
+                prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.5)}],
             )
 
         engine.llm = fake_llm(generate=generate)
-        assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (
-            -0.5,
-            4,
-            {},
-        )
+        assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (-0.5, 1, {})
         assert seen[0]["multi_modal_data"] == {"image": [image], "video": [video], "audio": (wave, 16000)}
         assert set(seen[0]["multi_modal_uuids"]) == {"image", "video", "audio"}
 

@@ -110,8 +110,12 @@ For several questions, totals and modality counts sum across their shared prompt
 suffixes and discarded internal output samples are excluded; adding criteria does not multiply usage.
 Input text attribution is the input total minus the modality counts. These are model token quantities,
 not a billing policy or an assertion that source-resolution billing equals processor tokenization.
-The chat wrapper exposes the same details as `usage.prompt_tokens_details` and includes the native
-usage inside its JSON message content.
+The chat wrapper uses upstream `_make_prompt_tokens_details` for `usage.prompt_tokens_details`.
+Its `multimodal_tokens` dictionary omits absent modalities; cached and created-cache tokens are zero
+because caching is disabled. Text-only input uses upstream's null multimodal breakdown. Native
+SystemOne retains its typed nullable modality fields inside `input_tokens_details`; the chat message
+content includes that native response. The same accounting refers to native counts, while these two
+transport envelopes have their respective JSON shapes.
 
 ## Runtime scope
 
