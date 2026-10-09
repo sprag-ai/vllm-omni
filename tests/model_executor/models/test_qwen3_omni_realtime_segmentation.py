@@ -35,7 +35,17 @@ def test_a_zero_search_cuts_at_the_segment_limit(monkeypatch):
 
 @pytest.mark.parametrize(
     ("segment", "search"),
-    [("abc", None), (None, "x"), ("2", "2"), ("2", "3"), ("0", None), (None, "-1")],
+    [
+        ("abc", None),
+        (None, "x"),
+        ("2", "2"),
+        ("2", "3"),
+        ("0", None),
+        (None, "-1"),
+        ("inf", None),
+        ("1e309", None),
+        ("nan", None),
+    ],
 )
 def test_an_invalid_pair_falls_back_to_both_defaults(monkeypatch, segment, search):
     assert segmentation(monkeypatch, segment, search) == (5.0, 1.0)

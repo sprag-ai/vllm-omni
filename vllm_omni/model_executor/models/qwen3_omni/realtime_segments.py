@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 import numpy as np
 
 _UNSPACED_SCRIPT_RANGES = (
@@ -20,10 +22,16 @@ _UNSPACED_SCRIPT_RANGES = (
 
 _NO_SPACE_BEFORE = frozenset(".,;:!?)]}%")
 
+_CLOSING_PUNCTUATION_CATEGORIES = frozenset({"Pe", "Pf"})
+
 
 def _is_unspaced(char: str) -> bool:
     codepoint = ord(char)
     return any(low <= codepoint <= high for low, high in _UNSPACED_SCRIPT_RANGES)
+
+
+def _closes(char: str) -> bool:
+    return char in _NO_SPACE_BEFORE or unicodedata.category(char) in _CLOSING_PUNCTUATION_CATEGORIES
 
 
 def segment_separator(previous: str, following: str) -> str:
@@ -38,7 +46,7 @@ def segment_separator(previous: str, following: str) -> str:
     """
     if not previous or not following:
         return ""
-    if previous[-1].isspace() or following[0].isspace() or following[0] in _NO_SPACE_BEFORE:
+    if previous[-1].isspace() or following[0].isspace() or _closes(following[0]):
         return ""
     if _is_unspaced(previous[-1]) or _is_unspaced(following[0]):
         return ""

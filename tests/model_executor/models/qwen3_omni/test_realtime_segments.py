@@ -41,6 +41,10 @@ def speech(seconds: float, seed: int = 0) -> np.ndarray:
         ("hello", "世界", ""),
         ("듣기 시작했다", "그에게", " "),
         ("เริ่มฟัง", "เขา", ""),
+        ("He said “hello", "”.", ""),
+        ("he don", "’t", ""),
+        ("« bonjour", "» dit-il", ""),
+        ("(see", "）", ""),
     ],
 )
 def test_segment_separator(previous, following, expected):

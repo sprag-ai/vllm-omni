@@ -32,6 +32,12 @@ class _FakeModelConfig:
 class _FakeServing:
     model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
 
+    def _is_model_supported(self, model: str) -> bool:
+        return model == "symphony"
+
+    def create_error_response(self, message: str, **kwargs) -> SimpleNamespace:
+        return SimpleNamespace(error=SimpleNamespace(message=message))
+
 
 def _segment_output(text: str, finished: bool = False) -> SimpleNamespace:
     completion = SimpleNamespace(text=text, token_ids=[1] if text else [], finish_reason="stop" if finished else None)
@@ -69,7 +75,7 @@ def _connection(transcription: bool, engine: _FakeEngine | None = None) -> Realt
     return conn
 
 
-def _run(conn: RealtimeConnection, mocker) -> tuple[list[str], str]:
+def _run(conn: RealtimeConnection, mocker, transcription: bool | None = None) -> tuple[list[str], str]:
     send = mocker.patch.object(conn, "send", new_callable=mocker.AsyncMock)
     mocker.patch.object(conn, "send_json", new_callable=mocker.AsyncMock)
 
@@ -77,7 +83,8 @@ def _run(conn: RealtimeConnection, mocker) -> tuple[list[str], str]:
         return
         yield
 
-    asyncio.run(conn._run_generation(no_input(), asyncio.Queue()))
+    mode = conn._transcription if transcription is None else transcription
+    asyncio.run(conn._run_generation(no_input(), asyncio.Queue(), mode))
     events = [call.args[0] for call in send.await_args_list]
     deltas = [event.delta for event in events if isinstance(event, TranscriptionDelta)]
     done = [event.text for event in events if isinstance(event, TranscriptionDone)]
@@ -91,6 +98,38 @@ class TestSessionTypeRouting:
         send_error = mocker.patch.object(conn, "send_error", new_callable=mocker.AsyncMock)
         asyncio.run(conn.handle_event({"type": "session.update", "model": "symphony", **event}))
         return base, send_error
+
+    @pytest.mark.parametrize("session_type", [[], {}, 1])
+    def test_a_non_string_session_type_is_refused(self, mocker, session_type) -> None:
+        conn = _connection(transcription=False)
+        base, send_error = self._handle(conn, mocker, {"session_type": session_type})
+        assert send_error.await_args.args[1] == "invalid_session_type"
+        base.assert_not_awaited()
+
+    @pytest.mark.parametrize("model", [{"model": None}, {"model": "other"}])
+    def test_an_update_the_base_refuses_keeps_the_current_mode(self, mocker, model) -> None:
+        conn = _connection(transcription=False)
+        base, _ = self._handle(conn, mocker, {"session_type": "transcription", **model})
+        base.assert_awaited_once()
+        assert conn._transcription is False
+
+    def test_a_generation_keeps_the_mode_it_started_with(self, mocker) -> None:
+        conn = _connection(transcription=True)
+        run = mocker.patch.object(conn, "_run_generation", new_callable=mocker.MagicMock)
+        buffered = mocker.patch.object(conn, "_buffer_realtime_audio_with_tools")
+        mocker.patch.object(conn, "audio_stream_generator")
+        conn.generation_task = None
+        conn._tool_result_queue = asyncio.Queue()
+
+        async def start():
+            run.return_value = asyncio.sleep(0)
+            await conn.start_generation()
+            await conn.generation_task
+
+        asyncio.run(start())
+        conn._transcription = False
+        assert run.call_args.args[2] is True
+        assert buffered.call_args.args[2] is True
 
     def test_transcription_session_type_enables_transcription(self, mocker) -> None:
         conn = _connection(transcription=False)
@@ -155,6 +194,13 @@ class TestTranscriptionGeneration:
         engine = _FakeEngine([_segment_output("我开始听。", finished=True), _segment_output("他说", finished=True)])
         _, text = _run(_connection(transcription=True, engine=engine), mocker)
         assert text == "我开始听。他说"
+
+    def test_output_follows_the_generation_mode_not_the_live_session(self, mocker) -> None:
+        engine = _FakeEngine([_segment_output("listening.", finished=True), _segment_output("To him.", finished=True)])
+        conn = _connection(transcription=False, engine=engine)
+        _, text = _run(conn, mocker, transcription=True)
+        assert text == "listening. To him."
+        assert engine.generate_kwargs["output_modalities"] == ["text"]
 
     def test_conversational_session_text_is_unchanged(self, mocker) -> None:
         engine = _FakeEngine([_segment_output("listening.", finished=True), _segment_output("To him.", finished=True)])

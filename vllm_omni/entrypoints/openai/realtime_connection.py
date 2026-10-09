@@ -158,15 +158,18 @@ class RealtimeConnection(VllmRealtimeConnection):
             if instructions is not None:
                 self._instructions = instructions
             session_type = event.get("session_type")
-            if session_type is not None:
-                if session_type not in _SESSION_TYPES:
-                    await self.send_error(
-                        f"session_type must be one of {sorted(_SESSION_TYPES)}, got {session_type!r}",
-                        "invalid_session_type",
-                    )
-                    return
-                self._transcription = session_type == "transcription"
+            if session_type is not None and (not isinstance(session_type, str) or session_type not in _SESSION_TYPES):
+                await self.send_error(
+                    f"session_type must be one of {sorted(_SESSION_TYPES)}, got {session_type!r}",
+                    "invalid_session_type",
+                )
+                return
+            # The base refuses an update without a supported model; a refused update must not change the mode.
+            model = event.get("model")
+            sets_type = session_type is not None and model is not None and self._check_model(model) is None
             await super().handle_event(event)
+            if sets_type:
+                self._transcription = session_type == "transcription"
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
             if item.get("type") == "function_call_output":
@@ -226,8 +229,11 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         audio_stream = self.audio_stream_generator()
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        streaming_input_gen = self._buffer_realtime_audio_with_tools(audio_stream, input_stream)
-        self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
+        transcription = self._transcription
+        streaming_input_gen = self._buffer_realtime_audio_with_tools(audio_stream, input_stream, transcription)
+        self.generation_task = asyncio.create_task(
+            self._run_generation(streaming_input_gen, input_stream, transcription)
+        )
 
     async def _render_prompt(self, prompt: PromptType) -> StreamingInput:
         model_config = self.serving.model_config
@@ -249,6 +255,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
+        transcription: bool = False,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
         threads `self._tools`/`self._speaker`/`self._instructions` through
@@ -265,7 +272,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             tools=self._tools,
             speaker=self._speaker,
             instructions=self._instructions,
-            transcription=self._transcription,
+            transcription=transcription,
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
@@ -406,6 +413,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        transcription: bool = False,
     ):
         request_id = f"rt-{self.connection_id}-{uuid4()}"
         sent_audio = False
@@ -436,7 +444,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 prompt=streaming_input_gen,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
-                output_modalities=["text"] if self._transcription else None,
+                output_modalities=["text"] if transcription else None,
             )
 
             async for output in result_gen:
@@ -457,7 +465,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                             request_prompt_token_ids = list(output.prompt_token_ids)
 
                     delta_text = first_output.text or ""
-                    if self._transcription and segment_finished and delta_text:
+                    if transcription and segment_finished and delta_text:
                         delta_text = segment_separator(full_text, delta_text) + delta_text
                         segment_finished = False
                     if first_output.finish_reason is not None:
@@ -501,7 +509,9 @@ class RealtimeConnection(VllmRealtimeConnection):
                         }
                     )
                 if self._is_connected:
-                    await self._await_tool_results_and_continue(request_prompt_token_ids, assistant_token_ids)
+                    await self._await_tool_results_and_continue(
+                        request_prompt_token_ids, assistant_token_ids, transcription
+                    )
                 return
 
             usage = UsageInfo(
@@ -566,6 +576,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         prior_prompt_token_ids: list[int],
         assistant_token_ids: list[int],
+        transcription: bool = False,
     ) -> None:
         """Block until the client has submitted a `function_call_output` for
         every pending tool call from the turn that just finished, then splice
@@ -670,7 +681,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._turn_prompt = {**base_prompt, "prompt_token_ids": continuation_token_ids}
 
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        await self._run_generation(self._render_token_prompt(continuation_token_ids, multi_modal_data), input_stream)
+        await self._run_generation(
+            self._render_token_prompt(continuation_token_ids, multi_modal_data), input_stream, transcription
+        )
 
     async def send_json(self, payload: dict):
         try:

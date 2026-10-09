@@ -5,6 +5,7 @@
 
 import asyncio
 import dataclasses
+import math
 import os
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
@@ -101,14 +102,15 @@ def _realtime_segmentation() -> tuple[float, float]:
     """Realtime segment length and cut-search span in seconds, from ``SPRAG_REALTIME_SEGMENT_S`` and
     ``SPRAG_REALTIME_CUT_SEARCH_S``.
 
-    An unparseable value, or a span that is negative or not shorter than the segment, falls back to both defaults.
+    An unparseable or infinite value, or a span that is negative or not shorter than the segment, falls back to
+    both defaults.
     """
     try:
         segment = float(os.environ.get("SPRAG_REALTIME_SEGMENT_S", _DEFAULT_REALTIME_SEGMENT_S))
         search = float(os.environ.get("SPRAG_REALTIME_CUT_SEARCH_S", _DEFAULT_REALTIME_CUT_SEARCH_S))
     except ValueError:
         segment, search = -1.0, -1.0
-    if not 0 <= search < segment:
+    if not (math.isfinite(segment) and 0 <= search < segment):
         logger.warning_once(
             "invalid SPRAG_REALTIME_SEGMENT_S / SPRAG_REALTIME_CUT_SEARCH_S; using %ss / %ss",
             _DEFAULT_REALTIME_SEGMENT_S,
