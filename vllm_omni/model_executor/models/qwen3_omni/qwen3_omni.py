@@ -79,10 +79,10 @@ _DEFAULT_AUDIO_CHUNK_S = 90
 _SPLIT_SEARCH_SAMPLES = 1600
 """Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
 
-_REALTIME_SEGMENT_S = 5.0
+_DEFAULT_REALTIME_SEGMENT_S = 5.0
 """Longest realtime audio segment decoded as one generation, in seconds."""
 
-_REALTIME_CUT_SEARCH_S = 1.0
+_DEFAULT_REALTIME_CUT_SEARCH_S = 1.0
 """Span before the segment limit searched for a transcription session's quietest cut, in seconds."""
 
 
@@ -95,6 +95,27 @@ def _audio_chunk_seconds() -> int:
         return int(raw)
     except ValueError:
         return _DEFAULT_AUDIO_CHUNK_S
+
+
+def _realtime_segmentation() -> tuple[float, float]:
+    """Realtime segment length and cut-search span in seconds, from ``SPRAG_REALTIME_SEGMENT_S`` and
+    ``SPRAG_REALTIME_CUT_SEARCH_S``.
+
+    An unparseable value, or a span that is negative or not shorter than the segment, falls back to both defaults.
+    """
+    try:
+        segment = float(os.environ.get("SPRAG_REALTIME_SEGMENT_S", _DEFAULT_REALTIME_SEGMENT_S))
+        search = float(os.environ.get("SPRAG_REALTIME_CUT_SEARCH_S", _DEFAULT_REALTIME_CUT_SEARCH_S))
+    except ValueError:
+        segment, search = -1.0, -1.0
+    if not 0 <= search < segment:
+        logger.warning_once(
+            "invalid SPRAG_REALTIME_SEGMENT_S / SPRAG_REALTIME_CUT_SEARCH_S; using %ss / %ss",
+            _DEFAULT_REALTIME_SEGMENT_S,
+            _DEFAULT_REALTIME_CUT_SEARCH_S,
+        )
+        return _DEFAULT_REALTIME_SEGMENT_S, _DEFAULT_REALTIME_CUT_SEARCH_S
+    return segment, search
 
 
 # Special token IDs for Qwen3 Omni MoE
@@ -379,18 +400,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         sampling_rate = feature_extractor.sampling_rate
         tokenizer = cached_tokenizer_from_config(model_config)
 
+        segment_s, cut_search_s = _realtime_segmentation()
         buffer: Qwen3ASRRealtimeBuffer | SilenceAlignedBuffer
         if transcription:
             buffer = SilenceAlignedBuffer(
                 sampling_rate=sampling_rate,
-                segment_duration_s=_REALTIME_SEGMENT_S,
-                search_duration_s=_REALTIME_CUT_SEARCH_S,
+                segment_duration_s=segment_s,
+                search_duration_s=cut_search_s,
                 energy_window_samples=_SPLIT_SEARCH_SAMPLES,
             )
         else:
             buffer = Qwen3ASRRealtimeBuffer(
                 sampling_rate=sampling_rate,
-                segment_duration_s=_REALTIME_SEGMENT_S,
+                segment_duration_s=segment_s,
             )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
