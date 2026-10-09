@@ -19,6 +19,14 @@ from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
 
 
+async def render_inputs(prompts):
+    return [dict(prompt, type="token") for prompt in prompts]
+
+
+def fake_llm(**kwargs):
+    return SimpleNamespace(renderer=SimpleNamespace(render_cmpl_async=render_inputs), **kwargs)
+
+
 def args():
     return SimpleNamespace(
         disable_fastapi_docs=False,
@@ -449,7 +457,7 @@ def test_native_processor_error_is_422_over_http(
     async def abort(request_id):
         aborted.append(request_id)
 
-    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    engine.llm = fake_llm(generate=generate, abort=abort, errored=False)
     data = io.BytesIO()
     Image.new("RGB", (56, 56)).save(data, format="PNG")
     payload = wire_body("/v1/systemone", modality, data.getvalue() if modality == "image" else video_bytes)
@@ -520,7 +528,7 @@ def test_generate_fault_classification_on_text_and_audio(route, audio, cause):
     async def abort(request_id):
         aborted.append(request_id)
 
-    engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+    engine.llm = fake_llm(generate=generate, abort=abort, errored=False)
     payload = body()
     if audio:
         data = io.BytesIO()

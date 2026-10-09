@@ -100,8 +100,10 @@ Invalid requests return 422 with field locations but no submitted input echoed i
 `usage.input_tokens` counts each shared question prompt once after vLLM expands its media placeholders.
 `usage.input_tokens_details` reports `cached_tokens: 0` (prefix caching is disabled) and
 `multimodal_tokens` with `audio`, `image` and `video` counts. A modality absent from the request is
-`null`; text-only prompts report `multimodal_tokens: null`. Counts come from the completed expanded
-prompt token IDs, not source resolution, frame-rate estimates or preflight geometry. Video soundtrack
+`null`; text-only prompts report `multimodal_tokens: null`. Counts come from vLLM's `_get_mm_token_counts` helper over the rendered `EngineInput.mm_placeholders`,
+the same accounting used by upstream chat. The renderer processes each candidate once; the same
+processed input is passed to AsyncLLM without repeating preprocessing. No token-ID histogram,
+source-resolution estimate, frame-rate estimate or preflight geometry supplies usage. Video soundtrack
 is not included; separately supplied audio is counted on the audio modality.
 
 For several questions, totals and modality counts sum across their shared prompts. Candidate target

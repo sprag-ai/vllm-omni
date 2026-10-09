@@ -173,6 +173,7 @@ class AsyncChoiceEngine:
 
     async def score(self, prefix, ids, wave, visual=None):
         from vllm import SamplingParams
+        from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts
         from vllm.exceptions import VLLMClientError
         from vllm.v1.engine.exceptions import EngineGenerateError
 
@@ -188,9 +189,15 @@ class AsyncChoiceEngine:
         async with self.slots:
             finished = False
             try:
+                # Use the same rendered input and modality accounting as upstream chat.
+                # AsyncLLM accepts EngineInput without repeating media preprocessing.
+                (engine_input,) = await self.llm.renderer.render_cmpl_async([prompt])
+                modalities = _get_mm_token_counts(engine_input)
                 output = None
                 async for update in self.llm.generate(
-                    prompt, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True, prompt_logprobs=0), request_id
+                    engine_input,
+                    SamplingParams(temperature=0, max_tokens=1, ignore_eos=True, prompt_logprobs=0),
+                    request_id,
                 ):
                     output = update
                 if output is None or output.prompt_logprobs is None:
@@ -201,19 +208,12 @@ class AsyncChoiceEngine:
                 if not all(math.isfinite(x) for x in terms):
                     raise RuntimeError("Nonfinite Choice likelihood")
                 shared_ids = output.prompt_token_ids[: -len(ids)]
-                modalities = {}
-                for modality in mm_data:
-                    token_id = self.tokenizer.convert_tokens_to_ids(f"<|{modality}_pad|>")
-                    count = shared_ids.count(token_id)
-                    if count < 1:
-                        raise RuntimeError(f"Missing expanded {modality} tokens in Choice prompt")
-                    modalities[modality] = count
                 finished = True
                 return sum(terms), len(shared_ids), modalities
-            except (EngineGenerateError, VLLMClientError) as exc:
+            except (EngineGenerateError, VLLMClientError, ValueError) as exc:
                 if self.llm.errored:
                     raise
-                if isinstance(exc, VLLMClientError) or isinstance(exc.__cause__, ValueError):
+                if isinstance(exc, (VLLMClientError, ValueError)) or isinstance(exc.__cause__, ValueError):
                     raise ChoiceInputError("Invalid or unsupported model input") from exc
                 raise
             finally:

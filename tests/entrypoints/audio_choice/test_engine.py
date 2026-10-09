@@ -12,6 +12,15 @@ from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine, verify_
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 
 
+async def render_inputs(prompts):
+    return [dict(prompt, type="token") for prompt in prompts]
+
+
+def fake_llm(**kwargs):
+    kwargs.setdefault("errored", False)
+    return SimpleNamespace(renderer=SimpleNamespace(render_cmpl_async=render_inputs), **kwargs)
+
+
 def request(question_id="routing"):
     return ChoiceRequest.model_validate(
         {
@@ -101,7 +110,7 @@ def test_interrupted_scoring_aborts_engine_request(monkeypatch):
         async def abort(request_id):
             aborted.append(request_id)
 
-        engine.llm = SimpleNamespace(generate=generate, abort=abort)
+        engine.llm = fake_llm(generate=generate, abort=abort)
         task = asyncio.create_task(engine.score([10], [11, 3], None))
         await entered.wait()
         task.cancel()
@@ -242,10 +251,10 @@ def test_score_submits_token_ids_without_retokenization():
                 prompt_logprobs=[None, {11: SimpleNamespace(logprob=-0.2)}, {90002: SimpleNamespace(logprob=-0.3)}],
             )
 
-        engine.llm = SimpleNamespace(generate=generate)
+        engine.llm = fake_llm(generate=generate)
         value = await engine.score([10], [11, 90002], None)
         assert value == (-0.5, 1, {})
-        assert seen == [{"prompt_token_ids": [10, 11, 90002]}]
+        assert seen == [{"type": "token", "prompt_token_ids": [10, 11, 90002]}]
         assert engine.tokenizer.calls == []
 
     asyncio.run(run())
@@ -290,11 +299,11 @@ def test_visual_payload_reaches_async_llm():
                 prompt_logprobs=[None, None, None, None, {11: SimpleNamespace(logprob=-0.5)}],
             )
 
-        engine.llm = SimpleNamespace(generate=generate)
+        engine.llm = fake_llm(generate=generate)
         assert await engine.score([10], [11], wave, VisualEvidence(image, video)) == (
             -0.5,
             4,
-            {"image": 1, "video": 1, "audio": 1},
+            {},
         )
         assert seen[0]["multi_modal_data"] == {"image": [image], "video": [video], "audio": (wave, 16000)}
         assert set(seen[0]["multi_modal_uuids"]) == {"image", "video", "audio"}
@@ -365,7 +374,7 @@ def test_native_input_errors_are_redacted_and_aborted(error_type):
         async def abort(request_id):
             aborted.append(request_id)
 
-        engine.llm = SimpleNamespace(generate=generate, abort=abort, errored=False)
+        engine.llm = fake_llm(generate=generate, abort=abort, errored=False)
         with pytest.raises(ValueError, match="^Invalid or unsupported model input$") as caught:
             await engine.score([1], [2], None)
         assert isinstance(caught.value.__cause__, VLLMClientError if error_type == "client" else EngineGenerateError)
@@ -444,15 +453,14 @@ def test_visual_preflight_does_not_hold_text_preparation_lock(visual_processor, 
     asyncio.run(run())
 
 
-def test_modality_usage_comes_from_expanded_ids_excluding_candidate_target():
+def test_modality_usage_uses_native_placeholder_spans_excluding_candidate_target():
     from vllm_omni.entrypoints.audio_choice.media import VisualEvidence
 
     async def run():
         engine = preparing_engine()
         engine.slots = asyncio.Semaphore(1)
-        pads = {"<|audio_pad|>": 91, "<|image_pad|>": 92, "<|video_pad|>": 93}
-        engine.tokenizer.convert_tokens_to_ids = pads.__getitem__
-        shared = [10, 91, 91, 92, 92, 92, 93, 93, 93, 93, 11]
+        engine.tokenizer.convert_tokens_to_ids = lambda _: pytest.fail("Usage must not count pad token IDs")
+        shared = [10] + [500] * 9 + [11]
         target_ids = [21, 22]
 
         async def generate(*a):
@@ -462,12 +470,34 @@ def test_modality_usage_comes_from_expanded_ids_excluding_candidate_target():
                 + [{21: SimpleNamespace(logprob=-0.2)}, {22: SimpleNamespace(logprob=-0.3)}],
             )
 
-        engine.llm = SimpleNamespace(generate=generate)
+        processed = {
+            "type": "multimodal",
+            "prompt_token_ids": shared + target_ids,
+            "mm_placeholders": {
+                "audio": [SimpleNamespace(offset=1, length=1), SimpleNamespace(offset=2, length=1)],
+                "image": [SimpleNamespace(offset=3, length=3)],
+                "video": [SimpleNamespace(offset=6, length=4)],
+            },
+        }
+        rendered = []
+
+        async def render(prompts):
+            rendered.extend(prompts)
+            return [processed]
+
+        async def checked_generate(prompt, *args):
+            assert prompt is processed
+            async for output in generate(prompt, *args):
+                yield output
+
+        engine.llm = fake_llm(generate=checked_generate)
+        engine.llm.renderer.render_cmpl_async = render
         score, total, counts = await engine.score([10], target_ids, [0.0], VisualEvidence(object(), object()))
         assert score == -0.5
         assert total == len(shared)
         assert counts == {"audio": 2, "image": 3, "video": 4}
         assert total - sum(counts.values()) == 2
+        assert len(rendered) == 1
 
     asyncio.run(run())
 
@@ -491,5 +521,34 @@ def test_usage_counts_shared_prompt_once_per_question_not_per_candidate():
             "cached_tokens": 0,
             "multimodal_tokens": {"audio": 4, "image": 6, "video": 8},
         }
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_renderer_failures_preserve_request_error_classification_and_abort(error_type):
+    from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError
+
+    async def run():
+        engine = preparing_engine()
+        engine.slots = asyncio.Semaphore(1)
+        aborted = []
+
+        async def render(*a):
+            raise error_type("PRIVATE INPUT DATA")
+
+        async def abort(request_id):
+            aborted.append(request_id)
+
+        engine.llm = fake_llm(abort=abort)
+        engine.llm.renderer.render_cmpl_async = render
+        with pytest.raises(ChoiceInputError if error_type is ValueError else RuntimeError) as raised:
+            await engine.score([10], [11], None)
+        if error_type is ValueError:
+            assert str(raised.value) == "Invalid or unsupported model input"
+            assert isinstance(raised.value.__cause__, ValueError)
+        assert len(aborted) == 1
+        assert engine.slots._value == 1
+        assert not engine.llm.errored
 
     asyncio.run(run())
