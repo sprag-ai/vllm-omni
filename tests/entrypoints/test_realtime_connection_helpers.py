@@ -339,9 +339,10 @@ class TestRenderTokenPromptReattachesAudio:
         the continuation has something audio-bearing to splice onto."""
         conn = self._conn(mocker)
         conn._tools = None
-        # _buffer_realtime_audio_with_tools now also reads _speaker/_instructions.
+        # _buffer_realtime_audio_with_tools now also reads _speaker/_instructions/_transcription.
         conn._speaker = None
         conn._instructions = None
+        conn._transcription = False
         conn._turn_prompt = None
         audio = {"audio": np.zeros(8000, dtype=np.float32)}
         prompt = TokensPrompt(prompt_token_ids=[10, 11], multi_modal_data=audio)
