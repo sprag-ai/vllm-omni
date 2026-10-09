@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Validate Choice requests at the HTTP edge, including the chat envelope."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Bound the internal named-choice scoring payload."""
 
 import base64
 import binascii
@@ -17,7 +18,6 @@ from vllm_omni.entrypoints.audio_choice.contract import (
 from vllm_omni.entrypoints.openai.decision_protocol import (
     DecisionInputAudio,
     DecisionRequestModel,
-    DecisionTextPart,
 )
 
 
@@ -65,21 +65,6 @@ class ChoiceInputMedia(DecisionRequestModel):
         return data
 
 
-class ChoiceImagePart(DecisionRequestModel):
-    type: Literal["input_image"]
-    input_image: ChoiceInputMedia
-
-
-class ChoiceVideoPart(DecisionRequestModel):
-    type: Literal["input_video"]
-    input_video: ChoiceInputMedia
-
-
-class ChoiceAudioPart(DecisionRequestModel):
-    type: Literal["input_audio"]
-    input_audio: ChoiceInputAudio
-
-
 class ChoicePayload(DecisionRequestModel):
     state: Description
     questions: dict[str, PublicQuestion] = Field(min_length=1, max_length=16)
@@ -117,40 +102,3 @@ class ChoiceRequest(ChoicePayload):
     input_audio: ChoiceInputAudio | None = None
     input_image: ChoiceInputMedia | None = None
     input_video: ChoiceInputMedia | None = None
-
-
-class ChoiceMessage(DecisionRequestModel):
-    role: Literal["user"]
-    content: list[
-        Annotated[ChoiceAudioPart | ChoiceImagePart | ChoiceVideoPart | DecisionTextPart, Field(discriminator="type")]
-    ] = Field(min_length=1, max_length=4)
-
-    @model_validator(mode="after")
-    def validate_parts(self):
-        kinds = [p.type for p in self.content]
-        if len(set(kinds)) != len(kinds):
-            raise ValueError("At most one part of each type is supported")
-        texts = [p for p in self.content if isinstance(p, DecisionTextPart)]
-        if len(texts) != 1:
-            raise ValueError("Exactly one text part containing a ChoicePayload JSON object is required")
-        ChoicePayload.model_validate_json(texts[0].text)
-        return self
-
-
-class ChoiceChatRequest(DecisionRequestModel):
-    model: str = Field(min_length=1)
-    messages: list[ChoiceMessage] = Field(min_length=1, max_length=1)
-    stream: Literal[False] = False
-    temperature: float = Field(default=0, ge=0, le=0)
-    n: int = Field(default=1, ge=1, le=1)
-    # No sampled text is generated; generation limits are rejected.
-    max_tokens: Literal[None] = None
-    max_completion_tokens: Literal[None] = None
-    user: str | None = None
-    cache_salt: str = ""
-
-    def to_choice(self):
-        parts = self.messages[0].content
-        payload = ChoicePayload.model_validate_json(next(p.text for p in parts if isinstance(p, DecisionTextPart)))
-        media = {p.type: getattr(p, p.type) for p in parts if not isinstance(p, DecisionTextPart)}
-        return ChoiceRequest(model=self.model, **media, **payload.model_dump())

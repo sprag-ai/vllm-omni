@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
 
 import pytest
@@ -12,7 +13,9 @@ from vllm_omni.entrypoints.audio_choice.contract import (
     score_confidence,
     scoring_question,
 )
-from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
+from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_noul_is_probability_not_boolean_or_generated_number():
@@ -58,35 +61,6 @@ def test_score_contract_rejects_invalid_scales(criteria):
 def test_choice_conversion_is_identity():
     question = ChoiceQuestion(instructions="test", criteria={"a": None, "b": "B"})
     assert scoring_question(question) is question
-
-
-def test_mixed_questions_and_media_round_trip_chat():
-    import json
-
-    questions = {
-        "a": {"type": "choice", "instructions": "name", "criteria": {"red": None, "blue": None}},
-        "b": {"type": "noul", "instructions": "red?"},
-        "c": {"type": "score", "instructions": "redness", "criteria": ["none", "some", "all"]},
-    }
-    payload = {"state": {}, "questions": questions}
-    media = {
-        kind: {"format": fmt, "data": "QUJD"}
-        for kind, fmt in (("input_audio", "wav"), ("input_image", "png"), ("input_video", "mp4"))
-    }
-    native = ChoiceRequest(model="spev", **payload, **media)
-    chat = ChoiceChatRequest(
-        model="spev",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": json.dumps(payload)},
-                    *[{"type": k, k: v} for k, v in media.items()],
-                ],
-            }
-        ],
-    )
-    assert chat.to_choice() == native
 
 
 @pytest.mark.parametrize("kind", ["input_image", "input_video"])

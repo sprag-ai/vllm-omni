@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Opt-in Choice API using the existing vLLM HTTP server and middleware."""
 
 import asyncio
-import time
-import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -12,13 +11,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import create_model
 from vllm.entrypoints.openai.api_server import build_app
-from vllm.entrypoints.openai.chat_completion.serving import _make_prompt_tokens_details
 from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
+from vllm_omni.entrypoints.audio_choice.decisions import DecisionsRequest, DecisionsResponse
+from vllm_omni.entrypoints.audio_choice.decisions_adapter import from_choice, to_choice
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
 from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError, log_input_error
-from vllm_omni.entrypoints.audio_choice.protocol import ChoiceChatRequest, ChoiceRequest
+from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
 
@@ -88,8 +88,7 @@ def build_choice_app(args, engine):
     keep = {"/health", "/version", "/v1/models", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
     app.router.routes[:] = [r for r in app.router.routes if getattr(r, "path", "") in keep]
     handler = ChoiceServing(engine, names[0], getattr(args, "decision_max_pending", 16))
-    request_type = create_model("BoundChoiceRequest", __base__=ChoiceRequest, model=(Literal[names[0]], ...))
-    chat_type = create_model("BoundChoiceChatRequest", __base__=ChoiceChatRequest, model=(Literal[names[0]], ...))
+    decisions_type = create_model("BoundDecisionsRequest", __base__=DecisionsRequest, model=(Literal[names[0]], ...))
 
     async def load():
         # Count actual admitted work, including disconnected HTTP waiters.
@@ -97,39 +96,27 @@ def build_choice_app(args, engine):
 
     app.add_api_route("/load", load, methods=["GET"])
 
-    async def system_one(request: request_type) -> ChoiceResponse:
-        return await handler.evaluate(request)
+    async def decisions(request: decisions_type) -> DecisionsResponse:
+        try:
+            native = to_choice(request)
+        except ValueError:
+            raise HTTPException(422, "Unsupported Decisions input or model limit exceeded") from None
+        return from_choice(request, await handler.evaluate(native))
 
-    async def chat(request: chat_type):
-        result = await handler.evaluate(request.to_choice())
-        # Compatibility transport only: native /v1/systemone returns the typed
-        # result directly; chat clients receive the same result as JSON content.
-        return {
-            "id": "chatcmpl-" + uuid.uuid4().hex,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": result.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result.model_dump_json()},
-                    "finish_reason": "stop",
+    async def retired_system_one():
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": {
+                    "message": "/v1/systemone has been removed. Use POST /v1/decisions "
+                    "with input and a questions array; "
+                    "use predicate, choices and levels instead of noul and criteria.",
+                    "type": "invalid_request_error",
+                    "code": "endpoint_removed",
+                    "param": None,
                 }
-            ],
-            "usage": {
-                "prompt_tokens": result.usage.input_tokens,
-                "completion_tokens": result.usage.output_tokens,
-                "total_tokens": result.usage.input_tokens + result.usage.output_tokens,
-                "prompt_tokens_details": _make_prompt_tokens_details(
-                    True,
-                    result.usage.input_tokens_details.cached_tokens,
-                    0,
-                    result.usage.input_tokens_details.multimodal_tokens.model_dump(exclude_none=True)
-                    if result.usage.input_tokens_details.multimodal_tokens is not None
-                    else None,
-                ).model_dump(),
             },
-        }
+        )
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
@@ -144,15 +131,13 @@ def build_choice_app(args, engine):
         )
 
     app.add_api_route(
-        "/v1/systemone",
-        system_one,
+        "/v1/decisions",
+        decisions,
         methods=["POST"],
-        response_model=ChoiceResponse,
-        summary="Evaluate Choice, Noul and Score questions",
+        response_model=DecisionsResponse,
+        summary="Evaluate predicate, choice and score questions",
     )
-    app.add_api_route(
-        "/v1/chat/completions", chat, methods=["POST"], summary="Chat compatibility wrapper for Choice, Noul and Score"
-    )
+    app.add_api_route("/v1/systemone", retired_system_one, methods=["POST"], deprecated=True, status_code=410)
     app.state.openai_serving_models = handler
     app.state.engine_client = handler
     app.state.log_stats = False

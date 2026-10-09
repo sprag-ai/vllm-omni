@@ -339,7 +339,7 @@ class OmniServeCommand(CLISubcommand):
             "--choice-bundle",
             type=str,
             default=None,
-            help="Named Choice adapter/calibration bundle; serves /v1/systemone and a chat compatibility wrapper.",
+            help="Named Choice adapter/calibration bundle; serves the /v1/decisions API.",
         )
         omni_config_group.add_argument(
             "--choice-enable-vision",
