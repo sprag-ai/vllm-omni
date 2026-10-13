@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import hashlib
 import json
@@ -11,6 +12,8 @@ from tests.entrypoints.audio_choice.helpers import fake_llm
 from vllm_omni.entrypoints.audio_choice.contract import render_question
 from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine, verify_bundle
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def request(question_id="routing"):
@@ -380,10 +383,8 @@ def test_engine_vision_limits_are_opt_in(enabled, tmp_path, monkeypatch):
     import transformers
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    from vllm_omni.entrypoints.audio_choice import engine as module
-
     captured = []
-    monkeypatch.setattr(module, "verify_bundle", lambda root: ({"model": "test"}, 1))
+    monkeypatch.setattr(AsyncChoiceEngine, "bundle_verifier", staticmethod(lambda root: ({"model": "test"}, 1)))
     monkeypatch.setattr(
         transformers.Qwen3OmniMoeProcessor, "from_pretrained", lambda *a, **kw: SimpleNamespace(tokenizer=object())
     )

@@ -1,6 +1,6 @@
 # Decisions API
 
-`--choice-bundle PATH` serves `POST /v1/decisions` using the trained named-choice likelihood scorer. The public request and response follow the [OpenAI Decisions contract](https://developers.openai.com/api/docs/guides/decisions). Native audio is an additional Sprag input. This is wire-format compatibility within the model limits below, not equivalence to OpenAI model behavior or confidence calibration.
+`--choice-bundle PATH` serves `POST /v1/decisions` using the scorer selected by the bundle. The public request and response follow the [OpenAI Decisions contract](https://developers.openai.com/api/docs/guides/decisions). Native audio is an additional Sprag input. This is wire-format compatibility within the model limits below, not equivalence to OpenAI model behavior or confidence calibration.
 
 ```sh
 vllm serve /models/qwen3 --omni --choice-bundle /models/choice \
@@ -57,7 +57,7 @@ Illustrative values:
 }
 ```
 
-Probabilities come from complete named-target sequence likelihoods, not generated numeric text. Choice confidence remains `(max_probability - 1/N)/(1 - 1/N)`. Score confidence retains the scorer's spread formula. These formulas are implementation choices, not a claim about OpenAI's scoring internals. The schema can represent refusals; this candidate has no newly trained refusal classifier.
+Probabilities come from candidate scores, not generated numeric text. Likelihood bundles score complete named-target sequences; single-pass SPEV bundles score contextual candidate anchors. Choice confidence remains `(max_probability - 1/N)/(1 - 1/N)`. Score confidence retains the scorer's spread formula. These formulas are implementation choices, not a claim about OpenAI's scoring internals. The schema can represent refusals; this candidate has no newly trained refusal classifier.
 
 ## Media and model limits
 
@@ -65,17 +65,17 @@ Text evidence can be a string or ordered user messages with string content or `i
 
 The Sprag audio extension is top-level `input_audio: {"data": "<base64>", "format": "wav"}` alongside `input` and `questions`. The decoder determines supported containers; `format` is a hint. Decoded bytes are bounded to 12 MiB, with the existing decoder channel/rate/duration and aggregate JSON-body limits. Video has no public Decisions input. Existing internal visual processing remains available to the scorer.
 
-The model permits 16 questions, 255 total candidate outcomes, 2–255 choices per choice question, and 2–10 score levels. Text work is bounded to 65,536 characters and 4,096 structure nodes. The 8,192-token context includes expanded media and candidate suffixes. Unsupported generation parameters and `stream` are rejected. The HTTP endpoint evaluates a complete input; it does not implement streaming audio sessions.
+The model permits 16 questions, 255 total candidate outcomes, 2–255 choices per choice question, and 2–10 score levels. Text work is bounded to 65,536 characters and 4,096 structure nodes. The 8,192-token context includes expanded media and candidate suffixes or scoring anchors. Unsupported generation parameters and `stream` are rejected. The HTTP endpoint evaluates a complete input; it does not implement streaming audio sessions.
 
 ## Runtime and accounting
 
-The bundle remains `choice.json`, adapter config/weights, and `calibration.json`, with file hashes verified on startup. No weights or trained string targets change. The scorer uses native Qwen3-Omni Thinker, frozen BF16 base, FP32 adapter, eager execution, TP/PP=1, seed 17 and invariant kernels. The separate frozen `--decision-bundle` mode is unchanged and mutually exclusive with `--choice-bundle`.
+Likelihood bundles contain `choice.json`, adapter config/weights, and `calibration.json`, with file hashes verified on startup. The single-pass bundle layout is specified below. The scorer uses native Qwen3-Omni Thinker, frozen BF16 base, FP32 adapter, eager execution, TP/PP=1, seed 17 and invariant kernels. The separate frozen `--decision-bundle` mode is unchanged and mutually exclusive with `--choice-bundle`.
 
-The existing bundle temperature applies to text/audio choice scoring. Predicate and score questions, and visual requests, use identity temperature. Existing calibration does not establish accuracy or calibration for arbitrary questions, mixed boolean choices, or streaming prefixes.
+For likelihood bundles, the temperature applies to text/audio choice scoring. Predicate and score questions, and visual requests, use identity temperature. Existing calibration does not establish accuracy or calibration for arbitrary questions, mixed boolean choices, or streaming prefixes.
 
-Usage counts the logical shared prompt once per question, including native modality placeholders. It excludes candidate target suffixes and discarded internal samples. `multimodal_tokens` is a Sprag accounting extension whose counts come from vLLM's rendered placeholder spans. Absent modalities are omitted; text-only input uses null. The gateway preserves this canonical usage envelope while settling per-modality billing internally. Cache counts and output counts are zero in this scorer.
+Likelihood-bundle usage counts the logical shared prompt once per question, including native modality placeholders. It excludes candidate target suffixes and discarded internal samples. `multimodal_tokens` is a Sprag accounting extension whose counts come from vLLM's rendered placeholder spans. Absent modalities are omitted; text-only input uses null. The gateway preserves this canonical usage envelope while settling per-modality billing internally. Cache counts and output counts are zero in this scorer.
 
-Candidates are scheduled concurrently but each currently repeats model prefill and media preprocessing. Questions run sequentially. Prefix caching and the multimodal processor cache remain disabled. No speedup is implied by adopting the Decisions contract.
+For likelihood bundles, candidates are scheduled concurrently but each repeats model prefill and media preprocessing. Questions run sequentially. Prefix caching and the multimodal processor cache remain disabled. No speedup is implied by adopting the Decisions contract.
 
 Invalid requests return 422 at the native server (400 at the gateway). Full admission returns 429 with `Retry-After: 1`; an unavailable engine returns 503. `/load` includes outstanding inference after an HTTP waiter disconnects. Shutdown drains tracked work.
 
@@ -86,3 +86,25 @@ Invalid requests return 422 at the native server (400 at the gateway). Full admi
 Migrate `state` to `input`; convert the question map to an array with `name`; replace choice `criteria` with `choices` entries, `noul` with `predicate`, and score `criteria` with `levels`. Read answers and probabilities as ordered arrays. This structural change cannot be expressed as Pydantic field aliases.
 
 The gateway and model catalog must advertise `/v1/decisions`, and the model must run a matching native server revision. Existing published artifacts do not gain this route automatically.
+
+## Single-pass SPEV checkpoints
+
+A `choice.json` bundle with `scorer: spev-contextual-candidate-v1` selects the
+contextual candidate head. The bundle contains `adapter.safetensors`,
+`head.safetensors` and `spev_config.json`; `files` maps each filename to its SHA256.
+The `model` field names the served checkpoint. Run it with the same
+`--choice-bundle` launcher; visual inputs require `--choice-enable-vision`.
+
+This scorer evaluates all supplied questions and criteria in one complete
+prefill. Concurrent requests share vLLM scheduler batches. The FP32 adapter and
+head remain separate from the BF16 backbone. TP and PP are both one; chunked
+prefill, prefix caching and CUDA graphs are disabled.
+
+Input usage counts the expanded prompt once, including every scoring anchor.
+Audio, image and video counts come from vLLM's rendered multimodal placeholders.
+The internal completion token is discarded and is not reported as output usage.
+
+The checkpoint temperature is applied to candidate scores. Turn-taking response
+thresholds are caller policy and do not alter ordinary highest-probability Choice
+answers. Port validation must compare the selected checkpoint's prompt tokens,
+head results and concurrent outputs before deployment.

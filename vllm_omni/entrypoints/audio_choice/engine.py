@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Choice, Noul and Score likelihoods through AsyncLLM."""
 
 import asyncio
@@ -48,6 +49,9 @@ def verify_bundle(root):
 
 class AsyncChoiceEngine:
     is_async = True
+    architecture = "Qwen3OmniChoiceThinker"
+    worker_class = "auto"
+    bundle_verifier = staticmethod(verify_bundle)
 
     def __init__(
         self,
@@ -80,7 +84,7 @@ class AsyncChoiceEngine:
         self.max_video_frames = max_video_frames
         self.visual_lock = threading.Lock()
         self.bundle = Path(bundle).resolve()
-        self.config, self.temperature = verify_bundle(self.bundle)
+        self.config, self.temperature = self.bundle_verifier(self.bundle)
         self.processor = Qwen3OmniMoeProcessor.from_pretrained(model, local_files_only=True)
         self.tokenizer = self.processor.tokenizer
         self.slots = asyncio.Semaphore(max_num_seqs)
@@ -90,7 +94,8 @@ class AsyncChoiceEngine:
                 model=model,
                 tokenizer=model,
                 dtype="bfloat16",
-                hf_overrides={"architectures": ["Qwen3OmniChoiceThinker"], "choice_bundle": str(self.bundle)},
+                hf_overrides={"architectures": [self.architecture], "choice_bundle": str(self.bundle)},
+                worker_cls=self.worker_class,
                 enforce_eager=True,
                 tensor_parallel_size=1,
                 pipeline_parallel_size=1,
@@ -223,7 +228,7 @@ class AsyncChoiceEngine:
     async def evaluate(self, request, wave=None, visual=None):
         answers = {}
         input_tokens = 0
-        multimodal_tokens = {}
+        multimodal_tokens: dict[str, int] = {}
         for question_id, question in request.questions.items():
             candidate_question = scoring_question(question)
             prefix, candidates = await asyncio.to_thread(self.prepare, candidate_question, request.state, wave, visual)
