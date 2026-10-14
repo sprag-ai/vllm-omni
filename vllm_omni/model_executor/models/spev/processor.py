@@ -148,7 +148,6 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
         return wave
 
     def decode_video(self, data: bytes):
-        from functools import partial
         from tempfile import NamedTemporaryFile
 
         import av
@@ -162,12 +161,25 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
                     raise ValueError("Video has no visual stream")
                 stream = container.streams.video[0]
                 duration = float(stream.duration * stream.time_base) if stream.duration is not None else None
+                if duration is None and container.duration is not None:
+                    duration = container.duration / av.time_base
                 if duration is None or not math.isfinite(duration) or not 0 < duration <= self.config.max_video_seconds:
                     raise ValueError("Video duration is missing or exceeds the checkpoint limit")
-                if not 0 < stream.frames <= self.config.max_video_frames:
+                frame_rate = float(stream.average_rate) if stream.average_rate is not None else None
+                if frame_rate is None or not math.isfinite(frame_rate) or frame_rate <= 0:
+                    raise ValueError("Video frame rate is missing or invalid")
+                frame_count = stream.frames or math.ceil(duration * frame_rate)
+                if not 0 < frame_count <= self.config.max_video_frames:
                     raise ValueError("Video frame count is missing or exceeds the checkpoint limit")
         except av.FFmpegError as exc:
             raise ValueError("Invalid or unsupported video") from exc
+
+        def sample_indices(metadata, **kwargs):
+            metadata.total_num_frames = frame_count
+            metadata.fps = frame_rate
+            metadata.duration = frame_count / frame_rate
+            return self.processor.video_processor.sample_frames(metadata=metadata, fps=self.config.video_fps)
+
         with NamedTemporaryFile() as source:
             source.write(data)
             source.flush()
@@ -175,12 +187,14 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
                 frames, metadata = load_video(
                     source.name,
                     backend="pyav",
-                    sample_indices_fn=partial(self.processor.video_processor.sample_frames, fps=self.config.video_fps),
+                    sample_indices_fn=sample_indices,
                 )
             except (av.FFmpegError, OSError) as exc:
                 raise ValueError("Invalid or unsupported video") from exc
         if not len(frames) or not metadata.fps or not metadata.total_num_frames:
             raise ValueError("Video has no decodable frames")
+        if metadata.frames_indices is None or len(frames) != len(metadata.frames_indices):
+            raise ValueError("Video sampled-frame decode is incomplete")
         return MediaWithBytes(
             (
                 frames,

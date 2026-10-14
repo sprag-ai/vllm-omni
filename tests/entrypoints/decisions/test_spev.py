@@ -190,3 +190,53 @@ def test_video_decode_respects_model_limits(processor, video_bytes):
 def test_corrupt_video_decode_is_an_input_error(processor):
     with pytest.raises(ValueError, match="Invalid or unsupported video"):
         processor.decode_video(b"private video bytes")
+
+
+@pytest.mark.parametrize("format_name,codec", [("matroska", "mpeg4"), ("webm", "libvpx-vp9")])
+def test_video_decode_recovers_container_metadata(processor, video_factory, format_name, codec):
+    path = os.environ.get("CHOICE_TEST_MODEL")
+    if not path:
+        pytest.skip("Set CHOICE_TEST_MODEL for native processor validation")
+    processor.processor = Qwen3OmniMoeProcessor.from_pretrained(path, local_files_only=True)
+    data = video_factory(format_name, codec)
+    frames, metadata = processor.decode_video(data).media
+    assert len(frames) == len(metadata["frames_indices"]) > 0
+    assert metadata["total_num_frames"] == 8
+    assert metadata["fps"] == 4
+    assert metadata["duration"] == 2
+    processor.config.max_video_frames = 7
+    with pytest.raises(ValueError, match="frame count"):
+        processor.decode_video(data)
+    processor.config.max_video_frames = 8
+    processor.config.max_video_seconds = 1
+    with pytest.raises(ValueError, match="duration"):
+        processor.decode_video(data)
+
+
+def test_audio_only_video_container_is_an_input_error(processor, audio_only_mp4):
+    with pytest.raises(ValueError, match="no visual stream"):
+        processor.decode_video(audio_only_mp4)
+
+
+@pytest.mark.parametrize("error_kind", ["ffmpeg", "os"])
+def test_video_loader_errors_are_input_errors(processor, video_bytes, monkeypatch, error_kind):
+    import av
+
+    error = av.FFmpegError(1, "private decoder data") if error_kind == "ffmpeg" else OSError("private decoder data")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("transformers.video_utils.load_video", fail)
+    with pytest.raises(ValueError, match="^Invalid or unsupported video$") as raised:
+        processor.decode_video(video_bytes)
+    assert raised.value.__cause__ is error
+
+
+def test_truncated_video_rejects_incomplete_sampled_frames(processor, video_factory):
+    from types import SimpleNamespace
+
+    data = video_factory()
+    processor.processor = SimpleNamespace(video_processor=SimpleNamespace(sample_frames=lambda metadata, fps: [0, 4]))
+    with pytest.raises(ValueError, match="incomplete"):
+        processor.decode_video(data[: len(data) // 2])
