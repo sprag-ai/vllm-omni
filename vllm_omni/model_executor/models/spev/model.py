@@ -4,6 +4,7 @@
 
 import torch
 from safetensors.torch import load_file
+from transformers import AutoTokenizer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -16,9 +17,14 @@ from vllm_omni.model_executor.models.spev.config import SPEVConfig
 from vllm_omni.model_executor.models.spev.pooler import CandidatePooler, OptionHead
 
 
+class SPEVProcessingInfo(Qwen3OmniMoeThinkerProcessingInfo):
+    def get_hf_config(self):
+        return self.ctx.get_hf_config().thinker_config
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
-    info=Qwen3OmniMoeThinkerProcessingInfo,
+    info=SPEVProcessingInfo,
     dummy_inputs=Qwen3OmniMoeThinkerDummyInputsBuilder,
 )
 class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
@@ -35,21 +41,52 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
         ):
             raise ValueError("SPEV requires complete eager prefills without prefix caching")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.spev_config = SPEVConfig.from_hf(vllm_config.model_config.hf_config)
+        hf_config = vllm_config.model_config.hf_config
+        self.standalone_checkpoint = hf_config.model_type == "spev"
+        tokenizer = None
+        if self.standalone_checkpoint:
+            tokenizer = AutoTokenizer.from_pretrained(
+                vllm_config.model_config.tokenizer,
+                revision=vllm_config.model_config.tokenizer_revision,
+                trust_remote_code=vllm_config.model_config.trust_remote_code,
+                local_files_only=True,
+            )
+            self.language_model.lm_head = torch.nn.Identity()
+        self.spev_config = SPEVConfig.from_hf(hf_config, tokenizer)
         self.spev_model_config = vllm_config.model_config
         head = OptionHead(self.spev_config.hidden_size, self.spev_config.width).float().cpu().eval()
         self.pooler = CandidatePooler(head, self.spev_config.marker_token_ids)
 
     def load_weights(self, weights):
-        loaded = super().load_weights(weights)
-        self.pooler.head.load_state_dict(
-            load_file(str(self.spev_config.asset(self.spev_model_config, "head.safetensors")))
-        )
-        self.pooler.head.requires_grad_(False)
         device = next(self.language_model.parameters()).device
-        tensors = load_file(
-            str(self.spev_config.asset(self.spev_model_config, "adapter.safetensors")), device=str(device)
-        )
+        if self.standalone_checkpoint:
+            tensors, head = {}, {}
+
+            def backbone_weights():
+                for name, tensor in weights:
+                    if name.startswith("head."):
+                        if tensor.dtype != torch.float32:
+                            raise ValueError("SPEV head requires FP32 tensors")
+                        head[name.removeprefix("head.")] = tensor
+                    elif name.startswith("backbone."):
+                        name = name.removeprefix("backbone.")
+                        if name.endswith((".q_proj.a", ".q_proj.b", ".v_proj.a", ".v_proj.b")):
+                            tensors[name] = tensor.to(device=device)
+                        else:
+                            name = name.replace(".q_proj.base.", ".q_proj.").replace(".v_proj.base.", ".v_proj.")
+                            yield "thinker." + name, tensor
+                    else:
+                        raise ValueError(f"Unexpected SPEV checkpoint tensor: {name}")
+
+            loaded = super().load_weights(backbone_weights())
+        else:
+            loaded = super().load_weights(weights)
+            head = load_file(str(self.spev_config.asset(self.spev_model_config, "head.safetensors")))
+            tensors = load_file(
+                str(self.spev_config.asset(self.spev_model_config, "adapter.safetensors")), device=str(device)
+            )
+        self.pooler.head.load_state_dict(head)
+        self.pooler.head.requires_grad_(False)
         scale = self.spev_config.alpha / self.spev_config.rank
         self._spev_adapter = tensors
         self._spev_handles = []
