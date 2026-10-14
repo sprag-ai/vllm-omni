@@ -198,7 +198,10 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
             media["audio"] = (self.decode_audio(audio.data), self.config.sample_rate)
             content.append({"type": "audio", "audio": "provided-array"})
         if prompt.image_bytes is not None:
-            media["image"] = [ImageMediaIO().load_bytes(prompt.image_bytes)]
+            try:
+                media["image"] = [ImageMediaIO().load_bytes(prompt.image_bytes)]
+            except (OSError, ValueError) as exc:
+                raise ValueError("Invalid or unsupported image") from exc
             content.append({"type": "image", "image": "provided-array"})
         if prompt.video_bytes is not None:
             media["video"] = [self.decode_video(prompt.video_bytes)]

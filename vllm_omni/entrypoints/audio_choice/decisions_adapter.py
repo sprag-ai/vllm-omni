@@ -79,7 +79,9 @@ def to_choice(request: DecisionsRequest) -> ChoiceRequest:
         state=state,
         questions=questions,
         input_audio=(
-            ChoiceInputAudio.model_validate(request.input_audio.model_dump()) if request.input_audio is not None else None
+            ChoiceInputAudio.model_validate(request.input_audio.model_dump())
+            if request.input_audio is not None
+            else None
         ),
         input_image=image,
     )

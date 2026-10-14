@@ -19,7 +19,8 @@ from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
 from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError, log_input_error
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
-from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
+from vllm_omni.entrypoints.openai.body_limit import BodyLimitMiddleware
+from vllm_omni.entrypoints.openai.serving_decision import MAX_JSON_BYTES, DecisionServing, parse_audio
 from vllm_omni.inputs.decisions import DecisionsRequest, DecisionsResponse
 
 
@@ -156,7 +157,7 @@ def build_choice_app(args, engine):
     # Upstream SageMaker bootstrap materializes the middleware stack. Rebuild it
     # with this opt-in app's final handlers before the first request.
     app.middleware_stack = None
-    return BodyLimitMiddleware(app)
+    return BodyLimitMiddleware(app, MAX_JSON_BYTES)
 
 
 async def run_choice_server(args, sock, **uvicorn_kwargs):

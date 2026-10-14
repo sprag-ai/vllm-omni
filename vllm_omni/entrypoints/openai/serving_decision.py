@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Native-audio handlers attached to the existing OpenAI API routers.
 
 This opt-in server mode uses the frozen decision policy over AsyncLLM. It
@@ -6,7 +7,6 @@ rejects unsupported generation/pooling options instead of silently ignoring them
 """
 
 import asyncio
-import base64
 import binascii
 import math
 import threading
@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import numpy as np
+import pybase64 as base64
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from vllm.entrypoints.openai.api_server import build_app
@@ -26,6 +27,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse, ModelCard, Mod
 
 from vllm_omni.entrypoints.audio_decision.async_engine import AsyncDecisionEngine
 from vllm_omni.entrypoints.audio_decision.server import MAX_BYTES, decode_audio
+from vllm_omni.entrypoints.openai.body_limit import BodyLimitMiddleware
 from vllm_omni.entrypoints.openai.decision_protocol import (
     DecisionChatRequest,
     DecisionInputAudio,
@@ -53,40 +55,6 @@ def error(message, code=400):
 
 def json_error(message, code=400):
     return JSONResponse(error(message, code).model_dump(), status_code=code)
-
-
-class BodyLimitMiddleware:
-    """Bound JSON uploads before the upstream router parses base64 audio."""
-
-    def __init__(self, app):
-        self.app = app
-
-    def __getattr__(self, name):
-        return getattr(self.app, name)
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] != "POST":
-            return await self.app(scope, receive, send)
-        body = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return
-            body.extend(message.get("body", b""))
-            if len(body) > MAX_JSON_BYTES:
-                return await json_error("Audio JSON upload is too large", 413)(scope, receive, send)
-            if not message.get("more_body", False):
-                break
-        delivered = False
-
-        async def replay():
-            nonlocal delivered
-            if not delivered:
-                delivered = True
-                return {"type": "http.request", "body": bytes(body), "more_body": False}
-            return await receive()
-
-        await self.app(scope, replay, send)
 
 
 def parse_audio(body):
@@ -453,7 +421,7 @@ def build_decision_app(args, engine):
             await handler.close()
 
     app.router.lifespan_context = lifespan
-    return BodyLimitMiddleware(app)
+    return BodyLimitMiddleware(app, MAX_JSON_BYTES)
 
 
 async def run_decision_server(args, sock, **uvicorn_kwargs):

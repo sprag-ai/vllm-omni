@@ -3,11 +3,9 @@
 
 """The OpenAI Decisions wire contract with optional native audio evidence."""
 
-import binascii
 from typing import Annotated, Literal
 
-import pybase64
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Self
 
 
@@ -23,15 +21,6 @@ class DecisionAudioInput(DecisionObject):
     data: str = Field(min_length=1)
     format: str = Field(min_length=1)
 
-    @field_validator("data")
-    @classmethod
-    def valid_base64(cls, data: str) -> str:
-        try:
-            if not pybase64.b64decode(data, validate=True):
-                raise ValueError("Empty audio")
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("Expected nonempty base64 audio bytes") from exc
-        return data
 
 
 class DecisionChoiceOption(DecisionObject):

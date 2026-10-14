@@ -64,6 +64,9 @@ class Engine:
         self.entered = asyncio.Event()
         self.release = None
 
+    async def get_supported_tasks(self):
+        return ("plugin",)
+
     async def encode(self, prompt, params, request_id):
         self.calls += 1
         self.entered.set()
@@ -217,3 +220,108 @@ def test_other_routes_keep_upstream_validation_handler(monkeypatch):
         result = client.get("/other?count=invalid")
         assert result.status_code == 400
         assert result.json() == {"error": "upstream"}
+
+
+@pytest.mark.parametrize("decoder_error", [None, OSError("private decoder data")])
+def test_corrupt_image_http_rejection_and_recovery(monkeypatch, decoder_error):
+    from tests.entrypoints.decisions.test_spev import spec
+    from vllm_omni.entrypoints.openai import serving_decisions
+    from vllm_omni.model_executor.models.spev.processor import SPEVProcessor
+
+    processor = object.__new__(SPEVProcessor)
+    processor.config = spec()
+    # Invalid media must fail before reaching the tokenizer or model.
+    if decoder_error is not None:
+
+        def fail_decode(self, data):
+            raise decoder_error
+
+        monkeypatch.setattr("vllm_omni.model_executor.models.spev.processor.ImageMediaIO.load_bytes", fail_decode)
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *a: processor)
+    engine = Engine()
+    app = FastAPI()
+    serving = mount_decisions(app, engine, Args())
+    with TestClient(app) as client:
+        bad = payload()
+        bad["input"] = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,cHJpdmF0ZQ==",
+                    }
+                ],
+            }
+        ]
+        response = client.post("/v1/decisions", json=bad)
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid or unsupported model input"}
+        assert engine.calls == 0
+        assert not engine.errored
+        serving.processor = AlternateProcessor()
+        assert client.post("/v1/decisions", json=payload()).status_code == 200
+
+
+def test_pooling_launcher_enforces_body_limit(monkeypatch):
+    from argparse import Namespace
+    from contextlib import asynccontextmanager
+    from unittest.mock import Mock
+
+    import httpx
+    from vllm.entrypoints.launchers import app as upstream_app
+    from vllm.entrypoints.launchers import launcher
+    from vllm.entrypoints.launchers.api_server import app_state, entry
+    from vllm.entrypoints.launchers.utils import server_utils
+
+    from vllm_omni.entrypoints.openai import serving_decisions
+
+    engine = Engine()
+
+    @asynccontextmanager
+    async def build_engine(args):
+        yield engine
+
+    async def init_state(*args):
+        pass
+
+    async def serve(app, **kwargs):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/decisions", content=b"not-json" * 64)
+            assert response.status_code == 413
+            assert engine.calls == 0
+            assert (await client.post("/v1/decisions", json=payload())).status_code == 200
+
+        async def shutdown():
+            pass
+
+        return shutdown()
+
+    monkeypatch.setattr(entry, "build_async_engine_client", build_engine)
+    monkeypatch.setattr(upstream_app, "build_app", lambda *args: FastAPI())
+    monkeypatch.setattr(app_state, "init_app_state", init_state)
+    monkeypatch.setattr(server_utils, "get_uvicorn_log_config", lambda args: None)
+    monkeypatch.setattr(launcher, "serve_http", serve)
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *args: AlternateProcessor())
+    args = Namespace(
+        runner="pooling",
+        model="unrelated-model",
+        served_model_name=None,
+        decision_max_pending=2,
+        max_request_body_bytes=256,
+        host="127.0.0.1",
+        port=8000,
+        enable_ssl_refresh=False,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=0,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=65536,
+        h11_max_header_count=256,
+    )
+    sock = Mock()
+    asyncio.run(serving_decisions.run_pooling_server(args, sock))
+    sock.close.assert_called_once()

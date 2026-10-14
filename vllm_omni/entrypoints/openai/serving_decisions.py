@@ -20,6 +20,8 @@ from vllm.plugins.io_processors import get_io_processor
 from vllm.plugins.io_processors.interface import IOProcessor
 from vllm.v1.engine.exceptions import EngineGenerateError
 
+from vllm_omni.entrypoints.cli.pooling import DEFAULT_MAX_REQUEST_BODY_BYTES, validate_pooling_args
+from vllm_omni.entrypoints.openai.body_limit import BodyLimitMiddleware
 from vllm_omni.inputs.decisions import (
     DecisionInputTokensDetails,
     DecisionOutputTokensDetails,
@@ -152,12 +154,13 @@ def mount_decisions(app: FastAPI, engine: EngineClient, args: Namespace) -> Deci
 
 async def run_pooling_server(args, sock, **uvicorn_kwargs):
     from vllm import envs
-    from vllm.entrypoints.launchers.launcher import serve_http
     from vllm.entrypoints.launchers.api_server.app_state import init_app_state
     from vllm.entrypoints.launchers.api_server.entry import build_async_engine_client
     from vllm.entrypoints.launchers.app import build_app
+    from vllm.entrypoints.launchers.launcher import serve_http
     from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 
+    validate_pooling_args(args)
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
@@ -168,7 +171,7 @@ async def run_pooling_server(args, sock, **uvicorn_kwargs):
             await init_app_state(engine, app.state, args, tasks)
             mount_decisions(app, engine, args)
             shutdown = await serve_http(
-                app,
+                BodyLimitMiddleware(app, getattr(args, "max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES)),
                 sock=sock,
                 host=args.host,
                 port=args.port,

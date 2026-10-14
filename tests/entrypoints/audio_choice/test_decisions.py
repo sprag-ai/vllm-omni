@@ -130,7 +130,7 @@ def test_canonical_usage(modalities):
         {"questions": [{"type": "choice", "instructions": "Pick", "choices": [{"value": 1}, {"value": "a"}]}]},
         {"questions": [{"type": "score", "instructions": "Rate", "levels": [{"label": "one"}]}]},
         {"input": [{"role": "assistant", "content": "test"}]},
-        {"input_audio": {"data": "PRIVATE AUDIO", "format": "wav"}},
+        {"input_audio": {"data": "", "format": "wav"}},
     ],
 )
 def test_invalid_contract(change):

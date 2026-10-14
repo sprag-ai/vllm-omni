@@ -130,3 +130,27 @@ def test_real_processor_marker_and_multimodal_template(processor):
     rendered = processor.pre_process(p)
     audio_id = processor.processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
     assert audio_id not in rendered["prompt_token_ids"]
+
+
+def test_audio_validation_is_deferred_to_model_preparation(processor, monkeypatch):
+    import pybase64
+
+    calls = []
+    original = pybase64.b64decode
+
+    def decode(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pybase64, "b64decode", decode)
+    data = request().model_dump()
+    data["input_audio"] = {"data": "not-base64!", "format": "wav"}
+    parsed = processor.parse_data(DecisionsRequest.model_validate(data))
+    assert calls == []
+    with pytest.raises(ValueError):
+        processor.pre_process(parsed)
+    assert calls == ["not-base64!"]
+    processor.config.max_media_bytes = 1
+    with pytest.raises(ValueError, match="byte limit"):
+        processor.decode_bytes("QUJDQUJD")
+    assert calls == ["not-base64!"]

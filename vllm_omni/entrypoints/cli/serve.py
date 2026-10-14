@@ -28,6 +28,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.cli.logo import log_logo
+from vllm_omni.entrypoints.cli.pooling import DEFAULT_MAX_REQUEST_BODY_BYTES, validate_pooling_args
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
@@ -135,6 +136,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        validate_pooling_args(args)
         validate_decision_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
@@ -162,6 +164,7 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        validate_pooling_args(args)
         validate_decision_args(args)
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
@@ -363,6 +366,12 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Frozen native-audio decision bundle; serves completions and block-residual embeddings.",
+        )
+        omni_config_group.add_argument(
+            "--max-request-body-bytes",
+            type=int,
+            default=DEFAULT_MAX_REQUEST_BODY_BYTES,
+            help="Maximum HTTP request body size for --runner pooling (default: 64 MiB).",
         )
         omni_config_group.add_argument(
             "--decision-max-pending",

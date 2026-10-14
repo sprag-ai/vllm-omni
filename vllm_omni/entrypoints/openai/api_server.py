@@ -240,7 +240,9 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     decorate_logs("APIServer", skip_if_decorated=True)
 
     from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
+    from vllm_omni.entrypoints.cli.pooling import validate_pooling_args
 
+    validate_pooling_args(args)
     validate_decision_args(args)
     listen_address, sock = setup_openai_server(args, reuse_port=False)
 

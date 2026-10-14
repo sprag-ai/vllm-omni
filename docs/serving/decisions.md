@@ -27,7 +27,13 @@ to the model implementation and configuration. Registering a different decision
 model does not require adding a model branch to the serving layer.
 
 `--runner pooling` uses vLLM's single-stage engine. Multi-stage pooling through
-`AsyncOmni.encode` is not implemented.
+`AsyncOmni.encode` is not implemented. Stage deployment, strategy, and override
+options cannot be combined with this runner. Headless and multiple API-server
+modes are also unsupported.
+
+Pooling HTTP request bodies are limited to 64 MiB before JSON parsing. Set
+`--max-request-body-bytes` to a positive byte count to change this server limit.
+Oversized requests return HTTP 413. Model-specific media limits still apply.
 
 ## SPEV
 
