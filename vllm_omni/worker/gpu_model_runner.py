@@ -56,6 +56,20 @@ else:
 logger = init_logger(__name__)
 
 
+def _split_aux_hidden_states(model_output: Any) -> tuple[Any, list[torch.Tensor] | None]:
+    """Separate an EAGLE3 ``(output, aux)`` pair from a bare forward output.
+
+    Only a sequence of tensors is auxiliary hidden states; the Omni thinker also
+    returns a capture mapping in that position when no drafter is attached.
+    """
+    if not isinstance(model_output, tuple) or len(model_output) != 2:
+        return model_output, None
+    candidate, aux = model_output
+    if isinstance(aux, (list, tuple)) and aux and all(isinstance(t, torch.Tensor) for t in aux):
+        return candidate, list(aux)
+    return model_output, None
+
+
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
     method = getattr(model, "get_mrope_input_positions")
@@ -2132,7 +2146,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # before the envelope restoration below inspects the tuple shape.
         aux_hidden_states = None
         if self.use_aux_hidden_state_outputs:
-            model_output, aux_hidden_states = model_output
+            model_output, aux_hidden_states = _split_aux_hidden_states(model_output)
         # CUDAGraphWrapper's weak_ref_tensors preserves the fields but turns
         # NamedTuple outputs into plain tuples. Restore the Omni envelope
         # before a model adapter or extraction discards its multimodal fields.

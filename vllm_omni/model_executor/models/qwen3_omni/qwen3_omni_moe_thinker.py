@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -572,6 +573,9 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
+        # EagleModelMixin collects by return value: the layers set through
+        # set_aux_hidden_state_layers are only honoured if this loop appends them.
+        aux_hidden_states = self._maybe_add_hidden_state([], self.start_layer, hidden_states, residual)
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
             for layer_idx in capture_set:
@@ -602,6 +606,11 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
+            # After the deepstack add, so the drafter sees the same state the
+            # next layer does. The last layer is handled below, before the norm.
+            if layer_idx + 1 < self.end_layer:
+                self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "residual": residual}
             if captured_hidden_states:
@@ -612,7 +621,12 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                     }
                 )
             return IntermediateTensors(tensors)
+        # The speculator reapplies the verifier norm itself, so the last
+        # requested layer is collected before it.
+        self._maybe_add_hidden_state(aux_hidden_states, self.end_layer, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, captured_hidden_states, aux_hidden_states
         if captured_hidden_states is not None:
             return hidden_states, captured_hidden_states
         else:
@@ -1022,6 +1036,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 )
 class Qwen3OmniMoeThinkerForConditionalGeneration(
     nn.Module,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     SupportsLoRA,
@@ -1415,6 +1430,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if isinstance(model_output, IntermediateTensors):
             # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
+        if len(model_output) == 3:
+            hidden_states, captured_hidden_states, aux_hidden_states = model_output
+            primary = (hidden_states, captured_hidden_states) if return_hidden_states else hidden_states
+            return primary, aux_hidden_states
         hidden_states, captured_hidden_states = model_output
         if capture_layer_indices is None and not return_hidden_states:
             # No capture requested. Return a bare tensor: stock vLLM's

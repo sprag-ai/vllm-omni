@@ -24,7 +24,10 @@ Contract under test:
   ``make_omni_output``.
 - The combined model requests capture only in staged runs
   (``model_config.model_stage`` injected), never in plain vLLM runs.
-- ``make_omni_output`` tolerates both return shapes.
+- EAGLE3 aux layers set → the decoder appends a third element and the thinker
+  re-nests it as ``((hidden_states, captured_layer_dict), aux_hidden_states)``,
+  so the drafter's pair is the outer shape and omni's pair stays inner.
+- ``make_omni_output`` tolerates every return shape.
 
 Pure shape/contract tests: CPU-only, no weights, no GPU.
 """
@@ -44,6 +47,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMModel,
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
+from vllm_omni.worker.gpu_model_runner import _split_aux_hidden_states
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -102,25 +106,29 @@ def test_single_rank_intermediate_capture_includes_deferred_residual(mocker):
 
 
 class _InnerModelStub:
-    """Stands in for ``Qwen3MoeLLMModel``: always returns the internal 2-tuple."""
+    """Stands in for ``Qwen3MoeLLMModel``: returns the internal 2- or 3-tuple."""
 
-    def __init__(self, output=None):
+    def __init__(self, output=None, aux_rows=0):
         self.calls: list[dict] = []
         self._output = output
+        self._aux_rows = aux_rows
 
     def __call__(self, input_ids, positions, intermediate_tensors, **kwargs):
         self.calls.append(kwargs)
         if self._output is not None:
             return self._output
-        if kwargs.get("return_hidden_states"):
-            return _hidden_states(), {"hidden_states": {"layers": {0: _hidden_states()}}}
-        return _hidden_states(), None
+        captured = {"hidden_states": {"layers": {0: _hidden_states()}}} if kwargs.get("return_hidden_states") else None
+        if self._aux_rows:
+            return _hidden_states(), captured, [_hidden_states() for _ in range(self._aux_rows)]
+        return _hidden_states(), captured
 
 
-def _make_thinker(inner_output=None) -> tuple[Qwen3OmniMoeThinkerForConditionalGeneration, _InnerModelStub]:
+def _make_thinker(
+    inner_output=None, aux_rows: int = 0
+) -> tuple[Qwen3OmniMoeThinkerForConditionalGeneration, _InnerModelStub]:
     thinker = object.__new__(Qwen3OmniMoeThinkerForConditionalGeneration)
     nn.Module.__init__(thinker)
-    inner = _InnerModelStub(output=inner_output)
+    inner = _InnerModelStub(output=inner_output, aux_rows=aux_rows)
     thinker.use_deepstack = False
     thinker.language_model = SimpleNamespace(model=inner)
     return thinker, inner
@@ -151,6 +159,50 @@ def test_thinker_forward_returns_tuple_when_capturing():
     hidden, captured = out
     assert isinstance(hidden, torch.Tensor)
     assert "hidden_states" in captured
+
+
+def test_thinker_forward_nests_capture_inside_aux_pair():
+    thinker, _ = _make_thinker(aux_rows=3)
+    out = thinker.forward(
+        **_forward_args(),
+        capture_layer_indices=[0, 2],
+        return_hidden_states=True,
+    )
+    primary, aux = out
+    assert isinstance(aux, list) and len(aux) == 3
+    assert all(isinstance(t, torch.Tensor) for t in aux)
+    hidden, captured = primary
+    assert isinstance(hidden, torch.Tensor)
+    assert "hidden_states" in captured
+
+
+def test_thinker_forward_returns_bare_primary_with_aux_and_no_capture():
+    thinker, _ = _make_thinker(aux_rows=3)
+    primary, aux = thinker.forward(**_forward_args())
+    assert isinstance(primary, torch.Tensor)
+    assert len(aux) == 3
+
+
+def test_split_aux_rejects_the_capture_mapping():
+    """A capture dict in slot 1 is not auxiliary hidden states.
+
+    Treating it as aux both starves the drafter and empties the talker payload,
+    and neither failure surfaces until a tensor op rejects a str.
+    """
+    captured = {"hidden_states": {"layers": {0: _hidden_states()}}}
+    pair = (_hidden_states(), captured)
+    out, aux = _split_aux_hidden_states(pair)
+    assert aux is None
+    assert out is pair
+
+    aux_pair = (_hidden_states(), [_hidden_states(), _hidden_states()])
+    out, aux = _split_aux_hidden_states(aux_pair)
+    assert isinstance(aux, list) and len(aux) == 2
+    assert isinstance(out, torch.Tensor)
+
+    bare = _hidden_states()
+    out, aux = _split_aux_hidden_states(bare)
+    assert aux is None and out is bare
 
 
 def test_thinker_forward_passes_through_intermediate_tensors():
