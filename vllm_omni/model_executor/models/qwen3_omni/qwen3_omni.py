@@ -263,6 +263,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
         self.thinker_config = thinker_config
+        # A speculative drafter copies the target's image token id off the top
+        # level config; this model nests it under the thinker.
+        if not hasattr(config, "image_token_index"):
+            config.image_token_index = thinker_config.image_token_id
         self.multimodal_config = multimodal_config
 
         # Initialize talker components

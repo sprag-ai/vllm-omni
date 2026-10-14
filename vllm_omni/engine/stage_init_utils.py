@@ -1157,7 +1157,7 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
+    for name in ("compilation_config", "profiler_config", "speculative_config"):
         value = getattr(stage_config, name)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
