@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import pybase64 as base64
 from scipy.signal import resample_poly
-from transformers import AutoProcessor
+from transformers import Qwen3OmniMoeProcessor
 from vllm import PoolingParams
 from vllm.multimodal.media import ImageMediaIO, MediaWithBytes
 from vllm.multimodal.media.audio import load_audio
@@ -69,12 +69,19 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
 
     def __init__(self, vllm_config, renderer):
         super().__init__(vllm_config, renderer)
-        self.config = SPEVConfig.from_hf(vllm_config.model_config.hf_config)
-        self.processor = AutoProcessor.from_pretrained(
+        self.processor = Qwen3OmniMoeProcessor.from_pretrained(
+            vllm_config.model_config.tokenizer,
+            revision=vllm_config.model_config.tokenizer_revision,
+            local_files_only=True,
+            trust_remote_code=vllm_config.model_config.trust_remote_code,
+        )
+        self.config = SPEVConfig.from_hf(vllm_config.model_config.hf_config, self.processor.tokenizer)
+        processor_config, _ = Qwen3OmniMoeProcessor.get_processor_dict(
             vllm_config.model_config.tokenizer,
             revision=vllm_config.model_config.tokenizer_revision,
             local_files_only=True,
         )
+        self.config.video_fps = processor_config.get("video_fps", self.config.video_fps)
         self.lock = threading.Lock()
         marker_ids = self.processor.tokenizer.encode(self.config.marker, add_special_tokens=False)
         if marker_ids != self.config.marker_token_ids:

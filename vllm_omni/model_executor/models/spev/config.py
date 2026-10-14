@@ -34,16 +34,28 @@ class SPEVConfig(BaseModel):
     max_questions: int = Field(default=16, gt=0)
     max_candidates: int = Field(default=255, ge=2)
     max_text_chars: int = Field(default=65536, gt=0)
-    adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    head_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    head_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @classmethod
-    def from_hf(cls, hf_config):
+    def from_hf(cls, hf_config, tokenizer=None):
+        if hf_config.model_type == "spev":
+            if tokenizer is None:
+                raise ValueError("SPEV checkpoint requires its tokenizer for scoring markers")
+            return cls(
+                architecture="contextual_candidate_mlp_v1",
+                hidden_size=hf_config.thinker_config.text_config.hidden_size,
+                width=hf_config.head_width,
+                rank=hf_config.adapter_rank,
+                alpha=hf_config.adapter_alpha,
+                temperature=hf_config.temperature,
+                marker_token_ids=tokenizer.encode(cls.model_fields["marker"].default, add_special_tokens=False),
+            )
         return cls.model_validate(hf_config.spev)
 
     def asset(self, model_config, filename: Literal["adapter.safetensors", "head.safetensors"]) -> Path:
         path = Path(cached_file(model_config.model, filename, revision=model_config.revision))
         digest = self.adapter_sha256 if filename == "adapter.safetensors" else self.head_sha256
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        if digest is None or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError(f"SPEV checkpoint hash mismatch: {filename}")
         return path

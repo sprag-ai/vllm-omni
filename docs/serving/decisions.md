@@ -41,15 +41,17 @@ SPEV uses a Qwen3-Omni backbone, FP32 residual adapters, and a contextual
 candidate head. Its pooler reads candidate anchor positions from native pooling
 metadata and returns the scores through ordinary pooling outputs.
 
-The model configuration selects `SPEVForDecisions` and the `spev_decisions` I/O
-processor. Its `spev` object declares the head architecture and dimensions,
-adapter rank and scale, calibration temperature, anchor token IDs, asset hashes,
-prompt strings, media preprocessing, and input limits. The model directory must
-contain the base model weights and tokenizer files plus `adapter.safetensors`
-and `head.safetensors` matching those hashes.
+Standalone Transformers checkpoints select `SPEVModel`. The native loader reads
+the nested Thinker configuration and indexed backbone, adapter, and head tensors.
+Adapters and the head retain FP32 arithmetic; the unused generation head is not
+required. Select the `spev_decisions` I/O processor when serving this format.
+
+`SPEVForDecisions` checkpoints instead declare a `spev` configuration object and
+separate, hash-verified `adapter.safetensors` and `head.safetensors` files.
 
 ```bash
 vllm serve /models/spev --omni --runner pooling \
+  --trust-remote-code --io-processor-plugin spev_decisions \
   --served-model-name spev --dtype bfloat16 --max-model-len 8192 \
   --enforce-eager --no-enable-chunked-prefill --no-enable-prefix-caching \
   --max-num-seqs 8 --max-num-batched-tokens 16384 \

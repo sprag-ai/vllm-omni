@@ -37,6 +37,7 @@ _OMNI_MODELS = {
         "Qwen2_5OmniToken2WavModel",
     ),
     "Qwen2ForCausalLM_old": ("qwen2_5_omni", "qwen2_old", "Qwen2ForCausalLM"),  # need to discuss
+    "SPEVModel": ("spev", "model", "SPEVForDecisions"),
     "SPEVForDecisions": ("spev", "model", "SPEVForDecisions"),
     "Qwen3OmniChoiceThinker": ("qwen3_omni", "qwen3_omni_choice", "Qwen3OmniChoiceThinker"),
     "Qwen3OmniBatchedDecisionThinker": (
