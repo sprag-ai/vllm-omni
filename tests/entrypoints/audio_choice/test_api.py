@@ -13,9 +13,9 @@ from fastapi.testclient import TestClient
 
 from tests.entrypoints.audio_choice.test_decisions import payload
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse, Usage, primitive_answer, scoring_question
-from vllm_omni.entrypoints.audio_choice.decisions import DecisionsRequest
 from vllm_omni.entrypoints.audio_choice.decisions_adapter import to_choice
 from vllm_omni.entrypoints.openai.serving_choice import ChoiceServing, build_choice_app
+from vllm_omni.inputs.decisions import DecisionsRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

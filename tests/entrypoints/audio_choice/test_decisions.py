@@ -15,8 +15,8 @@ from vllm_omni.entrypoints.audio_choice.contract import (
     scoring_question,
     target,
 )
-from vllm_omni.entrypoints.audio_choice.decisions import DecisionsRequest
 from vllm_omni.entrypoints.audio_choice.decisions_adapter import choice_keys, from_choice, to_choice
+from vllm_omni.inputs.decisions import DecisionsRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -130,7 +130,7 @@ def test_canonical_usage(modalities):
         {"questions": [{"type": "choice", "instructions": "Pick", "choices": [{"value": 1}, {"value": "a"}]}]},
         {"questions": [{"type": "score", "instructions": "Rate", "levels": [{"label": "one"}]}]},
         {"input": [{"role": "assistant", "content": "test"}]},
-        {"input_audio": {"data": "PRIVATE AUDIO", "format": "wav"}},
+        {"input_audio": {"data": "", "format": "wav"}},
     ],
 )
 def test_invalid_contract(change):

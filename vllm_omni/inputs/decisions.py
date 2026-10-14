@@ -8,13 +8,19 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Self
 
-from vllm_omni.entrypoints.audio_choice.protocol import ChoiceInputAudio
-
 
 class DecisionObject(BaseModel):
     """A strictly typed Decisions object."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class DecisionAudioInput(DecisionObject):
+    """Inline encoded audio evidence."""
+
+    data: str = Field(min_length=1)
+    format: str = Field(min_length=1)
+
 
 
 class DecisionChoiceOption(DecisionObject):
@@ -45,7 +51,7 @@ class DecisionChoiceQuestion(DecisionObject):
     type: Literal["choice"] = Field(description="question primitive")
     name: str | None = Field(default=None, description="optional caller question name")
     instructions: str = Field(description="selection instructions")
-    choices: list[DecisionChoiceOption] = Field(min_length=2, max_length=255, description="allowed values and meanings")
+    choices: list[DecisionChoiceOption] = Field(min_length=2, description="allowed values and meanings")
 
     @model_validator(mode="after")
     def unique_choices(self) -> Self:
@@ -232,7 +238,7 @@ class DecisionsRequest(DecisionObject):
     input: DecisionInput = Field(description="shared text or user evidence messages")
     questions: list[DecisionQuestion] = Field(min_length=1, description="questions in answer order")
     safety_identifier: str | None = Field(default=None, max_length=128, description="opaque end-user safety identifier")
-    input_audio: ChoiceInputAudio | None = Field(
+    input_audio: DecisionAudioInput | None = Field(
         default=None, description="Sprag extension: inline native audio evidence"
     )
 
