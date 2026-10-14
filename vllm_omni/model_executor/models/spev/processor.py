@@ -114,7 +114,8 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
                         image = self.decode_bytes(encoded)
                         content.append({"type": "input_image"})
                 state.append({"role": "user", "content": content})
-        parsed = SPEVInput(request=request, state=state, image_bytes=image)
+        video = self.decode_bytes(request.input_video.data) if request.input_video is not None else None
+        parsed = SPEVInput(request=request, state=state, image_bytes=image, video_bytes=video)
         if len(self.render(parsed)) > self.config.max_text_chars:
             raise ValueError("SPEV input exceeds the text limit")
         return parsed
@@ -155,21 +156,29 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
 
         if len(data) > self.config.max_media_bytes:
             raise ValueError("Video exceeds the checkpoint byte limit")
-        with av.open(io.BytesIO(data)) as container:
-            stream = container.streams.video[0]
-            duration = float(stream.duration * stream.time_base) if stream.duration is not None else None
-            if duration is None or not math.isfinite(duration) or not 0 < duration <= self.config.max_video_seconds:
-                raise ValueError("Video duration is missing or exceeds the checkpoint limit")
-            if not 0 < stream.frames <= self.config.max_video_frames:
-                raise ValueError("Video frame count is missing or exceeds the checkpoint limit")
+        try:
+            with av.open(io.BytesIO(data)) as container:
+                if not container.streams.video:
+                    raise ValueError("Video has no visual stream")
+                stream = container.streams.video[0]
+                duration = float(stream.duration * stream.time_base) if stream.duration is not None else None
+                if duration is None or not math.isfinite(duration) or not 0 < duration <= self.config.max_video_seconds:
+                    raise ValueError("Video duration is missing or exceeds the checkpoint limit")
+                if not 0 < stream.frames <= self.config.max_video_frames:
+                    raise ValueError("Video frame count is missing or exceeds the checkpoint limit")
+        except av.FFmpegError as exc:
+            raise ValueError("Invalid or unsupported video") from exc
         with NamedTemporaryFile() as source:
             source.write(data)
             source.flush()
-            frames, metadata = load_video(
-                source.name,
-                backend="pyav",
-                sample_indices_fn=partial(self.processor.video_processor.sample_frames, fps=self.config.video_fps),
-            )
+            try:
+                frames, metadata = load_video(
+                    source.name,
+                    backend="pyav",
+                    sample_indices_fn=partial(self.processor.video_processor.sample_frames, fps=self.config.video_fps),
+                )
+            except (av.FFmpegError, OSError) as exc:
+                raise ValueError("Invalid or unsupported video") from exc
         if not len(frames) or not metadata.fps or not metadata.total_num_frames:
             raise ValueError("Video has no decodable frames")
         return MediaWithBytes(

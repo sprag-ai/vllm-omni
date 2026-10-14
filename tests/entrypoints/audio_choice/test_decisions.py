@@ -106,7 +106,7 @@ def test_ordered_mixed_answers_and_typed_boolean_collision():
     assert answers[2]["score"] == pytest.approx(answers[2]["probabilities"][1]["probability"])
 
 
-@pytest.mark.parametrize("modalities", [None, {"audio": 10}, {"image": 4}])
+@pytest.mark.parametrize("modalities", [None, {"audio": 10}, {"image": 4}, {"video": 8}])
 def test_canonical_usage(modalities):
     result = evaluate(DecisionsRequest.model_validate(payload()), modalities).model_dump()
     assert result["usage"] == {
@@ -153,6 +153,15 @@ def test_audio_extension_and_text_message_order():
     ]
     native = to_choice(DecisionsRequest.model_validate(data))
     assert native.input_audio.data == "QUJD"
+    assert native.state == data["input"]
+
+
+def test_video_extension_is_preserved_by_choice_adapter():
+    data = {**payload(), "input_video": {"data": "QUJD", "format": "mp4"}}
+    request = DecisionsRequest.model_validate(data)
+    native = to_choice(request)
+    assert request.carries_media
+    assert native.input_video.model_dump() == data["input_video"]
     assert native.state == data["input"]
 
 
