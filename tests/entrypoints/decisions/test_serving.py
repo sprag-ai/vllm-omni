@@ -97,6 +97,47 @@ def test_model_independent_processor_uses_encode_and_native_usage():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("modalities", [[], ["audio"], ["image"], ["video"], ["audio", "image", "video"]])
+def test_http_usage_preserves_upstream_multimodal_counts(monkeypatch, modalities):
+    from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    from vllm_omni.entrypoints.openai import serving_decisions
+
+    engine_input = {
+        "prompt_token_ids": list(range(64)),
+        "mm_placeholders": {
+            name: [PlaceholderRange(offset=index * 12, length=3), PlaceholderRange(offset=index * 12 + 3, length=5)]
+            for index, name in enumerate(modalities)
+        },
+    }
+    counted = []
+    assert serving_decisions._get_mm_token_counts is _get_mm_token_counts
+
+    def count(prompt):
+        counted.append(prompt)
+        return _get_mm_token_counts(prompt)
+
+    class NativeRenderer:
+        async def render_cmpl_async(self, prompts):
+            return [engine_input]
+
+    monkeypatch.setattr(serving_decisions, "_get_mm_token_counts", count)
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *args: AlternateProcessor())
+    engine = Engine()
+    engine.renderer = NativeRenderer()
+    app = FastAPI()
+    mount_decisions(app, engine, Args())
+    with TestClient(app) as client:
+        response = client.post("/v1/decisions", json=payload())
+        assert response.status_code == 200
+        usage = response.json()["usage"]
+        assert counted == [engine_input]
+        assert usage["input_tokens_details"]["multimodal_tokens"] == (_get_mm_token_counts(engine_input) or None)
+        assert usage["input_tokens"] == usage["total_tokens"] == 64
+        assert usage["output_tokens"] == 0
+
+
 @pytest.mark.parametrize("dead,client,status", [(False, True, 422), (False, False, 500), (True, True, 503)])
 def test_native_failures_are_redacted_and_do_not_latch(dead, client, status):
     async def run():
