@@ -52,7 +52,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _split_aux_hidden_states
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -1206,7 +1206,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                hidden_states, aux_hidden_states = _split_aux_hidden_states(model_output)
             else:
                 # Common case.
                 hidden_states = model_output
