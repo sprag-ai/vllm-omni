@@ -166,6 +166,9 @@ def _as_row_matrix(tensor: torch.Tensor | None, device: torch.device) -> torch.T
 )
 class Qwen3OmniMoeForConditionalGeneration(
     nn.Module,
+    # EAGLE3 is wired for the CUDA runners only: the Ascend runners extract
+    # multimodal outputs before unpacking the auxiliary hidden states, so the
+    # unpack there sees a bare tensor.
     SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
@@ -353,6 +356,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "tts_pad_projected"),
+                # the speculative decode queue is re-read every talker step, so a
+                # CPU round-trip here lands a sync in the audio decode loop
+                ("embed", "cached_decode"),
                 # talker MTP codec codes must stay on GPU to avoid a per-step D2H
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),

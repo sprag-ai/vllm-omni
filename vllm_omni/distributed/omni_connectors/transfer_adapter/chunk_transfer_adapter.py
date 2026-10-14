@@ -215,6 +215,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # late old-segment frame cannot restore the previous watermark.
         self._segment_generation: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self._thinker_output_lens: dict[str, int] = {}
         # The recv thread only records AR payloads. Prompt mutation is finalized
         # by the scheduler after it observes the ready marker, where the request
         # token counters form a consistent snapshot.
@@ -1037,6 +1038,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.ramp_chunk_count.pop(external_req_id, None)
         self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        self._thinker_output_lens.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:

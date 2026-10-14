@@ -225,6 +225,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
+    committed_tokens: int,
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -248,8 +249,16 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     # also carry several rows. Row count alone cannot tell that apart from a new
     # input segment; a step whose rows are all accounted for by newly committed
     # output tokens is a decode step.
-    output_delta = _committed_output_delta(transfer_manager, request_id, output_token_ids)
-    is_speculative_decode = thinker_emb.shape[0] > 1 and thinker_emb.shape[0] <= output_delta
+    is_speculative_decode = thinker_emb.shape[0] > 1 and thinker_emb.shape[0] <= committed_tokens
+    # A stop token inside an accepted span leaves more rows than committed
+    # tokens on the final chunk. Treating that as a new input segment would
+    # cache it and emit nothing, clipping the end of the turn.
+    if is_finished and not is_speculative_decode and 0 < committed_tokens < thinker_emb.shape[0]:
+        thinker_emb = thinker_emb[:committed_tokens]
+        thinker_hid = thinker_hid[:committed_tokens]
+        emb_cpu = thinker_emb.detach().cpu()
+        hid_cpu = thinker_hid.detach().cpu()
+        is_speculative_decode = True
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1 and not is_speculative_decode:
@@ -487,10 +496,16 @@ def thinker2talker_async_chunk(
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
     else:
+        committed_tokens = _committed_output_delta(transfer_manager, request_id, _ensure_list(request.output_token_ids))
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, committed_tokens
             )
+        # An accepted speculative span is truncated at a stop token by the
+        # scheduler, which runs before this payload is built, so the committed
+        # output tokens - not the sampled rows - bound what the talker may speak.
+        if 0 < committed_tokens < thinker_emb.shape[0]:
+            thinker_emb = thinker_emb[:committed_tokens]
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
