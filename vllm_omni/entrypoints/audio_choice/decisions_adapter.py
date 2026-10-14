@@ -3,7 +3,8 @@
 """Adapt Decisions requests to the named-choice scorer without changing its targets."""
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
-from vllm_omni.entrypoints.audio_choice.decisions import (
+from vllm_omni.entrypoints.audio_choice.protocol import ChoiceInputAudio, ChoiceInputMedia, ChoiceRequest
+from vllm_omni.inputs.decisions import (
     DecisionChoiceQuestion,
     DecisionInputImage,
     DecisionInputText,
@@ -11,7 +12,6 @@ from vllm_omni.entrypoints.audio_choice.decisions import (
     DecisionsRequest,
     DecisionsResponse,
 )
-from vllm_omni.entrypoints.audio_choice.protocol import ChoiceInputMedia, ChoiceRequest
 
 
 def choice_keys(question: DecisionChoiceQuestion) -> list[str]:
@@ -78,7 +78,9 @@ def to_choice(request: DecisionsRequest) -> ChoiceRequest:
         model=request.model,
         state=state,
         questions=questions,
-        input_audio=request.input_audio,
+        input_audio=(
+            ChoiceInputAudio.model_validate(request.input_audio.model_dump()) if request.input_audio is not None else None
+        ),
         input_image=image,
     )
 

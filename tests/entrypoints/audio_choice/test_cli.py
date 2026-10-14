@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import pytest
 
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
-
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def parse(*flags):
@@ -46,7 +43,7 @@ def test_choice_rejects_parallelism_at_cli_and_direct_launcher(flag, monkeypatch
     def unexpected(*a, **kw):
         pytest.fail("Invalid parallelism reached engine setup")
 
-    monkeypatch.setattr(serving_choice, "engine_class", unexpected)
+    monkeypatch.setattr(serving_choice, "AsyncChoiceEngine", unexpected)
     with pytest.raises(ValueError, match="TP=1 and PP=1"):
         asyncio.run(serving_choice.run_choice_server(args, None))
 

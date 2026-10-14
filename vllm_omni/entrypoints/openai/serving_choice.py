@@ -14,13 +14,13 @@ from vllm.entrypoints.openai.api_server import build_app
 from vllm.entrypoints.serve.engine.protocol import ModelCard, ModelList
 
 from vllm_omni.entrypoints.audio_choice.contract import ChoiceResponse
-from vllm_omni.entrypoints.audio_choice.decisions import DecisionsRequest, DecisionsResponse
 from vllm_omni.entrypoints.audio_choice.decisions_adapter import from_choice, to_choice
+from vllm_omni.entrypoints.audio_choice.engine import AsyncChoiceEngine
 from vllm_omni.entrypoints.audio_choice.errors import ChoiceInputError, log_input_error
 from vllm_omni.entrypoints.audio_choice.protocol import ChoiceRequest
-from vllm_omni.entrypoints.audio_choice.single_pass import engine_class
 from vllm_omni.entrypoints.audio_decision.cli_args import validate_decision_args
 from vllm_omni.entrypoints.openai.serving_decision import BodyLimitMiddleware, DecisionServing, parse_audio
+from vllm_omni.inputs.decisions import DecisionsRequest, DecisionsResponse
 
 
 class ChoiceServing(DecisionServing):
@@ -33,17 +33,16 @@ class ChoiceServing(DecisionServing):
         if self.pending >= self.max_pending:
             raise HTTPException(429, "Choice queue is full", headers={"Retry-After": "1"})
         self.pending += 1
-        loop = asyncio.get_running_loop()
-        self.loop = loop
+        self.loop = asyncio.get_running_loop()
 
         async def run():
             wave = None
             if request.input_audio is not None:
-                wave = await loop.run_in_executor(
+                wave = await self.loop.run_in_executor(
                     self.pool, parse_audio, {"input_audio": request.input_audio.model_dump()}
                 )
             if request.input_image is not None or request.input_video is not None:
-                visual = await loop.run_in_executor(self.pool, self.engine.decode_visual, request)
+                visual = await self.loop.run_in_executor(self.pool, self.engine.decode_visual, request)
                 return await self.engine.evaluate(request, wave, visual=visual)
             return await self.engine.evaluate(request, wave)
 
@@ -166,7 +165,7 @@ async def run_choice_server(args, sock, **uvicorn_kwargs):
     from vllm.entrypoints.launchers.launcher import serve_http
 
     keys = args.explicit_keys
-    engine = engine_class(args.choice_bundle)(
+    engine = AsyncChoiceEngine(
         args.model,
         args.choice_bundle,
         args.gpu_memory_utilization,

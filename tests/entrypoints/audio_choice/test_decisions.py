@@ -15,8 +15,8 @@ from vllm_omni.entrypoints.audio_choice.contract import (
     scoring_question,
     target,
 )
-from vllm_omni.entrypoints.audio_choice.decisions import DecisionsRequest
 from vllm_omni.entrypoints.audio_choice.decisions_adapter import choice_keys, from_choice, to_choice
+from vllm_omni.inputs.decisions import DecisionsRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

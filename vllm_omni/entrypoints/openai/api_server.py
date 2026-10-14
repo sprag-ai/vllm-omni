@@ -256,6 +256,12 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
         await run_decision_server(args, sock, **uvicorn_kwargs)
         return
 
+    if getattr(args, "runner", None) == "pooling":
+        from vllm_omni.entrypoints.openai.serving_decisions import run_pooling_server
+
+        await run_pooling_server(args, sock, **uvicorn_kwargs)
+        return
+
     # Unified use of omni_run_server_worker, AsyncOmni automatically handles LLM and Diffusion models
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
