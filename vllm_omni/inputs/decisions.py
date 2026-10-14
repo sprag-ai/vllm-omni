@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""The OpenAI Decisions wire contract with optional native audio evidence."""
+"""The OpenAI Decisions wire contract with optional native media evidence."""
 
 from typing import Annotated, Literal
 
@@ -21,6 +21,12 @@ class DecisionAudioInput(DecisionObject):
     data: str = Field(min_length=1)
     format: str = Field(min_length=1)
 
+
+class DecisionVideoInput(DecisionObject):
+    """Inline encoded visual video evidence."""
+
+    data: str = Field(min_length=1, description="base64-encoded video bytes")
+    format: str = Field(min_length=1, description="container or format hint")
 
 
 class DecisionChoiceOption(DecisionObject):
@@ -241,6 +247,9 @@ class DecisionsRequest(DecisionObject):
     input_audio: DecisionAudioInput | None = Field(
         default=None, description="Sprag extension: inline native audio evidence"
     )
+    input_video: DecisionVideoInput | None = Field(
+        default=None, description="Sprag extension: inline native visual video evidence"
+    )
 
     @model_validator(mode="after")
     def unique_names(self) -> Self:
@@ -252,12 +261,16 @@ class DecisionsRequest(DecisionObject):
 
     @property
     def carries_media(self) -> bool:
-        """Whether the evidence includes native audio or an image part."""
-        return self.input_audio is not None or (
-            isinstance(self.input, list)
-            and any(
-                isinstance(message.content, list)
-                and any(isinstance(part, DecisionInputImage) for part in message.content)
-                for message in self.input
+        """Whether the evidence includes audio, video, or an image part."""
+        return (
+            self.input_audio is not None
+            or self.input_video is not None
+            or (
+                isinstance(self.input, list)
+                and any(
+                    isinstance(message.content, list)
+                    and any(isinstance(part, DecisionInputImage) for part in message.content)
+                    for message in self.input
+                )
             )
         )

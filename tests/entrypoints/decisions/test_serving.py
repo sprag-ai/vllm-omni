@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
+import threading
 from dataclasses import dataclass
 
 import pytest
@@ -94,6 +95,47 @@ def test_model_independent_processor_uses_encode_and_native_usage():
         assert engine.calls == 1
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("modalities", [[], ["audio"], ["image"], ["video"], ["audio", "image", "video"]])
+def test_http_usage_preserves_upstream_multimodal_counts(monkeypatch, modalities):
+    from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    from vllm_omni.entrypoints.openai import serving_decisions
+
+    engine_input = {
+        "prompt_token_ids": list(range(64)),
+        "mm_placeholders": {
+            name: [PlaceholderRange(offset=index * 12, length=3), PlaceholderRange(offset=index * 12 + 3, length=5)]
+            for index, name in enumerate(modalities)
+        },
+    }
+    counted = []
+    assert serving_decisions._get_mm_token_counts is _get_mm_token_counts
+
+    def count(prompt):
+        counted.append(prompt)
+        return _get_mm_token_counts(prompt)
+
+    class NativeRenderer:
+        async def render_cmpl_async(self, prompts):
+            return [engine_input]
+
+    monkeypatch.setattr(serving_decisions, "_get_mm_token_counts", count)
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *args: AlternateProcessor())
+    engine = Engine()
+    engine.renderer = NativeRenderer()
+    app = FastAPI()
+    mount_decisions(app, engine, Args())
+    with TestClient(app) as client:
+        response = client.post("/v1/decisions", json=payload())
+        assert response.status_code == 200
+        usage = response.json()["usage"]
+        assert counted == [engine_input]
+        assert usage["input_tokens_details"]["multimodal_tokens"] == (_get_mm_token_counts(engine_input) or None)
+        assert usage["input_tokens"] == usage["total_tokens"] == 64
+        assert usage["output_tokens"] == 0
 
 
 @pytest.mark.parametrize("dead,client,status", [(False, True, 422), (False, False, 500), (True, True, 503)])
@@ -259,6 +301,96 @@ def test_corrupt_image_http_rejection_and_recovery(monkeypatch, decoder_error):
         assert response.json() == {"detail": "Invalid or unsupported model input"}
         assert engine.calls == 0
         assert not engine.errored
+        serving.processor = AlternateProcessor()
+        assert client.post("/v1/decisions", json=payload()).status_code == 200
+
+
+@pytest.mark.parametrize("format_name,codec", [("mp4", "mpeg4"), ("matroska", "mpeg4"), ("webm", "libvpx-vp9")])
+def test_video_http_forwarding_and_native_token_accounting(monkeypatch, video_factory, format_name, codec):
+    from types import SimpleNamespace
+
+    import pybase64
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    from tests.entrypoints.decisions.test_spev import spec
+    from vllm_omni.entrypoints.openai import serving_decisions
+    from vllm_omni.model_executor.models.spev.processor import SPEVProcessor
+
+    processor = object.__new__(SPEVProcessor)
+    processor.config = spec()
+    processor.lock = threading.Lock()
+    processor.processor = SimpleNamespace(
+        video_processor=SimpleNamespace(sample_frames=lambda metadata, fps: [0, 4]),
+        apply_chat_template=lambda *a, **k: "video prompt",
+        tokenizer=SimpleNamespace(encode=lambda *a, **k: list(range(12))),
+    )
+
+    def post_process(output, *, prompt, request_id):
+        assert prompt.request.questions[0].name == "condition"
+        return [{"type": "predicate", "name": "condition", "probability": 0.75}]
+
+    processor.post_process = post_process
+
+    class VideoRenderer:
+        async def render_cmpl_async(self, prompts):
+            (prompt,) = prompts
+            assert set(prompt["multi_modal_data"]) == {"video"}
+            return [{**prompt, "mm_placeholders": {"video": [PlaceholderRange(offset=1, length=4)]}}]
+
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *a: processor)
+    engine = Engine()
+    engine.renderer = VideoRenderer()
+    app = FastAPI()
+    mount_decisions(app, engine, Args())
+    encoded = pybase64.b64encode(video_factory(format_name, codec)).decode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/decisions", json={**payload(), "input_video": {"data": encoded, "format": format_name}}
+        )
+        assert response.status_code == 200, response.text
+        usage = response.json()["usage"]
+        assert usage["input_tokens"] == 12
+        assert usage["input_tokens_details"]["multimodal_tokens"] == {"video": 4}
+        assert engine.calls == 1
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "audio_only", "ffmpeg", "os", "truncated"])
+def test_video_http_rejection_and_recovery(monkeypatch, video_bytes, video_factory, audio_only_mp4, failure):
+    from types import SimpleNamespace
+
+    import av
+    import pybase64
+
+    from tests.entrypoints.decisions.test_spev import spec
+    from vllm_omni.entrypoints.openai import serving_decisions
+    from vllm_omni.model_executor.models.spev.processor import SPEVProcessor
+
+    processor = object.__new__(SPEVProcessor)
+    processor.config = spec()
+    if failure in {"ffmpeg", "os"}:
+        error = av.FFmpegError(1, "private decoder data") if failure == "ffmpeg" else OSError("private decoder data")
+
+        def fail(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr("transformers.video_utils.load_video", fail)
+    data = b"private" if failure == "corrupt" else audio_only_mp4 if failure == "audio_only" else video_bytes
+    if failure == "truncated":
+        data = video_factory()
+        data = data[: len(data) // 2]
+        processor.processor = SimpleNamespace(
+            video_processor=SimpleNamespace(sample_frames=lambda metadata, fps: [0, 4])
+        )
+    monkeypatch.setattr(serving_decisions, "get_io_processor", lambda *a: processor)
+    engine = Engine()
+    app = FastAPI()
+    serving = mount_decisions(app, engine, Args())
+    with TestClient(app) as client:
+        bad = {**payload(), "input_video": {"data": pybase64.b64encode(data).decode(), "format": "mp4"}}
+        response = client.post("/v1/decisions", json=bad)
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid or unsupported model input"}
+        assert engine.calls == 0 and not engine.errored
         serving.processor = AlternateProcessor()
         assert client.post("/v1/decisions", json=payload()).status_code == 200
 

@@ -75,7 +75,9 @@ prefill, without generating a completion token.
 ```
 
 The public Decisions input supports text, inline images, and the optional
-`input_audio` extension. SPEV's model processor also supports video evidence
-internally; the public Decisions schema does not define a video input part.
+`input_audio` and `input_video` extensions. Each extension contains `data`
+(base64-encoded file bytes) and `format` (a container hint). Video supplies visual
+frames; supply its soundtrack separately through `input_audio` when needed.
+SPEV's checkpoint configuration controls frame sampling and media limits.
 For direct `/pooling` plugin calls, SPEV returns the candidate logit vector.
 The Decisions route supplies question context to obtain typed answers instead.

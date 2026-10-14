@@ -84,6 +84,11 @@ def to_choice(request: DecisionsRequest) -> ChoiceRequest:
             else None
         ),
         input_image=image,
+        input_video=(
+            ChoiceInputMedia.model_validate(request.input_video.model_dump())
+            if request.input_video is not None
+            else None
+        ),
     )
 
 
