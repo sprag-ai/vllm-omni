@@ -886,6 +886,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "parallel_config",
         "compilation_config",
         "profiler_config",
+        "speculative_config",
         "quantization_config",
     }
     assert "diffusion_config" not in public_fields

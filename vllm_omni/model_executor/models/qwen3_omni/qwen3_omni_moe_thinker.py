@@ -560,7 +560,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
         capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -573,10 +573,6 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
-        # The accept-layer capture is read off the model after the forward
-        # rather than returned, leaving the second return slot to
-        # EagleModelMixin's documented (hidden_states, aux) contract.
-        self.captured_layers = None
         aux_hidden_states = self._maybe_add_hidden_state([], self.start_layer, hidden_states, residual)
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
@@ -608,10 +604,10 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
-            # After the deepstack add, so the drafter sees the same state the
-            # next layer does. The last layer is handled below, before the norm.
-            if layer_idx + 1 < self.end_layer:
-                self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+            # After the deepstack add, so the drafter sees the state the next
+            # layer does. The speculator reapplies the verifier norm itself, so
+            # the last layer is collected here too, before self.norm below.
+            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "residual": residual}
@@ -623,13 +619,12 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                     }
                 )
             return IntermediateTensors(tensors)
-        # The speculator reapplies the verifier norm itself, so the last
-        # requested layer is collected before it.
-        self._maybe_add_hidden_state(aux_hidden_states, self.end_layer, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        self.captured_layers = captured_hidden_states
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
+        # Both extra values ride the return so a CUDA-graph replay, which does
+        # not re-run this body, still yields the current step's tensors. The
+        # wrapper below reduces this to the shape vLLM expects.
+        if captured_hidden_states is not None or aux_hidden_states:
+            return hidden_states, captured_hidden_states, aux_hidden_states or None
         return hidden_states
 
 
@@ -1047,6 +1042,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     # PEFT stores the expert LoRA matrices with an explicit expert dimension.
     is_3d_moe_weight: bool = True
+    # Accept-layer capture from the most recent forward, consumed by the
+    # combined model's make_omni_output. None when no capture was requested.
+    captured_layers: OmniPayload | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1430,9 +1428,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if isinstance(model_output, IntermediateTensors):
             # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
-        # Whatever the decoder returned is already the shape vLLM expects:
-        # a bare tensor, or (hidden_states, aux_hidden_states) under EAGLE3.
-        # The capture rides on the decoder, read by make_omni_output.
+        if isinstance(model_output, tuple) and len(model_output) == 3:
+            hidden_states, captured_layers, aux_hidden_states = model_output
+            # Published here rather than in the decoder: this method is outside
+            # the compiled region, so it runs on every step including a replay.
+            self.captured_layers = captured_layers
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
         return model_output
 
     def compute_logits(
