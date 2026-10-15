@@ -24,6 +24,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
@@ -148,6 +149,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _as_row_matrix(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    """Normalise a thinker embed payload to [rows, hidden] on ``device``."""
+    if tensor is None:
+        return None
+    tensor = tensor.to(device)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -155,6 +166,10 @@ logger = init_logger(__name__)
 )
 class Qwen3OmniMoeForConditionalGeneration(
     nn.Module,
+    # EAGLE3 is wired for the CUDA runners only: the Ascend runners extract
+    # multimodal outputs before unpacking the auxiliary hidden states, so the
+    # unpack there sees a bare tensor.
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     Qwen3OmniMoeConditionalGenerationMixin,
@@ -248,6 +263,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
         self.thinker_config = thinker_config
+        # A speculative drafter copies the target's image token id off the top
+        # level config; this model nests it under the thinker.
+        if not hasattr(config, "image_token_index"):
+            image_token_id = getattr(thinker_config, "image_token_id", None)
+            if image_token_id is not None:
+                config.image_token_index = image_token_id
         self.multimodal_config = multimodal_config
 
         # Initialize talker components
@@ -276,7 +297,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # vLLM run with no talker stage downstream, so no one consumes captured
         # thinker layers and the forward must return what stock vLLM expects.
         self.is_staged_run = getattr(vllm_config.model_config, "model_stage", None) is not None
-        self._returns_tuple = self.model_stage == "thinker" and self.is_staged_run
+        # Any thinker forward can return a tuple: the accept-layer capture when
+        # staged, the auxiliary hidden states when a drafter is attached. The
+        # latter is configured on the runner, so it is not knowable here.
+        self._returns_tuple = self.model_stage == "thinker"
 
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
@@ -341,6 +365,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "tts_pad_projected"),
+                # the speculative decode queue is re-read every talker step, so a
+                # CPU round-trip here lands a sync in the audio decode loop
+                ("embed", "cached_decode"),
                 # talker MTP codec codes must stay on GPU to avoid a per-step D2H
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),
@@ -381,6 +408,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
                     ["hidden_states", "residual", *incoming_captures], thinker_config.text_config.hidden_size
                 )
+
+    def _thinker_captured_layers(self) -> OmniPayload | None:
+        """Accept-layer capture published by the thinker's last forward."""
+        return self.thinker.captured_layers
 
     def _thinker_capture_layer_indices(self) -> list[int]:
         accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
@@ -585,7 +616,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         logits_index: int | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput | tuple:
         """
         Unified forward pass for all model stages.
 
@@ -613,8 +644,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Run thinker forward
             # If talker expects a specific intermediate layer, capture it here.
             # Only staged runs have a talker stage to consume the capture; in a
-            # plain vLLM run capturing would waste a clone per layer per step
-            # and make the thinker return a tuple stock vLLM cannot handle.
+            # plain vLLM run capturing would waste a clone per layer per step.
             capture_indices = self._thinker_capture_layer_indices()
             capture_kwargs = {}
             if capture_indices:
@@ -623,8 +653,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "return_hidden_states": True,
                 }
 
-            # Run thinker. Returns (text_hidden_states, captured_layer_dict)
-            # when capturing, a bare tensor otherwise.
+            # Run thinker. Returns a bare tensor, or (hidden_states, aux)
+            # under EAGLE3; the accept-layer capture rides on the decoder.
             return self.thinker(
                 input_ids=input_ids,
                 positions=positions,
@@ -722,11 +752,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
-            if isinstance(model_outputs, tuple):
-                text_hidden_states, captured_layer_dict = model_outputs
-            else:
-                # Bare tensor: capture was not requested (no accept_hidden_layer).
-                text_hidden_states, captured_layer_dict = model_outputs, None
+            text_hidden_states = model_outputs[0] if isinstance(model_outputs, tuple) else model_outputs
+            # Published by the thinker wrapper on the forward this output came
+            # from; None when no capture was requested.
+            captured_layer_dict = self._thinker_captured_layers()
             # Compute thinker-side TTS token embeddings for BOS/EOS/PAD and expose via multimodal outputs.
             # These will later be projected into talker text space by the talker stage.
             multimodal_outputs: OmniPayload = captured_layer_dict if captured_layer_dict is not None else {}
@@ -1185,7 +1214,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         target_len = thinker_result_ids.shape[-1]
         im_start_indexes = torch.cat(
             (
-                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
+                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(-1),
                 torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
@@ -1261,23 +1290,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
 
-        cached_thinker_decode_embeds = embed.get("cached_decode", None)
-        thinker_decode_embed = embed.get("decode", None)
-        start_index = meta.get("num_processed_tokens", 0)
+        # A speculative thinker step commits several text tokens at once while the
+        # talker consumes one per call, so the arrivals are a queue rather than an
+        # array indexed by the processed-token count.
+        queue = _as_row_matrix(embed.get("cached_decode", None), device)
+        arriving = _as_row_matrix(embed.get("decode", None), device)
+        if queue is None:
+            queue = arriving
+        elif arriving is not None:
+            queue = torch.cat([queue, arriving], dim=0)
 
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-
-        elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
+        if queue is not None and queue.shape[0] > 0:
+            thinker_embed = queue[0]
+            update_dict.setdefault("embed", {})["cached_decode"] = queue[1:]
         else:
             # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
             # Use the finished_flag to mark that all tokens output by thinker have been consumed.

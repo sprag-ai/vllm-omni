@@ -4,7 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +31,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 # Pooling output layer indices (semantic names for clarity)
 # Actual layer indices are integers; these functions provide semantic access
@@ -203,6 +204,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
+    committed_tokens: int,
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -222,8 +224,23 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     emb_cpu = thinker_emb.detach().cpu()
     hid_cpu = thinker_hid.detach().cpu()
 
+    # Speculation commits several output tokens in one step, so a decode step can
+    # also carry several rows. Row count alone cannot tell that apart from a new
+    # input segment; a step whose rows are all accounted for by newly committed
+    # output tokens is a decode step.
+    is_speculative_decode = thinker_emb.shape[0] > 1 and thinker_emb.shape[0] <= committed_tokens
+    # A stop token inside an accepted span leaves more rows than committed
+    # tokens on the final chunk. Treating that as a new input segment would
+    # cache it and emit nothing, clipping the end of the turn.
+    if is_finished and not is_speculative_decode and 0 < committed_tokens < thinker_emb.shape[0]:
+        thinker_emb = thinker_emb[:committed_tokens]
+        thinker_hid = thinker_hid[:committed_tokens]
+        emb_cpu = thinker_emb.detach().cpu()
+        hid_cpu = thinker_hid.detach().cpu()
+        is_speculative_decode = True
+
     if output_token_ids:
-        if thinker_emb.shape[0] > 1:
+        if thinker_emb.shape[0] > 1 and not is_speculative_decode:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
             new_prompt_len = thinker_emb.shape[0]
@@ -372,6 +389,7 @@ def thinker2talker_async_chunk(
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
+    new_token_ids: Iterable[int] = (),
 ) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
@@ -458,20 +476,18 @@ def thinker2talker_async_chunk(
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
     else:
+        # Tokens this scheduler step committed, snapshotted by the connector
+        # before any resumable cleanup could rewrite the request.
+        committed_tokens = len(tuple(new_token_ids))
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, committed_tokens
             )
-        if thinker_emb.shape[0] > 1:
-            logger.warning(
-                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
-                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
-                chunk_id,
-                request_id,
-                request.num_computed_tokens,
-                thinker_emb.shape,
-            )
-            return None
+        # An accepted speculative span is truncated at a stop token by the
+        # scheduler, which runs before this payload is built, so the committed
+        # output tokens - not the sampled rows - bound what the talker may speak.
+        if 0 < committed_tokens < thinker_emb.shape[0]:
+            thinker_emb = thinker_emb[:committed_tokens]
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,

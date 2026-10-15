@@ -262,15 +262,18 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             inputs_embeds = self.embed_input_ids(input_ids)
             input_ids = None
 
-        talker_hidden_states, _ = self.language_model.model(
+        talker_output = self.language_model.model(
             input_ids,
             positions,
             intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-
-        return talker_hidden_states
+        # The shared decoder returns hidden states alone, or paired with the
+        # auxiliary states a drafter consumes; the talker wants the former.
+        if isinstance(talker_output, tuple):
+            return talker_output[0]
+        return talker_output
 
     def compute_logits(
         self,

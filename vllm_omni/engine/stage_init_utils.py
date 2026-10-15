@@ -42,6 +42,7 @@ from vllm_omni.config.omni_config import (
     _DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP,
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
     _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
+    _DIRECT_VLLM_CONFIG_ENGINE_FIELDS,
     _LOAD_STAGE_ENGINE_FIELD_MAP,
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
@@ -1157,10 +1158,21 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
+    for name in sorted(_DIRECT_VLLM_CONFIG_ENGINE_FIELDS):
         value = getattr(stage_config, name)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
+
+    if stage_config.speculative_config is not None and getattr(
+        stage_config.cache_config, "enable_prefix_caching", False
+    ):
+        # The merged prefix-cache payload is rebuilt from the scheduled token
+        # counts, so the committed-row span cannot reach it and rejected draft
+        # rows would be handed to the next stage.
+        raise ValueError(
+            f"Stage {stage_config.stage_id}: speculative decoding is not supported together "
+            "with the Omni prefix cache; set enable_prefix_caching: false on this stage."
+        )
 
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
