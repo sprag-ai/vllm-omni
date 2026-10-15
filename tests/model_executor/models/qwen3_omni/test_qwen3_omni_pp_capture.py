@@ -40,7 +40,7 @@ def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=
     model.end_layer = end
     model.layers = nn.ModuleList([_Layer() for _ in range(48)])
     model.norm = _Norm()
-    return model.forward(
+    result = model.forward(
         input_ids=None,
         positions=torch.arange(embeddings.shape[0]),
         inputs_embeds=embeddings,
@@ -48,6 +48,8 @@ def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=
         capture_layer_indices=[0, 24] if capture else None,
         return_hidden_states=capture,
     )
+    # The decoder returns vLLM's shape and exposes the capture separately.
+    return result, getattr(model, "captured_layers", None)
 
 
 @pytest.mark.parametrize("tokens", [1, 4])
@@ -57,12 +59,12 @@ def test_required_captures_match_unsplit_forward(monkeypatch, tokens, boundaries
     reference, captures = _forward(monkeypatch, 0, 48, embeddings)
     intermediate = None
     for start, end in zip(boundaries, boundaries[1:]):
-        result = _forward(monkeypatch, start, end, embeddings, intermediate)
+        result, captured = _forward(monkeypatch, start, end, embeddings, intermediate)
         if end < 48:
             assert isinstance(result, IntermediateTensors)
             assert all(isinstance(value, torch.Tensor) for value in result.tensors.values())
             intermediate = result
-    actual, actual_captures = result
+    actual, actual_captures = result, captured
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     actual_layers = actual_captures["hidden_states"]["layers"]
     assert set(actual_layers) == {0, 24}
@@ -78,7 +80,7 @@ def test_required_captures_match_unsplit_forward(monkeypatch, tokens, boundaries
 
 def test_capture_disabled_keeps_original_intermediate_schema(monkeypatch):
     embeddings = torch.ones(4, 8)
-    first = _forward(monkeypatch, 0, 24, embeddings, capture=False)
+    first, _ = _forward(monkeypatch, 0, 24, embeddings, capture=False)
     assert set(first.tensors) == {"hidden_states", "residual"}
     actual, captures = _forward(monkeypatch, 24, 48, embeddings, first, capture=False)
     reference, _ = _forward(monkeypatch, 0, 48, embeddings, capture=False)
