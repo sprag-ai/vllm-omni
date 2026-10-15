@@ -573,8 +573,10 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
-        # EagleModelMixin collects by return value: the layers set through
-        # set_aux_hidden_state_layers are only honoured if this loop appends them.
+        # The accept-layer capture is read off the model after the forward
+        # rather than returned, leaving the second return slot to
+        # EagleModelMixin's documented (hidden_states, aux) contract.
+        self.captured_layers = None
         aux_hidden_states = self._maybe_add_hidden_state([], self.start_layer, hidden_states, residual)
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
@@ -625,12 +627,10 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
         # requested layer is collected before it.
         self._maybe_add_hidden_state(aux_hidden_states, self.end_layer, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        self.captured_layers = captured_hidden_states
         if aux_hidden_states:
-            return hidden_states, captured_hidden_states, aux_hidden_states
-        if captured_hidden_states is not None:
-            return hidden_states, captured_hidden_states
-        else:
-            return hidden_states, None
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
@@ -1430,18 +1430,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if isinstance(model_output, IntermediateTensors):
             # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
-        if len(model_output) == 3:
-            hidden_states, captured_hidden_states, aux_hidden_states = model_output
-            primary = (hidden_states, captured_hidden_states) if return_hidden_states else hidden_states
-            return primary, aux_hidden_states
-        hidden_states, captured_hidden_states = model_output
-        if capture_layer_indices is None and not return_hidden_states:
-            # No capture requested. Return a bare tensor: stock vLLM's
-            # GPUModelRunner indexes the forward output directly, so a tuple
-            # here breaks non-staged runs that resolve this class through the
-            # global registry (e.g. plain `vllm serve` of the thinker).
-            return hidden_states
-        return hidden_states, captured_hidden_states
+        # Whatever the decoder returned is already the shape vLLM expects:
+        # a bare tensor, or (hidden_states, aux_hidden_states) under EAGLE3.
+        # The capture rides on the decoder, read by make_omni_output.
+        return model_output
 
     def compute_logits(
         self,

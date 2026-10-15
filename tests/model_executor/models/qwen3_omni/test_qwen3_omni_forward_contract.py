@@ -24,9 +24,12 @@ Contract under test:
   ``make_omni_output``.
 - The combined model requests capture only in staged runs
   (``model_config.model_stage`` injected), never in plain vLLM runs.
-- EAGLE3 aux layers set → the decoder appends a third element and the thinker
-  re-nests it as ``((hidden_states, captured_layer_dict), aux_hidden_states)``,
-  so the drafter's pair is the outer shape and omni's pair stays inner.
+- EAGLE3 aux layers set → the decoder returns ``(hidden_states,
+  aux_hidden_states)``, which is ``EagleModelMixin``'s documented contract, and
+  the wrappers pass it through untouched.
+- The accept-layer capture never rides the return value: the decoder exposes it
+  as ``captured_layers``, which ``make_omni_output`` reads. That keeps the second
+  return slot free for aux.
 - ``make_omni_output`` tolerates every return shape.
 
 Pure shape/contract tests: CPU-only, no weights, no GPU.
@@ -47,7 +50,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMModel,
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
-from vllm_omni.worker.gpu_model_runner import _split_aux_hidden_states
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -106,21 +108,24 @@ def test_single_rank_intermediate_capture_includes_deferred_residual(mocker):
 
 
 class _InnerModelStub:
-    """Stands in for ``Qwen3MoeLLMModel``: returns the internal 2- or 3-tuple."""
+    """Stands in for ``Qwen3MoeLLMModel``: upstream's shape, capture on self."""
 
     def __init__(self, output=None, aux_rows=0):
         self.calls: list[dict] = []
         self._output = output
         self._aux_rows = aux_rows
+        self.captured_layers = None
 
     def __call__(self, input_ids, positions, intermediate_tensors, **kwargs):
         self.calls.append(kwargs)
         if self._output is not None:
             return self._output
-        captured = {"hidden_states": {"layers": {0: _hidden_states()}}} if kwargs.get("return_hidden_states") else None
+        self.captured_layers = (
+            {"hidden_states": {"layers": {0: _hidden_states()}}} if kwargs.get("return_hidden_states") else None
+        )
         if self._aux_rows:
-            return _hidden_states(), captured, [_hidden_states() for _ in range(self._aux_rows)]
-        return _hidden_states(), captured
+            return _hidden_states(), [_hidden_states() for _ in range(self._aux_rows)]
+        return _hidden_states()
 
 
 def _make_thinker(
@@ -148,61 +153,37 @@ def test_thinker_forward_returns_bare_tensor_without_capture():
     assert out.shape == (_TOKENS, _HIDDEN)
 
 
-def test_thinker_forward_returns_tuple_when_capturing():
-    thinker, _ = _make_thinker()
+def test_thinker_forward_keeps_capture_off_the_return_value():
+    thinker, inner = _make_thinker()
     out = thinker.forward(
         **_forward_args(),
         capture_layer_indices=[0, 2],
         return_hidden_states=True,
     )
-    assert isinstance(out, tuple)
-    hidden, captured = out
+    assert isinstance(out, torch.Tensor)
+    assert "hidden_states" in inner.captured_layers
+
+
+def test_thinker_forward_returns_the_documented_aux_pair():
+    thinker, inner = _make_thinker(aux_rows=3)
+    hidden, aux = thinker.forward(
+        **_forward_args(),
+        capture_layer_indices=[0, 2],
+        return_hidden_states=True,
+    )
     assert isinstance(hidden, torch.Tensor)
-    assert "hidden_states" in captured
-
-
-def test_thinker_forward_nests_capture_inside_aux_pair():
-    thinker, _ = _make_thinker(aux_rows=3)
-    out = thinker.forward(
-        **_forward_args(),
-        capture_layer_indices=[0, 2],
-        return_hidden_states=True,
-    )
-    primary, aux = out
     assert isinstance(aux, list) and len(aux) == 3
     assert all(isinstance(t, torch.Tensor) for t in aux)
-    hidden, captured = primary
+    # capture is reachable without disturbing the aux contract
+    assert "hidden_states" in inner.captured_layers
+
+
+def test_thinker_forward_returns_aux_pair_without_capture():
+    thinker, inner = _make_thinker(aux_rows=3)
+    hidden, aux = thinker.forward(**_forward_args())
     assert isinstance(hidden, torch.Tensor)
-    assert "hidden_states" in captured
-
-
-def test_thinker_forward_returns_bare_primary_with_aux_and_no_capture():
-    thinker, _ = _make_thinker(aux_rows=3)
-    primary, aux = thinker.forward(**_forward_args())
-    assert isinstance(primary, torch.Tensor)
     assert len(aux) == 3
-
-
-def test_split_aux_rejects_the_capture_mapping():
-    """A capture dict in slot 1 is not auxiliary hidden states.
-
-    Treating it as aux both starves the drafter and empties the talker payload,
-    and neither failure surfaces until a tensor op rejects a str.
-    """
-    captured = {"hidden_states": {"layers": {0: _hidden_states()}}}
-    pair = (_hidden_states(), captured)
-    out, aux = _split_aux_hidden_states(pair)
-    assert aux is None
-    assert out is pair
-
-    aux_pair = (_hidden_states(), [_hidden_states(), _hidden_states()])
-    out, aux = _split_aux_hidden_states(aux_pair)
-    assert isinstance(aux, list) and len(aux) == 2
-    assert isinstance(out, torch.Tensor)
-
-    bare = _hidden_states()
-    out, aux = _split_aux_hidden_states(bare)
-    assert aux is None and out is bare
+    assert inner.captured_layers is None
 
 
 def test_thinker_forward_passes_through_intermediate_tensors():
@@ -213,16 +194,17 @@ def test_thinker_forward_passes_through_intermediate_tensors():
 
 
 class _ThinkerStub(nn.Module):
-    """Records capture kwargs; mirrors the fixed thinker return contract."""
+    """Records capture kwargs; mirrors the thinker's return contract."""
 
     def __init__(self):
         super().__init__()
         self.received: dict = {}
+        self.language_model = SimpleNamespace(model=SimpleNamespace(captured_layers=None))
 
     def forward(self, **kwargs):
         self.received = kwargs
         if kwargs.get("return_hidden_states"):
-            return _hidden_states(), {"hidden_states": {"layers": {}}}
+            self.language_model.model.captured_layers = {"hidden_states": {"layers": {}}}
         return _hidden_states()
 
 
@@ -243,12 +225,14 @@ def test_combined_forward_plain_run_skips_capture_and_returns_tensor():
     assert isinstance(out, torch.Tensor)
 
 
-def test_combined_forward_staged_run_captures_and_returns_tuple():
+def test_combined_forward_staged_run_requests_capture():
     model = _make_combined(is_staged_run=True)
     out = model.forward(**_forward_args())
     assert model.thinker.received["capture_layer_indices"] == [0, 6]
     assert model.thinker.received["return_hidden_states"] is True
-    assert isinstance(out, tuple)
+    # The capture is fetched from the decoder, so the return stays vLLM's shape.
+    assert isinstance(out, torch.Tensor)
+    assert model._thinker_captured_layers() == {"hidden_states": {"layers": {}}}
 
 
 def test_combined_forward_staged_run_without_accept_layer_returns_tensor():
@@ -266,9 +250,18 @@ def test_make_omni_output_accepts_bare_tensor():
     assert out.multimodal_outputs == {}
 
 
-def test_make_omni_output_accepts_capture_tuple():
+def test_make_omni_output_reads_the_decoder_capture():
     model = _make_combined(is_staged_run=True)
     captured: dict[str, dict[str, dict[int, torch.Tensor]]] = {"hidden_states": {"layers": {}}}
-    out = model.make_omni_output((_hidden_states(), captured))
+    model.thinker.language_model.model.captured_layers = captured
+    out = model.make_omni_output(_hidden_states())
     assert isinstance(out, OmniOutput)
     assert out.multimodal_outputs == captured
+
+
+def test_make_omni_output_accepts_the_aux_pair():
+    """An EAGLE3 forward hands make_omni_output (hidden_states, aux)."""
+    model = _make_combined(is_staged_run=True)
+    model.thinker.language_model.model.captured_layers = None
+    out = model.make_omni_output((_hidden_states(), [_hidden_states()]))
+    assert isinstance(out, OmniOutput)

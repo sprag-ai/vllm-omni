@@ -266,7 +266,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         # A speculative drafter copies the target's image token id off the top
         # level config; this model nests it under the thinker.
         if not hasattr(config, "image_token_index"):
-            config.image_token_index = thinker_config.image_token_id
+            image_token_id = getattr(thinker_config, "image_token_id", None)
+            if image_token_id is not None:
+                config.image_token_index = image_token_id
         self.multimodal_config = multimodal_config
 
         # Initialize talker components
@@ -403,6 +405,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
                     ["hidden_states", "residual", *incoming_captures], thinker_config.text_config.hidden_size
                 )
+
+    def _thinker_captured_layers(self) -> OmniPayload | None:
+        """Accept-layer capture from the decoder forward just run."""
+        decoder = getattr(getattr(self.thinker, "language_model", None), "model", None)
+        return getattr(decoder, "captured_layers", None)
 
     def _thinker_capture_layer_indices(self) -> list[int]:
         accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
@@ -645,8 +652,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "return_hidden_states": True,
                 }
 
-            # Run thinker. Returns (text_hidden_states, captured_layer_dict)
-            # when capturing, a bare tensor otherwise.
+            # Run thinker. Returns a bare tensor, or (hidden_states, aux)
+            # under EAGLE3; the accept-layer capture rides on the decoder.
             return self.thinker(
                 input_ids=input_ids,
                 positions=positions,
@@ -744,11 +751,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
-            if isinstance(model_outputs, tuple):
-                text_hidden_states, captured_layer_dict = model_outputs
-            else:
-                # Bare tensor: capture was not requested (no accept_hidden_layer).
-                text_hidden_states, captured_layer_dict = model_outputs, None
+            text_hidden_states = model_outputs[0] if isinstance(model_outputs, tuple) else model_outputs
+            # Set by the decoder on the forward this output came from; None
+            # when no capture was requested (no accept_hidden_layer).
+            captured_layer_dict = self._thinker_captured_layers()
             # Compute thinker-side TTS token embeddings for BOS/EOS/PAD and expose via multimodal outputs.
             # These will later be projected into talker text space by the talker stage.
             multimodal_outputs: OmniPayload = captured_layer_dict if captured_layer_dict is not None else {}
