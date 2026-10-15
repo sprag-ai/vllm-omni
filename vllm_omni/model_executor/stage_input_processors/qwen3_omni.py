@@ -4,7 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,27 +31,6 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _committed_output_delta(
-    transfer_manager: Any,
-    request_id: str,
-    output_token_ids: Any,
-) -> int:
-    """Thinker output tokens committed since this request was last looked at.
-
-    The cursor is cleared by the sender-side cleanup, not on the final chunk:
-    ``output_token_ids`` is cumulative, so dropping it at a segment boundary
-    would make the next delta the whole output length.
-    """
-    lengths = getattr(transfer_manager, "_thinker_output_lens", None)
-    if lengths is None:
-        lengths = {}
-        transfer_manager._thinker_output_lens = lengths
-    current = len(output_token_ids) if output_token_ids is not None else 0
-    previous = lengths.get(request_id, 0)
-    lengths[request_id] = current
-    return current - previous
 
 
 # Pooling output layer indices (semantic names for clarity)
@@ -410,6 +389,7 @@ def thinker2talker_async_chunk(
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
+    new_token_ids: Iterable[int] = (),
 ) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
@@ -496,7 +476,9 @@ def thinker2talker_async_chunk(
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
     else:
-        committed_tokens = _committed_output_delta(transfer_manager, request_id, _ensure_list(request.output_token_ids))
+        # Tokens this scheduler step committed, snapshotted by the connector
+        # before any resumable cleanup could rewrite the request.
+        committed_tokens = len(tuple(new_token_ids))
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager, committed_tokens

@@ -1872,3 +1872,23 @@ class TestPreferModelSamplerNoneFallback:
             "least tolerates -- that fallback, then add its directory name to "
             "`expected` above. If you REMOVED one, drop its name."
         )
+
+
+@pytest.mark.parametrize(
+    "drafts,sampled,num_scheduled,expected",
+    [
+        ({}, [[1]], 4, 4),
+        ({"other": [9]}, [[1]], 4, 4),
+        ({"r": [9, 9, 9]}, [], 4, 4),
+        ({"r": [9, 9, 9]}, [[]], 4, 4),
+        ({"r": [9, 9, 9]}, [[1, 2]], 4, 2),
+        ({"r": [9]}, [[1, 2, 3, 4, 5]], 2, 2),
+    ],
+    ids=["no-drafts", "other-req", "idx-out-of-range", "nothing-sampled", "two-of-three", "never-exceeds-span"],
+)
+def test_committed_rows_trim_to_the_accepted_prefix(drafts, sampled, num_scheduled, expected):
+    """Only the prior token plus the accepted draft prefix may go downstream."""
+    from vllm_omni.worker.gpu_ar_model_runner import _committed_num_scheduled_tokens
+
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens=drafts)
+    assert _committed_num_scheduled_tokens(scheduler_output, sampled, "r", 0, num_scheduled) == expected

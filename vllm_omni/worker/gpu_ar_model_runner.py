@@ -766,14 +766,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """
         if not get_pp_group().is_last_rank:
             raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
-        if self.speculative_config is not None:
-            # The merged payload is rebuilt from the scheduled token counts saved
-            # with the step, so the committed-row span below cannot reach it and
-            # rejected draft rows would be handed to the next stage.
-            raise RuntimeError(
-                "Speculative decoding is not supported together with the Omni prefix cache; "
-                "set enable_prefix_caching: false on this stage."
-            )
+        # Rejected at stage-config assembly; kept as a defensive assert.
+        assert self.speculative_config is None, (
+            "speculative decoding is not supported with the Omni prefix cache"
+        )
         hidden_states_cpu = None
         if needs_scheduled_hidden_payload:
             if staged_hidden_states_cpu is None:

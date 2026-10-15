@@ -23,6 +23,13 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _bare_runner() -> OmniGPUModelRunner:
+    """A runner built without __init__; mirror the attributes it would set."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.use_aux_hidden_state_outputs = False
+    return runner
+
+
 def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
     hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     payload = {
@@ -37,7 +44,7 @@ def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
     # the upstream container conversion is exercised unchanged.
     monkeypatch.setattr("vllm.utils.torch_utils.weak_ref_tensor", lambda value: value)
     replay = weak_ref_tensors(original)
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = SimpleNamespace(have_multimodal_outputs=True)
     runner._build_model_kwargs_extra = lambda: {}
     monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: replay)
@@ -53,7 +60,7 @@ def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
 def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
     hidden = torch.ones(2, 4)
     auxiliary = (hidden, hidden.clone(), None, None)
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = SimpleNamespace(have_multimodal_outputs=True)
     runner._build_model_kwargs_extra = lambda: {}
     monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: auxiliary)
@@ -67,7 +74,7 @@ def _runner_for_talker_graph_init(
     has_separate_talker: bool = True,
     model_stage: str = "talker",
 ) -> OmniGPUModelRunner:
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = SimpleNamespace(
         talker=object() if has_separate_talker else None,
         talker_mtp=object(),
@@ -160,7 +167,7 @@ def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
         supports_omni_decode_step_metadata=True,
         update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
     )
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = model
     runner.input_batch = DummyInputBatch(["request-a", "request-b"])
     runner._build_model_kwargs_extra = lambda: {}
@@ -278,7 +285,7 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     # Create an instance without calling OmniGPUModelRunner.__init__
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
 
     # Minimal attributes used by OmniGPUModelRunner._talker_mtp_forward
     runner.input_batch = DummyInputBatch(list(req_ids))
@@ -313,7 +320,7 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
 
 def _make_runner_for_mimo(req_id="r_mimo"):
     """Create a minimal runner with MiMoAudio-like model and request state."""
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = MiMoAudioForConditionalGeneration()
 
     # Minimal vllm_config / model_config used by helper.
@@ -876,7 +883,7 @@ def test_request_end_payload_suppresses_per_step_multimodal_outputs():
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     payload = {"codes": {"audio": [1, 2, 3]}}
     runner._local_stage_payload_cache = {"late": payload}
     runner._full_payload_pending_broadcast_req_ids = set()

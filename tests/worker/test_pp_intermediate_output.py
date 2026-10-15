@@ -14,6 +14,13 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.parallel]
 
 
+def _bare_runner() -> OmniGPUModelRunner:
+    """A runner built without __init__; mirror the attributes it would set."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.use_aux_hidden_state_outputs = False
+    return runner
+
+
 def test_nonfinal_forward_bypasses_final_output_conversion(monkeypatch):
     intermediate = IntermediateTensors({"hidden_states": torch.ones(4, 8), "residual": torch.ones(4, 8)})
     monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *args, **kwargs: intermediate)
@@ -21,7 +28,7 @@ def test_nonfinal_forward_bypasses_final_output_conversion(monkeypatch):
     def final_only_converter(*args, **kwargs):
         pytest.fail("A non-final rank must not convert intermediate tensors to OmniOutput")
 
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = SimpleNamespace(make_omni_output=final_only_converter, have_multimodal_outputs=True)
     runner._build_model_kwargs_extra = lambda: {}
     result = runner._model_forward()
@@ -41,7 +48,7 @@ def test_final_tensor_still_uses_model_converter(monkeypatch):
         calls.append(value)
         return converted
 
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = _bare_runner()
     runner.model = SimpleNamespace(make_omni_output=convert)
     runner._build_model_kwargs_extra = lambda: {}
     assert runner._model_forward() is converted

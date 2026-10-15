@@ -297,7 +297,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # vLLM run with no talker stage downstream, so no one consumes captured
         # thinker layers and the forward must return what stock vLLM expects.
         self.is_staged_run = getattr(vllm_config.model_config, "model_stage", None) is not None
-        self._returns_tuple = self.model_stage == "thinker" and self.is_staged_run
+        # Any thinker forward can return a tuple: the accept-layer capture when
+        # staged, the auxiliary hidden states when a drafter is attached. The
+        # latter is configured on the runner, so it is not knowable here.
+        self._returns_tuple = self.model_stage == "thinker"
 
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
@@ -407,9 +410,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
 
     def _thinker_captured_layers(self) -> OmniPayload | None:
-        """Accept-layer capture from the decoder forward just run."""
-        decoder = getattr(getattr(self.thinker, "language_model", None), "model", None)
-        return getattr(decoder, "captured_layers", None)
+        """Accept-layer capture published by the thinker's last forward."""
+        return self.thinker.captured_layers
 
     def _thinker_capture_layer_indices(self) -> list[int]:
         accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
@@ -614,7 +616,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         logits_index: int | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput | tuple:
         """
         Unified forward pass for all model stages.
 
@@ -642,8 +644,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Run thinker forward
             # If talker expects a specific intermediate layer, capture it here.
             # Only staged runs have a talker stage to consume the capture; in a
-            # plain vLLM run capturing would waste a clone per layer per step
-            # and make the thinker return a tuple stock vLLM cannot handle.
+            # plain vLLM run capturing would waste a clone per layer per step.
             capture_indices = self._thinker_capture_layer_indices()
             capture_kwargs = {}
             if capture_indices:
@@ -752,8 +753,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         if self.model_stage == "thinker":
             text_hidden_states = model_outputs[0] if isinstance(model_outputs, tuple) else model_outputs
-            # Set by the decoder on the forward this output came from; None
-            # when no capture was requested (no accept_hidden_layer).
+            # Published by the thinker wrapper on the forward this output came
+            # from; None when no capture was requested.
             captured_layer_dict = self._thinker_captured_layers()
             # Compute thinker-side TTS token embeddings for BOS/EOS/PAD and expose via multimodal outputs.
             # These will later be projected into talker text space by the talker stage.

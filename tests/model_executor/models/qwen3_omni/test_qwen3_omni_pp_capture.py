@@ -31,7 +31,7 @@ class _Norm(nn.Module):
         return hidden_states + residual, None
 
 
-def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=True):
+def _build_model(monkeypatch, start, end):
     rank = SimpleNamespace(is_first_rank=start == 0, is_last_rank=end == 48)
     monkeypatch.setattr(thinker_module, "get_pp_group", lambda: rank)
     model = object.__new__(thinker_module.Qwen3MoeLLMModel)
@@ -40,6 +40,11 @@ def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=
     model.end_layer = end
     model.layers = nn.ModuleList([_Layer() for _ in range(48)])
     model.norm = _Norm()
+    return model
+
+
+def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=True):
+    model = _build_model(monkeypatch, start, end)
     result = model.forward(
         input_ids=None,
         positions=torch.arange(embeddings.shape[0]),
@@ -48,8 +53,10 @@ def _forward(monkeypatch, start, end, embeddings, intermediate=None, *, capture=
         capture_layer_indices=[0, 24] if capture else None,
         return_hidden_states=capture,
     )
-    # The decoder returns vLLM's shape and exposes the capture separately.
-    return result, getattr(model, "captured_layers", None)
+    # A capturing decoder returns (hidden_states, captured_layers, aux).
+    if isinstance(result, tuple) and len(result) == 3:
+        return result[0], result[1]
+    return result, None
 
 
 @pytest.mark.parametrize("tokens", [1, 4])
@@ -64,9 +71,8 @@ def test_required_captures_match_unsplit_forward(monkeypatch, tokens, boundaries
             assert isinstance(result, IntermediateTensors)
             assert all(isinstance(value, torch.Tensor) for value in result.tensors.values())
             intermediate = result
-    actual, actual_captures = result, captured
-    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    actual_layers = actual_captures["hidden_states"]["layers"]
+    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    actual_layers = captured["hidden_states"]["layers"]
     assert set(actual_layers) == {0, 24}
     for key in (0, 24):
         torch.testing.assert_close(actual_layers[key], captures["hidden_states"]["layers"][key], rtol=0, atol=0)
@@ -115,3 +121,43 @@ def test_factory_declares_only_captures_from_earlier_ranks(monkeypatch, start, e
     buffers = model.make_empty_intermediate_tensors(4, dtype=torch.float32, device="cpu")
     assert set(buffers.tensors) == {"hidden_states", "residual"} | (expected if staged else set())
     assert all(value.shape == (4, 8) for value in buffers.tensors.values())
+
+
+def test_aux_layers_collect_post_deepstack_and_pre_norm(monkeypatch):
+    """EAGLE3 aux rows come from the requested layer offsets, before the norm.
+
+    The speculator reapplies the verifier norm itself, so collecting after
+    ``self.norm`` would hand the drafter an already-normed state.
+    """
+    embeddings = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8) / 8
+    model = _build_model(monkeypatch, 0, 48)
+    model._set_aux_hidden_state_layers((0, 24, 48))
+
+    class _ScalingNorm(nn.Module):
+        """Distinguishes the pre-norm state from the returned hidden states."""
+
+        def forward(self, hidden_states, residual):
+            return hidden_states * 3.0, None
+
+    model.norm = _ScalingNorm()
+
+    result = model.forward(
+        input_ids=None,
+        positions=torch.arange(embeddings.shape[0]),
+        inputs_embeds=embeddings,
+        intermediate_tensors=None,
+    )
+    hidden, _captured, aux = result
+    assert len(aux) == 3, "one row per requested layer"
+    assert all(isinstance(row, torch.Tensor) for row in aux)
+    # layer 0 is the state entering the stack
+    torch.testing.assert_close(aux[0], embeddings, rtol=0, atol=0)
+    # the last requested layer is pre-norm, so it differs from the return
+    assert not torch.allclose(aux[-1], hidden)
+
+
+def test_set_aux_hidden_state_layers_reaches_the_decoder(monkeypatch):
+    """SupportsEagle3's default setter must resolve to the thinker's decoder."""
+    model = _build_model(monkeypatch, 0, 48)
+    model._set_aux_hidden_state_layers((2, 24))
+    assert model.aux_hidden_state_layers == (2, 24)
