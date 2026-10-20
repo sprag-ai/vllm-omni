@@ -32,7 +32,13 @@ class _Norm(nn.Module):
 
 
 def _build_model(monkeypatch, start, end):
-    rank = SimpleNamespace(is_first_rank=start == 0, is_last_rank=end == 48)
+    # A rank holding every layer is the single-rank case; a partial span means the model
+    # is split, which is what world_size reports to callers that gate on it.
+    rank = SimpleNamespace(
+        is_first_rank=start == 0,
+        is_last_rank=end == 48,
+        world_size=1 if (start == 0 and end == 48) else 2,
+    )
     monkeypatch.setattr(thinker_module, "get_pp_group", lambda: rank)
     model = object.__new__(thinker_module.Qwen3MoeLLMModel)
     nn.Module.__init__(model)

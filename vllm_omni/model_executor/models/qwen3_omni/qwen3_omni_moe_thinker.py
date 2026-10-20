@@ -551,6 +551,18 @@ ISO639_1_SUPPORTED_LANGS = {
     }
 )
 class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Auxiliary states are collected into a rank-local list, and a non-final rank
+        # returns IntermediateTensors without them, so a drafter would see only the layers
+        # the last rank captured. Both SupportsEagle3 entry points resolve to this method,
+        # so refusing here covers the combined model and a bare thinker alike.
+        if get_pp_group().world_size > 1:
+            raise ValueError(
+                "Qwen3-Omni cannot produce EAGLE3 auxiliary hidden states across pipeline "
+                "ranks; serve the thinker with pipeline_parallel_size 1 to use a drafter."
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
     def forward(
         self,
         input_ids: torch.Tensor,

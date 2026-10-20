@@ -102,10 +102,10 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 
-# Fields a global CLI value must not fan out to every stage. Only the stage that can
-# actually draft may carry a speculative config: a talker strips the auxiliary tuple its
-# runner then expects, and code2wav returns audio rather than hidden states, so applying
-# one pipeline-wide fails at startup or on the first forward.
+# Fields a global CLI value must not fan out to every stage. A speculative config names a
+# draft model paired with one specific target, so it belongs to a single stage; stages in
+# a pipeline differ in what they consume and emit, and the ones that are not that target
+# cannot draft for it.
 _STAGE_SCOPED_ONLY_ENGINE_FIELDS = frozenset({"speculative_config"})
 
 

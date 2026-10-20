@@ -1188,17 +1188,6 @@ def _project_omni_stage_engine_args(
             "on this stage; the committed-row span cannot be derived asynchronously."
         )
 
-    if stage_config.speculative_config is not None and stage_config.parallel_config.pipeline_parallel_size > 1:
-        # A non-final rank returns IntermediateTensors and drops its rank-local
-        # auxiliary states, so the drafter would see only the layers the last rank
-        # captured. Forwarding them needs the PP payload to declare their keys up
-        # front, but the auxiliary layer indices arrive later from the runner via
-        # set_aux_hidden_state_layers, after that payload schema is fixed.
-        raise ValueError(
-            f"Stage {stage_config.stage_id}: speculative decoding requires pipeline_parallel_size 1 "
-            "on this stage; auxiliary hidden states are not forwarded across pipeline ranks."
-        )
-
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
