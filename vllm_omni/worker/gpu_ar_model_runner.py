@@ -82,8 +82,12 @@ def _committed_num_scheduled_tokens(
     previously unprocessed token plus the accepted draft prefix are committed,
     and the rejection sampler's emitted count is that number. Requests without
     drafts, prefill included, keep their full scheduled span.
+
+    ``scheduled_spec_decode_tokens`` is read directly rather than through
+    ``getattr``: a default would return the untrimmed span if upstream renamed
+    the field, handing rejected draft rows to the next stage with no error.
     """
-    drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+    drafts = scheduler_output.scheduled_spec_decode_tokens
     if not drafts or not drafts.get(req_id):
         return num_scheduled
     if idx >= len(valid_sampled_token_ids):
@@ -766,10 +770,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """
         if not get_pp_group().is_last_rank:
             raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
-        # Rejected at stage-config assembly; kept as a defensive assert.
-        assert self.speculative_config is None, (
-            "speculative decoding is not supported with the Omni prefix cache"
-        )
+        # Also rejected at stage-config assembly; raised rather than asserted so the
+        # guard survives `python -O`, where the merged payload would otherwise be
+        # rebuilt from untrimmed token counts and carry rejected draft rows.
+        if self.speculative_config is not None:
+            raise RuntimeError("Speculative decoding is not supported with the Omni prefix cache.")
         hidden_states_cpu = None
         if needs_scheduled_hidden_payload:
             if staged_hidden_states_cpu is None:

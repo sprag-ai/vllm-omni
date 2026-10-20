@@ -560,7 +560,11 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
         capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor, OmniPayload | None, list[torch.Tensor] | None]
+    ):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1042,8 +1046,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     # PEFT stores the expert LoRA matrices with an explicit expert dimension.
     is_3d_moe_weight: bool = True
-    # Accept-layer capture from the most recent forward, consumed by the
-    # combined model's make_omni_output. None when no capture was requested.
+    # Accept-layer capture from the most recent forward, consumed by the combined
+    # model's make_omni_output. None when no capture was requested. Pairing a read
+    # with its own step depends on the thinker never running under a full CUDA
+    # graph: _returns_tuple forces _exclude_full_graph in the v2 runner, so this
+    # attribute is rewritten on every step rather than skipped by a replay.
     captured_layers: OmniPayload | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -1435,6 +1442,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             self.captured_layers = captured_layers
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
+            # Bare tensor when only the capture was requested: stock vLLM's
+            # GPUModelRunner indexes the forward output directly, so a tuple here
+            # breaks non-staged runs that resolve this class through the global
+            # registry (e.g. plain `vllm serve` of the thinker).
             return hidden_states
         return model_output
 

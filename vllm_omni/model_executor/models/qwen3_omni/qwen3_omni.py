@@ -166,9 +166,10 @@ def _as_row_matrix(tensor: torch.Tensor | None, device: torch.device) -> torch.T
 )
 class Qwen3OmniMoeForConditionalGeneration(
     nn.Module,
-    # EAGLE3 is wired for the CUDA runners only: the Ascend runners extract
+    # EAGLE3 is wired for the CUDA runners only. npu_ar_model_runner extracts
     # multimodal outputs before unpacking the auxiliary hidden states, so the
-    # unpack there sees a bare tensor.
+    # unpack there sees a bare tensor; this capability flag cannot express that,
+    # so an Ascend AR deployment must not enable a drafter.
     SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
@@ -616,7 +617,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         logits_index: int | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput | tuple:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | OmniOutput
+        | tuple[torch.Tensor, list[torch.Tensor]]
+    ):
         """
         Unified forward pass for all model stages.
 

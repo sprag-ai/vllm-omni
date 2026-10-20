@@ -1163,9 +1163,9 @@ def _project_omni_stage_engine_args(
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
-    if stage_config.speculative_config is not None and getattr(
-        stage_config.cache_config, "enable_prefix_caching", False
-    ):
+    # enable_prefix_caching is read directly: OmniStageCacheConfig declares it, and a
+    # getattr default would silently skip this guard if the field ever moved.
+    if stage_config.speculative_config is not None and stage_config.cache_config.enable_prefix_caching:
         # The merged prefix-cache payload is rebuilt from the scheduled token
         # counts, so the committed-row span cannot reach it and rejected draft
         # rows would be handed to the next stage.
