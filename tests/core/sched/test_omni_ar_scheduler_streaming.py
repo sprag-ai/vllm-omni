@@ -16,6 +16,7 @@ import pytest
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
@@ -1235,6 +1236,7 @@ def _make_live_session_scheduler(*, max_model_len: int) -> OmniARScheduler:
     sched.requests_needing_kv_transfer = {}
     sched._kv_wait_start_ts = {}
     sched.kv_cache_manager = SimpleNamespace(take_events=lambda: None, estimate_cached_tokens=lambda _request: 0)
+    sched._pause_state = PauseState.UNPAUSED
     return sched
 
 
