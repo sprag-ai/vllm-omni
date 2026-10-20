@@ -493,14 +493,13 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
-                self._websockets = WebSocketSessionGauge(inner)
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
 
             async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
                 if scope["type"] == "websocket":
-                    await self._websockets(scope, receive, send)
+                    await WebSocketSessionGauge(self._inner)(scope, receive, send)
                     return
                 if scope["type"] == "http":
                     scope.setdefault("state", {})
