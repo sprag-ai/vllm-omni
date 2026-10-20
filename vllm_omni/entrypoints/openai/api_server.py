@@ -423,7 +423,6 @@ async def omni_run_server_worker(
             )
             app.include_router(weight_transfer_api.router)
 
-        app.add_middleware(WebSocketSessionGauge)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
@@ -482,20 +481,27 @@ async def omni_run_server_worker(
             )
 
         class _TimestampMiddleware:
-            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time
+            and counts open WebSocket sessions.
 
             Wraps the fully-built Starlette app as an outer ASGI layer so no
             Starlette internals (user_middleware, middleware_stack, etc.) are
-            touched. Websocket and lifespan scopes pass through unchanged.
+            touched: upstream's app has already built its middleware stack, so
+            add_middleware raises. WebSocket scopes pass through unchanged apart
+            from being counted; lifespan scopes pass through unchanged.
             """
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
+                self._websockets = WebSocketSessionGauge(inner)
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
 
             async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] == "websocket":
+                    await self._websockets(scope, receive, send)
+                    return
                 if scope["type"] == "http":
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
