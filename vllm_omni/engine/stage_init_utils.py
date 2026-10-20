@@ -1163,17 +1163,6 @@ def _project_omni_stage_engine_args(
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
-    # enable_prefix_caching is read directly: OmniStageCacheConfig declares it, and a
-    # getattr default would silently skip this guard if the field ever moved.
-    if stage_config.speculative_config is not None and stage_config.cache_config.enable_prefix_caching:
-        # The merged prefix-cache payload is rebuilt from the scheduled token
-        # counts, so the committed-row span cannot reach it and rejected draft
-        # rows would be handed to the next stage.
-        raise ValueError(
-            f"Stage {stage_config.stage_id}: speculative decoding is not supported together "
-            "with the Omni prefix cache; set enable_prefix_caching: false on this stage."
-        )
-
     # An unset async_scheduling resolves to True, and AR stages are defaulted to it, so
     # the permissive case has to be spelled out rather than compared against False.
     if stage_config.speculative_config is not None and (
