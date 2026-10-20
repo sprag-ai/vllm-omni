@@ -52,6 +52,9 @@ class PrefixCacheRunnerMixin:
 
     omni_prefix_cache: OmniPrefixCacheManager | None = None
     _omni_prefix_cache_cfg: PrefixCacheConfig | None = None
+    # Set by a runner whose save runs in a later call than its forward; see
+    # _prefix_cache_step_num_tokens_padded. None outside that window.
+    _prefix_cache_num_tokens_padded: int | None = None
     # Snapshotted once at load_model; the hot path must not re-probe model
     # attributes every step. The same object is registered on the manager.
     _omni_cache_policy: ModelCachePolicy = ModelCachePolicy()
@@ -102,10 +105,28 @@ class PrefixCacheRunnerMixin:
         """Per-step lifecycle entry; must run before ``_update_states``
         removes finished requests (finished/abort escalation happens inside
         ``new_step_starts``). Builds the manager on the first real step."""
+        self._prefix_cache_num_tokens_padded = None
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.new_step_starts(scheduler_output)
+
+    def _prefix_cache_step_num_tokens_padded(self) -> int:
+        """Padded width of the hidden-state tensor this step's forward produced.
+
+        A runner that samples in a separate call from its forward cannot pass the
+        value down an argument, and ``ExecuteModelState`` packs positionally in both
+        runners (see ``prefix_cache_step_id``), so it rides the instance. Cleared
+        each ``_prefix_cache_step_begin``: a step that skipped the forward raises
+        rather than sizing the write from the previous batch.
+        """
+        num_tokens_padded = self._prefix_cache_num_tokens_padded
+        if num_tokens_padded is None:
+            raise OmniPrefixCacheUnmatchError(
+                "prefix-cache save reached without this step's padded token count; "
+                "the forward must record it before sampling"
+            )
+        return num_tokens_padded
 
     def _prefix_cache_save_step(
         self,

@@ -1003,6 +1003,62 @@ def test_save_slot_mismatch_fails_fast():
         mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
 
 
+def test_save_keeps_only_committed_rows_of_a_speculative_step():
+    """A rejected draft's row must not be cached: vLLM reclaims its slot.
+
+    Two requests, 4 scheduled rows each, 2 committed each. The hidden tensor
+    arrives in the scheduled packing, so request b's committed rows start at row
+    4 while its slots start at slot index 2 — the two bases that only coincide
+    when nothing was rejected.
+    """
+    mgr, view = make_manager()
+    view.order = ["a", "b"]
+    view.req_blocks["a"], view.computed["a"] = [0], 0
+    view.req_blocks["b"], view.computed["b"] = [1], 0
+    mgr.new_step_starts(
+        FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("b")], num_scheduled={"a": 4, "b": 4})
+    )
+    slots_a = view.slots_for("a", 0, 2)
+    slots_b = view.slots_for("b", 0, 2)
+    hidden = torch.cat(
+        [
+            view.slots_for("a", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
+            view.slots_for("b", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
+        ]
+    )
+    sid = mgr.save_outputs(
+        hidden, {}, num_tokens_unpadded=8, num_tokens_padded=8, committed={"a": 2, "b": 2}
+    )
+    mgr.materialize(sid, ["a", "b"])
+    for req_id, slots in (("a", slots_a), ("b", slots_b)):
+        got = plan_fetch(mgr, slots, HIDDEN_KEY, req_id=req_id)
+        torch.testing.assert_close(got, expected_rows(slots))
+
+
+def test_save_requires_a_committed_count_for_every_scheduled_request():
+    """An omission must raise, not fall back to the untrimmed span.
+
+    Defaulting a missing request to its scheduled count would cache exactly the
+    rejected-draft rows the argument exists to drop. Requests in the batch that
+    this step did not schedule need no entry.
+    """
+    mgr, view = make_manager()
+    view.order = ["a", "idle"]
+    view.req_blocks["a"], view.computed["a"] = [0], 0
+    view.req_blocks["idle"], view.computed["idle"] = [1], 0
+    hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("idle")], num_scheduled={"a": 4})
+
+    mgr.new_step_starts(sched)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="omit"):
+        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={})
+
+    mgr.new_step_starts(sched)
+    mgr.discard_step(
+        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={"a": 4})
+    )
+
+
 def test_materialize_rejects_out_of_snapshot_ids():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})

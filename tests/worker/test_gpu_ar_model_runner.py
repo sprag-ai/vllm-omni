@@ -912,6 +912,9 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     # Cache on, but this step produced no saved context: the payload path must then
     # serve the freshly staged slice rather than a merged read.
     runner.omni_prefix_cache = SimpleNamespace(save_outputs=lambda *a, **k: None)
+    # What execute_model records for the save; unset means no forward ran, which the
+    # save rejects rather than sizing the write from a previous step.
+    runner._prefix_cache_num_tokens_padded = 3
     runner.is_pooling_model = False
     # One rank, so it is the last one; get_pp_group asserts rather than defaulting.
     monkeypatch.setattr(

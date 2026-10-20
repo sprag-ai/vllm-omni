@@ -597,11 +597,20 @@ class OmniPrefixCacheManager:
         # only the committed prefix of each span is real output. A speculative step also
         # produces rows for rejected draft tokens, and vLLM reclaims those slots, so
         # cached state keyed to one belongs to different tokens by the next hit.
-        num_keep = (
-            {r: min(num_sched[r], int(committed.get(r, num_sched[r]))) for r in req_order}
-            if committed is not None
-            else dict(num_sched)
-        )
+        if committed is None:
+            num_keep = dict(num_sched)
+        else:
+            # Required for every request with rows this step, because defaulting a
+            # missing one to its scheduled span would keep exactly the rows a rejection
+            # discarded. req_order spans the whole persistent batch, so requests the
+            # step did not schedule need no entry.
+            missing = sorted(r for r in req_order if num_sched[r] > 0 and r not in committed)
+            if missing:
+                raise OmniPrefixCacheUnmatchError(
+                    f"committed-row counts omit {missing}, which have rows in this step; "
+                    "the caller must supply one per scheduled request"
+                )
+            num_keep = {r: min(num_sched[r], int(committed[r])) if num_sched[r] else 0 for r in req_order}
         # Two offset bases, which coincide only when nothing was rejected: hidden-state
         # rows are indexed in the scheduled packing they arrive in, while the slot map is
         # built over kept rows alone and so is packed by num_keep.

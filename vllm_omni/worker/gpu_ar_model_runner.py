@@ -73,7 +73,7 @@ def _committed_num_scheduled_tokens(
     scheduler_output: SchedulerOutput,
     valid_sampled_token_ids: list[list[int]],
     req_id: str,
-    idx: int,
+    idx: int | None,
     num_scheduled: int,
 ) -> int:
     """Rows of a speculative step that survive verification.
@@ -83,6 +83,10 @@ def _committed_num_scheduled_tokens(
     and the rejection sampler's emitted count is that number. Requests without
     drafts, prefill included, keep their full scheduled span.
 
+    ``idx`` is None for a request the step scheduled but did not sample, as a
+    non-final prefill chunk does. Those are never given drafts, so the full span
+    is already the committed one.
+
     ``scheduled_spec_decode_tokens`` is read directly rather than through
     ``getattr``: a default would return the untrimmed span if upstream renamed
     the field, handing rejected draft rows to the next stage with no error.
@@ -90,7 +94,7 @@ def _committed_num_scheduled_tokens(
     drafts = scheduler_output.scheduled_spec_decode_tokens
     if not drafts or not drafts.get(req_id):
         return num_scheduled
-    if idx >= len(valid_sampled_token_ids):
+    if idx is None or idx >= len(valid_sampled_token_ids):
         return num_scheduled
     sampled = valid_sampled_token_ids[idx]
     if not sampled:
@@ -1219,9 +1223,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # committed-row span it must not exceed is a sampling result; only the
             # question of whether it will write at all is answerable here.
             prefix_cache_step_id = None
-            # ExecuteModelState pins prefix_cache_step_id as its last field because both
-            # runners pack it positionally, so the save's padded count rides the instance
-            # rather than widening that tuple.
             self._prefix_cache_num_tokens_padded = num_tokens_padded
             if (
                 self._prefix_cache_will_write()
@@ -2111,18 +2112,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states,
                 multimodal_outputs,
                 num_tokens_unpadded=scheduler_output.total_num_scheduled_tokens,
-                num_tokens_padded=getattr(
-                    self, "_prefix_cache_num_tokens_padded", scheduler_output.total_num_scheduled_tokens
-                ),
+                num_tokens_padded=self._prefix_cache_step_num_tokens_padded(),
+                # Keyed over every scheduled request, not over the sampler's output
+                # map: the manager requires an entry wherever the step produced rows,
+                # and one it had to default would keep that request's rejected drafts.
                 committed={
                     rid: _committed_num_scheduled_tokens(
                         scheduler_output,
                         valid_sampled_token_ids,
                         rid,
-                        idx,
-                        int(scheduler_output.num_scheduled_tokens.get(rid, 0)),
+                        req_id_to_index_output_copy.get(rid),
+                        int(num_scheduled),
                     )
-                    for rid, idx in req_id_to_index_output_copy.items()
+                    for rid, num_scheduled in scheduler_output.num_scheduled_tokens.items()
                 },
             )
 
