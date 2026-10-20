@@ -820,14 +820,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             synthesize_abort_outputs=True,
         )
 
-        self._attach_scheduler_stats(
-            engine_core_outputs,
-            spec_decoding_stats,
-            kv_connector_stats,
-            cudagraph_stats,
-            perf_stats,
-        )
-
         self._capture_omni_connector_output(model_runner_output)
 
         # Free blocks that were held for transfer (kv_ready and
@@ -847,6 +839,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         self.waiting_for_transfer_free.remove(req_id)
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
+
+        # After the transfer cleanup, which can be what drains the stage: make_stats always reports a drain.
+        self._attach_scheduler_stats(
+            engine_core_outputs,
+            spec_decoding_stats,
+            kv_connector_stats,
+            cudagraph_stats,
+            perf_stats,
+        )
 
         return engine_core_outputs
 
