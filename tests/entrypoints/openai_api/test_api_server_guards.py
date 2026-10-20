@@ -50,7 +50,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
@@ -633,7 +633,7 @@ async def test_websocket_sessions_are_counted_on_an_app_with_a_built_middleware_
         app = FastAPI()
 
         @app.websocket("/probe")
-        async def probe(websocket):
+        async def probe(websocket: WebSocket):
             seen.append(REGISTRY.get_sample_value(defs.WEBSOCKET_SESSIONS_ACTIVE))
             await websocket.close()
 
