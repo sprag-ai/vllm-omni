@@ -909,7 +909,15 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         runner.query_start_loc = query_start_loc
     else:
         runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    runner.omni_prefix_cache = object()
+    # Cache on, but this step produced no saved context: the payload path must then
+    # serve the freshly staged slice rather than a merged read.
+    runner.omni_prefix_cache = SimpleNamespace(save_outputs=lambda *a, **k: None)
+    runner.is_pooling_model = False
+    # One rank, so it is the last one; get_pp_group asserts rather than defaulting.
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, world_size=1),
+    )
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner.requests = {}

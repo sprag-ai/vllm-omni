@@ -770,11 +770,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """
         if not get_pp_group().is_last_rank:
             raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
-        # Also rejected at stage-config assembly; raised rather than asserted so the
-        # guard survives `python -O`, where the merged payload would otherwise be
-        # rebuilt from untrimmed token counts and carry rejected draft rows.
-        if self.speculative_config is not None:
-            raise RuntimeError("Speculative decoding is not supported with the Omni prefix cache.")
         hidden_states_cpu = None
         if needs_scheduled_hidden_payload:
             if staged_hidden_states_cpu is None:
@@ -1220,16 +1215,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             hidden_states_cpu = None
-            # Prefix-cache write: freeze + submit; policy gating (full
-            # hidden, skip/deferred keys) happens inside the manager.
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
+            # The prefix-cache write happens after sampling (sample_tokens), because the
+            # committed-row span it must not exceed is a sampling result; only the
+            # question of whether it will write at all is answerable here.
+            prefix_cache_step_id = None
+            # ExecuteModelState pins prefix_cache_step_id as its last field because both
+            # runners pack it positionally, so the save's padded count rides the instance
+            # rather than widening that tuple.
+            self._prefix_cache_num_tokens_padded = num_tokens_padded
             if (
-                prefix_cache_step_id is not None
+                self._prefix_cache_will_write()
                 and not self._model_needs_full_prefix_hidden_states()
                 and self._model_omni_pooler_payload_include_hidden()
             ):
@@ -2103,6 +2098,32 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+            )
+
+        # Prefix-cache write: freeze + submit; policy gating (full hidden,
+        # skip/deferred keys) happens inside the manager. Runs here rather than in
+        # execute_model because only a sampled step knows how many of each request's
+        # rows were committed, and caching a rejected draft row would key stage output
+        # to a slot vLLM reclaims. `multimodal_outputs` is the pre-talker-MTP value the
+        # cache has always stored, so the save precedes that reassignment below.
+        if self._prefix_cache_will_write():
+            prefix_cache_step_id = self._prefix_cache_save_step(
+                hidden_states,
+                multimodal_outputs,
+                num_tokens_unpadded=scheduler_output.total_num_scheduled_tokens,
+                num_tokens_padded=getattr(
+                    self, "_prefix_cache_num_tokens_padded", scheduler_output.total_num_scheduled_tokens
+                ),
+                committed={
+                    rid: _committed_num_scheduled_tokens(
+                        scheduler_output,
+                        valid_sampled_token_ids,
+                        rid,
+                        idx,
+                        int(scheduler_output.num_scheduled_tokens.get(rid, 0)),
+                    )
+                    for rid, idx in req_id_to_index_output_copy.items()
+                },
             )
 
         multimodal_outputs = self._run_post_sample_talker_mtp(

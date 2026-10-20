@@ -104,8 +104,8 @@ class _CacheStub:
         self.materialize_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, committed=None):
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, committed))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -167,7 +167,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, None)]  # empty mm stays {}; no cap by default
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():

@@ -560,6 +560,7 @@ class OmniPrefixCacheManager:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        committed: dict[ReqId, int] | None = None,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
 
@@ -592,6 +593,23 @@ class OmniPrefixCacheManager:
         for req_id in req_order:
             query_start[req_id] = current_start_idx
             current_start_idx += num_sched[req_id]
+        # Offsets stay scheduled because that is how the incoming tensor is packed, but
+        # only the committed prefix of each span is real output. A speculative step also
+        # produces rows for rejected draft tokens, and vLLM reclaims those slots, so
+        # cached state keyed to one belongs to different tokens by the next hit.
+        num_keep = (
+            {r: min(num_sched[r], int(committed.get(r, num_sched[r]))) for r in req_order}
+            if committed is not None
+            else dict(num_sched)
+        )
+        # Two offset bases, which coincide only when nothing was rejected: hidden-state
+        # rows are indexed in the scheduled packing they arrive in, while the slot map is
+        # built over kept rows alone and so is packed by num_keep.
+        keep_start: dict[str, int] = {}
+        current_keep_idx = 0
+        for req_id in req_order:
+            keep_start[req_id] = current_keep_idx
+            current_keep_idx += num_keep[req_id]
 
         slots_cpu: torch.Tensor | None = None
         mm_outputs = mm_outputs or {}
@@ -601,13 +619,23 @@ class OmniPrefixCacheManager:
         if num_tokens_unpadded > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
-            slots_cpu = self._view.step_slots_cpu(req_order, num_sched)
-            if int(slots_cpu.numel()) != num_tokens_unpadded:
+            # Two separate invariants, which a committed-row trim pulls apart: the
+            # scheduled layout must still describe the whole incoming tensor, while the
+            # slot map covers only the rows that are kept.
+            num_sched_total = sum(num_sched.values())
+            num_keep_total = sum(num_keep.values())
+            if num_sched_total != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at
                 # some future hit instead of a debuggable one here.
                 raise OmniPrefixCacheUnmatchError(
-                    f"slot mapping covers {int(slots_cpu.numel())} of {num_tokens_unpadded} scheduled tokens; "
+                    f"scheduled layout covers {num_sched_total} of {num_tokens_unpadded} tokens in the step; "
+                    "CPU-side batch layout out of sync with the forward"
+                )
+            slots_cpu = self._view.step_slots_cpu(req_order, num_keep)
+            if int(slots_cpu.numel()) != num_keep_total:
+                raise OmniPrefixCacheUnmatchError(
+                    f"slot mapping covers {int(slots_cpu.numel())} of {num_keep_total} committed tokens; "
                     "CPU-side slot derivation out of sync with the batch"
                 )
         step_outputs = self._split_step_outputs(
@@ -618,6 +646,8 @@ class OmniPrefixCacheManager:
             slots_cpu=slots_cpu,
             req_order=req_order,
             num_sched=num_sched,
+            num_keep=num_keep,
+            keep_start=keep_start,
             query_start=query_start,
         )
 
@@ -650,7 +680,8 @@ class OmniPrefixCacheManager:
             step_id, queued = self._publish_saved_step(
                 req_order=req_order,
                 query_start=query_start,
-                num_sched=num_sched,
+                num_keep=num_keep,
+                keep_start=keep_start,
                 num_tokens_unpadded=num_tokens_unpadded,
                 step_outputs=step_outputs,
                 slots_cpu=slots_cpu,
@@ -893,7 +924,8 @@ class OmniPrefixCacheManager:
         *,
         req_order: list[str],
         query_start: dict[str, int],
-        num_sched: dict[str, int],
+        num_keep: dict[str, int],
+        keep_start: dict[str, int],
         num_tokens_unpadded: int,
         step_outputs: _StepOutputs,
         slots_cpu: torch.Tensor | None,
@@ -916,7 +948,8 @@ class OmniPrefixCacheManager:
             queued = self._submit_step_writes(
                 req_order,
                 query_start,
-                num_sched,
+                num_keep,
+                keep_start,
                 step_outputs.immediate,
                 step_outputs.immediate_budget,
                 slots_cpu,
@@ -935,7 +968,7 @@ class OmniPrefixCacheManager:
         step_id = self._next_step_id
         self._next_step_id += 1
         self._step_ctxs[step_id] = _StepContext(
-            spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
+            spans={r: (query_start[r], query_start[r] + num_keep[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
             hits=dict(self._hit_spans),
             hit_prefetch=dict(self._hit_prefetch),
@@ -957,6 +990,8 @@ class OmniPrefixCacheManager:
         slots_cpu: torch.Tensor | None,
         req_order: list[str],
         num_sched: dict[str, int],
+        num_keep: dict[str, int],
+        keep_start: dict[str, int],
         query_start: dict[str, int],
     ) -> _StepOutputs:
         """Split this step's outputs into immediate / deferred / leftover.
@@ -1002,7 +1037,9 @@ class OmniPrefixCacheManager:
         deferred_chunks: list[tuple[str, _WriteChunk]] = []
         if deferred_tensors:
             assert slots_cpu is not None
-            deferred_chunks = self._pack_deferred_chunks(deferred_tensors, slots_cpu, req_order, num_sched, query_start)
+            deferred_chunks = self._pack_deferred_chunks(
+                deferred_tensors, slots_cpu, req_order, num_keep, keep_start, query_start
+            )
         immediate_budget = (
             _BudgetTicket(nbytes=sum(t.numel() * t.element_size() for t in immediate.values())) if immediate else None
         )
@@ -1020,24 +1057,30 @@ class OmniPrefixCacheManager:
         deferred_tensors: dict[str, torch.Tensor],
         slots_cpu: torch.Tensor,
         req_order: list[str],
-        num_sched: dict[str, int],
+        num_keep: dict[str, int],
+        keep_start: dict[str, int],
         query_start: dict[str, int],
     ) -> list[tuple[str, _WriteChunk]]:
-        """Per-req views of already-cloned deferred tensors. No further clone."""
+        """Per-req views of already-cloned deferred tensors. No further clone.
+
+        Tensor rows are indexed from ``query_start`` because they arrive in the
+        scheduled packing; ``slots_cpu`` covers kept rows only and is indexed from
+        ``keep_start``. The two bases coincide unless a step rejected draft tokens.
+        """
         ticket = _BudgetTicket(nbytes=sum(t.numel() * t.element_size() for t in deferred_tensors.values()))
         out: list[tuple[str, _WriteChunk]] = []
         for req_id in req_order:
-            sched = num_sched[req_id]
-            if sched <= 0:
+            keep = num_keep[req_id]
+            if keep <= 0:
                 continue
-            start = query_start[req_id]
-            end = start + sched
+            row_start = query_start[req_id]
+            slot_start = keep_start[req_id]
             out.append(
                 (
                     req_id,
                     _WriteChunk(
-                        slots_cpu=slots_cpu[start:end],
-                        tensors={k: v[start:end] for k, v in deferred_tensors.items()},
+                        slots_cpu=slots_cpu[slot_start : slot_start + keep],
+                        tensors={k: v[row_start : row_start + keep] for k, v in deferred_tensors.items()},
                         budget=ticket,
                     ),
                 )
@@ -1048,7 +1091,8 @@ class OmniPrefixCacheManager:
         self,
         req_order: list[str],
         query_start: dict[str, int],
-        num_sched: dict[str, int],
+        num_keep: dict[str, int],
+        keep_start: dict[str, int],
         device_snapshot: dict[str, torch.Tensor],
         budget: _BudgetTicket | None,
         slots_cpu: torch.Tensor,
@@ -1067,16 +1111,20 @@ class OmniPrefixCacheManager:
         """
         tasks: list[WriteTask] = []
         for req_id in req_order:
-            start = query_start[req_id]
-            end = start + num_sched[req_id]
-            if end == start:
+            keep = num_keep[req_id]
+            if keep == 0:
                 continue
-            tensors = {k: v[start:end] for k, v in device_snapshot.items()}
+            # Rows keep the scheduled packing they arrived in; slots cover kept rows only.
+            row_start = query_start[req_id]
+            slot_start = keep_start[req_id]
+            tensors = {k: v[row_start : row_start + keep] for k, v in device_snapshot.items()}
             tid = self._request_tasks.alloc_tid()
-            chunk = _WriteChunk(slots_cpu=slots_cpu[start:end], tensors=tensors, budget=budget)
+            chunk = _WriteChunk(
+                slots_cpu=slots_cpu[slot_start : slot_start + keep], tensors=tensors, budget=budget
+            )
             # Host rows are views into the slot; the committer only waits
             # the shared step event. Device→host is already in flight.
-            chunk.host = {k: v[start:end] for k, v in host_views.items()}
+            chunk.host = {k: v[row_start : row_start + keep] for k, v in host_views.items()}
             task = WriteTask(
                 tid=tid,
                 req_id=req_id,
@@ -1087,7 +1135,7 @@ class OmniPrefixCacheManager:
                 staging_slot=staging_slot,
                 step_d2h_event=step_d2h_event,
             )
-            self._map_slots(slots_cpu[start:end], tid, tensors.keys())
+            self._map_slots(slots_cpu[slot_start : slot_start + keep], tid, tensors.keys())
             # Bind and pin before register: the slot must never be holder-free
             # while the task is live (released at its pool write).
             self._controller.staging_bind(staging_slot, StagingBufferHolder.for_task(tid))

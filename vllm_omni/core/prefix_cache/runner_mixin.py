@@ -114,23 +114,37 @@ class PrefixCacheRunnerMixin:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        committed: dict[str, int] | None = None,
     ) -> int | None:
         """Write this step's outputs into the cache.
 
         None when this stage/rank does not write (pooling, cache off, or not
         the last PP rank). The returned step id must be consumed exactly once
         — materialize or discard_step — by the output path.
-        """
-        from vllm.distributed.parallel_state import get_pp_group
 
-        if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
+        ``committed`` caps each request's kept rows. A speculative step also
+        produces rows for rejected draft tokens, whose slots vLLM reclaims, so
+        omitting it caches state against slots that later hold other tokens.
+        """
+        if not self._prefix_cache_will_write():
             return None
         return self.omni_prefix_cache.save_outputs(
             hidden_states,
             flatten_payload(multimodal_outputs) if multimodal_outputs else {},
             num_tokens_unpadded=num_tokens_unpadded,
             num_tokens_padded=num_tokens_padded,
+            committed=committed,
         )
+
+    def _prefix_cache_will_write(self) -> bool:
+        """Whether a save on this stage/rank would produce a step id.
+
+        The save itself runs after sampling, because the committed-row span it
+        needs is a sampling result; callers that must branch before then ask here.
+        """
+        from vllm.distributed.parallel_state import get_pp_group
+
+        return not (self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank)
 
     def _prefix_cache_materialize(
         self, step_id: int | None, req_ids: list[str]

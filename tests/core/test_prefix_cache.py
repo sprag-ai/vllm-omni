@@ -427,6 +427,8 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
         slots_cpu=view.step_slots_cpu(["a"], {"a": n}),
         req_order=["a"],
         num_sched={"a": n},
+        num_keep={"a": n},
+        keep_start={"a": 0},
         query_start={"a": 0},
     )
     assert HIDDEN_KEY in step_outputs.immediate and "tok" in step_outputs.immediate
@@ -673,10 +675,17 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, async_sched=False
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
-        cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=enable,
+            block_size=BLOCK_SIZE,
+            prefix_match_unit=match_unit,
+            async_scheduling=async_sched,
+        ),
         kv_transfer_config=kv_transfer,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_model_len=128),
         model_config=None,
@@ -695,7 +704,12 @@ def test_stage_prefix_cache_config_gate():
     with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
         _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), groups=())
     assert _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), enable=False) is None
+    # Speculation refuses only under async scheduling, where num_computed_tokens_cpu
+    # stays optimistic through the forward and the slot map would mirror rows wrongly.
     with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
+        _stage_cfg(spec=SimpleNamespace(method="ngram"), async_sched=True, groups=())
+    # Without async it reaches the group check instead of being refused outright.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
         _stage_cfg(spec=SimpleNamespace(method="ngram"), groups=())
     with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
         _stage_cfg(match_unit=BLOCK_SIZE // 2, groups=())
