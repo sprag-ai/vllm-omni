@@ -102,10 +102,9 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 
-# Fields a global CLI value must not fan out to every stage. A speculative config names a
-# draft model paired with one specific target, so it belongs to a single stage; stages in
-# a pipeline differ in what they consume and emit, and the ones that are not that target
-# cannot draft for it.
+# Fields that must name their stage once a pipeline has more than one. A speculative
+# config pairs a draft model with one specific target, so applying a pipeline-wide value
+# would hand it to stages that are not that target and cannot draft for it.
 _STAGE_SCOPED_ONLY_ENGINE_FIELDS = frozenset({"speculative_config"})
 
 
@@ -374,6 +373,7 @@ def _stage_cli_overrides(
     cli_overrides: Mapping[str, Any],
     *,
     execution_type: StageExecutionType | None = None,
+    stage_count: int = 1,
 ) -> dict[str, Any]:
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
@@ -401,8 +401,15 @@ def _stage_cli_overrides(
             and not stage_specific
         ):
             continue
-        if key in _STAGE_SCOPED_ONLY_ENGINE_FIELDS and not stage_specific:
-            continue
+        # On a one-stage pipeline the global value is that stage's value, so there is
+        # nothing to fan out and it applies unchanged. On more stages it is ambiguous
+        # rather than wrong, and dropping it silently would leave the caller believing
+        # a feature is on, so say which key to use instead.
+        if key in _STAGE_SCOPED_ONLY_ENGINE_FIELDS and not stage_specific and stage_count > 1:
+            raise ValueError(
+                f"{key} must name the stage it applies to in a {stage_count}-stage pipeline; "
+                f"pass stage_<id>_{key} instead of a pipeline-wide value."
+            )
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
@@ -2338,6 +2345,7 @@ class VllmOmniConfig:
                         topology.stage_id,
                         cli_overrides,
                         execution_type=topology.execution_type,
+                        stage_count=len(pipeline_cfg.stages),
                     ),
                 ),
                 model=model,
