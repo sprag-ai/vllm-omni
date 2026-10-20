@@ -58,8 +58,17 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.platforms.interface import UnspecifiedOmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Module-wide cpu marker, so a test that reaches worker discovery states the
+# accelerator it needs: no omni platform is registered for CPU.
+requires_omni_platform = pytest.mark.skipif(
+    isinstance(current_omni_platform, UnspecifiedOmniPlatform),
+    reason="requires a resolved omni platform",
+)
 
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
@@ -294,6 +303,7 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+@requires_omni_platform
 @pytest.mark.parametrize("disabled", [True, False])
 def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
