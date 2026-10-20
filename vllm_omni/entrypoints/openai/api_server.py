@@ -203,6 +203,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _unpack_video_generation_result,
     video_response_from_request,
 )
+from vllm_omni.entrypoints.openai.websocket_sessions import WebSocketSessionGauge
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
@@ -421,6 +422,8 @@ async def omni_run_server_worker(
                 "untrusted environments."
             )
             app.include_router(weight_transfer_api.router)
+
+        app.add_middleware(WebSocketSessionGauge)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
