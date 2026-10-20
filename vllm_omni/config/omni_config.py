@@ -102,6 +102,12 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 
+# Fields a global CLI value must not fan out to every stage. Only the stage that can
+# actually draft may carry a speculative config: a talker strips the auxiliary tuple its
+# runner then expects, and code2wav returns audio rather than hidden states, so applying
+# one pipeline-wide fails at startup or on the first forward.
+_STAGE_SCOPED_ONLY_ENGINE_FIELDS = frozenset({"speculative_config"})
+
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
     quantization_config: _QuantizationConfigType
@@ -394,6 +400,8 @@ def _stage_cli_overrides(
             and key in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
             and not stage_specific
         ):
+            continue
+        if key in _STAGE_SCOPED_ONLY_ENGINE_FIELDS and not stage_specific:
             continue
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)

@@ -1174,6 +1174,31 @@ def _project_omni_stage_engine_args(
             "with the Omni prefix cache; set enable_prefix_caching: false on this stage."
         )
 
+    # An unset async_scheduling resolves to True, and AR stages are defaulted to it, so
+    # the permissive case has to be spelled out rather than compared against False.
+    if stage_config.speculative_config is not None and (
+        stage_config.scheduler_config.async_scheduling is not False
+    ):
+        # The committed-row span is derived from the rejection sampler's emitted
+        # counts, which are not available while the payload is built under async
+        # scheduling; the span would fall back to every scheduled row and the next
+        # stage would receive rejected draft tokens.
+        raise ValueError(
+            f"Stage {stage_config.stage_id}: speculative decoding requires async_scheduling: false "
+            "on this stage; the committed-row span cannot be derived asynchronously."
+        )
+
+    if stage_config.speculative_config is not None and stage_config.parallel_config.pipeline_parallel_size > 1:
+        # A non-final rank returns IntermediateTensors and drops its rank-local
+        # auxiliary states, so the drafter would see only the layers the last rank
+        # captured. Forwarding them needs the PP payload to declare their keys up
+        # front, but the auxiliary layer indices arrive later from the runner via
+        # set_aux_hidden_state_layers, after that payload schema is fixed.
+        raise ValueError(
+            f"Stage {stage_config.stage_id}: speculative decoding requires pipeline_parallel_size 1 "
+            "on this stage; auxiliary hidden states are not forwarded across pipeline ranks."
+        )
+
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
