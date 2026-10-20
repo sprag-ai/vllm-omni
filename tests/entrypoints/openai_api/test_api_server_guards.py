@@ -50,7 +50,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
@@ -616,6 +616,67 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     assert "request_timestamp" in http_scope["state"]
     assert isinstance(http_scope["state"]["request_timestamp"], float)
     assert "request_timestamp" not in ws_scope.get("state", {})
+
+
+@pytest.mark.asyncio
+async def test_websocket_sessions_are_counted_on_an_app_with_a_built_middleware_stack(monkeypatch) -> None:
+    """Upstream's build_app returns an app whose middleware stack is already built, so
+    ``add_middleware`` raises at startup; the session count must come from the outer wrapper."""
+    from prometheus_client import REGISTRY
+
+    from vllm_omni.metrics import definitions as defs
+
+    captured: dict[str, Any] = {}
+    seen: list[float] = []
+
+    def fake_build_openai_app(args, supported_tasks):
+        app = FastAPI()
+
+        @app.websocket("/probe")
+        async def probe(websocket: WebSocket):
+            seen.append(REGISTRY.get_sample_value(defs.WEBSOCKET_SESSIONS_ACTIVE))
+            await websocket.close()
+
+        app.middleware_stack = app.build_middleware_stack()
+        return app
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        yield _FakeEngineClient()
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    async def fake_serve_http(app, **_kwargs):
+        captured["served_app"] = app
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    baseline = REGISTRY.get_sample_value(defs.WEBSOCKET_SESSIONS_ACTIVE)
+    scope = {"type": "websocket", "path": "/probe", "headers": [], "query_string": b"", "subprotocols": []}
+    sent: list[dict[str, Any]] = []
+
+    async def _receive():
+        return {"type": "websocket.connect"}
+
+    async def _send(message):
+        sent.append(message)
+
+    await captured["served_app"](scope, _receive, _send)
+
+    assert seen == [baseline + 1]
+    assert REGISTRY.get_sample_value(defs.WEBSOCKET_SESSIONS_ACTIVE) == baseline
+    assert sent[-1]["type"] == "websocket.close"
 
 
 @pytest.mark.parametrize(
