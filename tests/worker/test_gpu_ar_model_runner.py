@@ -529,6 +529,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -573,6 +574,7 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=6,
             num_scheduled_tokens={"r1": 1, "r2": 2, "r3": 3},
         ),
@@ -626,6 +628,7 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -688,6 +691,7 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 2},
         ),
@@ -735,6 +739,7 @@ def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_onl
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -782,6 +787,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=5,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -874,6 +880,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner._pooler_payload_include_hidden_flag = True
     runner.execute_model_state = ExecuteModelState(
         SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -902,7 +909,18 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         runner.query_start_loc = query_start_loc
     else:
         runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    runner.omni_prefix_cache = object()
+    # Cache on, but this step produced no saved context: the payload path must then
+    # serve the freshly staged slice rather than a merged read.
+    runner.omni_prefix_cache = SimpleNamespace(save_outputs=lambda *a, **k: None)
+    # What execute_model records for the save; unset means no forward ran, which the
+    # save rejects rather than sizing the write from a previous step.
+    runner._prefix_cache_num_tokens_padded = 3
+    runner.is_pooling_model = False
+    # One rank, so it is the last one; get_pp_group asserts rather than defaulting.
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, world_size=1),
+    )
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner.requests = {}
@@ -984,6 +1002,7 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 1, "r2": 1},
         ),
@@ -1031,6 +1050,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -1071,6 +1091,7 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -1131,6 +1152,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -1205,6 +1227,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -1872,3 +1895,23 @@ class TestPreferModelSamplerNoneFallback:
             "least tolerates -- that fallback, then add its directory name to "
             "`expected` above. If you REMOVED one, drop its name."
         )
+
+
+@pytest.mark.parametrize(
+    "drafts,sampled,num_scheduled,expected",
+    [
+        ({}, [[1]], 4, 4),
+        ({"other": [9]}, [[1]], 4, 4),
+        ({"r": [9, 9, 9]}, [], 4, 4),
+        ({"r": [9, 9, 9]}, [[]], 4, 4),
+        ({"r": [9, 9, 9]}, [[1, 2]], 4, 2),
+        ({"r": [9]}, [[1, 2, 3, 4, 5]], 2, 2),
+    ],
+    ids=["no-drafts", "other-req", "idx-out-of-range", "nothing-sampled", "two-of-three", "never-exceeds-span"],
+)
+def test_committed_rows_trim_to_the_accepted_prefix(drafts, sampled, num_scheduled, expected):
+    """Only the prior token plus the accepted draft prefix may go downstream."""
+    from vllm_omni.worker.gpu_ar_model_runner import _committed_num_scheduled_tokens
+
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens=drafts)
+    assert _committed_num_scheduled_tokens(scheduler_output, sampled, "r", 0, num_scheduled) == expected

@@ -422,6 +422,34 @@ def test_model_cli_fields_reach_typed_engine_args(monkeypatch):
     assert {field: engine_args.get(field) for field in _MODEL_CLI_FLAGS} == _MODEL_CLI_FLAGS
 
 
+@pytest.mark.parametrize(
+    "attr, owner, match",
+    [
+        ("async_scheduling", "scheduler_config", "async_scheduling: false"),
+        ("use_v2_model_runner", "model_config", "model_runner: v1"),
+    ],
+    ids=["async_scheduling", "v2_runner"],
+)
+def test_speculative_config_refuses_runners_that_drop_committed_rows(attr, owner, match, monkeypatch):
+    """Neither setting can report which rows a step committed, so pairing it with
+    speculation is refused rather than passing rejected draft rows downstream."""
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config refusal.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    stage = _from_pipeline_key("minicpmo_4_5").stage_by_id(0)
+    stage.speculative_config = {"method": "eagle3", "num_speculative_tokens": 4}
+    stage.scheduler_config.async_scheduling = False
+
+    setattr(getattr(stage, owner), attr, True)
+    with pytest.raises(ValueError, match=match):
+        build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+
+    setattr(getattr(stage, owner), attr, False)
+    build_engine_args_dict_from_omni_stage_config(stage, model="test-model")  # admitted
+
+
 @pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
 def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
     from vllm_omni.engine import stage_init_utils
@@ -886,6 +914,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "parallel_config",
         "compilation_config",
         "profiler_config",
+        "speculative_config",
         "quantization_config",
     }
     assert "diffusion_config" not in public_fields

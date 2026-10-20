@@ -30,7 +30,11 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.interface import (
+    OmniPrefixCacheUnmatchError,
+    PrefixCacheConfig,
+    StageCacheOutputs,
+)
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -104,8 +108,8 @@ class _CacheStub:
         self.materialize_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, committed=None):
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, committed))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -167,7 +171,26 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, None)]  # empty mm stays {}; no cap by default
+
+
+def test_padded_count_is_per_step_and_absent_outside_a_forward():
+    """A save that outlives its forward must raise, not reuse the last count.
+
+    The value crosses from the forward to a later sampling call on the instance,
+    so a step that recorded nothing would otherwise size its write from the
+    previous step's batch and write rows at the wrong width.
+    """
+    r = _Runner()
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="padded token count"):
+        r._prefix_cache_step_num_tokens_padded()
+
+    r._prefix_cache_num_tokens_padded = 8
+    assert r._prefix_cache_step_num_tokens_padded() == 8
+
+    r._prefix_cache_step_begin(_sched())  # next step: cleared again
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="padded token count"):
+        r._prefix_cache_step_num_tokens_padded()
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():

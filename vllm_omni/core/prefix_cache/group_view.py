@@ -107,10 +107,22 @@ def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
             "omni prefix caching requires a single full-attention kv-cache group; "
             f"found {len(groups)}. disable enable_prefix_caching for this model"
         )
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
     spec = getattr(groups[0], "kv_cache_spec", None)
-    if not isinstance(spec, FullAttentionSpec):
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        # A uniform-type group is layers that always need the same number of token
+        # slots, which is the property the row-to-slot mapping relies on. A drafter
+        # shares the target's KV type, so attaching one wraps the group in this rather
+        # than changing what a slot means.
+        members = list(spec.kv_cache_specs.values())
+        if not members or not all(isinstance(m, FullAttentionSpec) for m in members):
+            raise OmniPrefixCacheUnmatchError(
+                "omni prefix caching requires full-attention layers; found a uniform-type "
+                f"group of {sorted({type(m).__name__ for m in members})}. "
+                "disable enable_prefix_caching for this model"
+            )
+    elif not isinstance(spec, FullAttentionSpec):
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching requires a single full-attention kv-cache group; "
             f"found {type(spec).__name__}. disable enable_prefix_caching for this model"
@@ -135,18 +147,18 @@ def check_prefix_cache_token_accounting(cache_config: object, speculative_config
     """Reject configs where ``num_computed_tokens`` stops meaning "first
     scheduled position, block aligned".
 
-    Speculative decoding: with async scheduling vLLM keeps
-    ``num_computed_tokens_cpu`` optimistic (all drafts accepted) during the
-    forward and corrects it after; ``step_slots_cpu`` would read the
-    uncorrected value and mirror rows at the wrong slots. Refused as a
-    whole until that path is verified. ``prefix_match_unit`` smaller than
-    the block enables sub-block hits, which the hit registry rejects as
-    unaligned on the first hit; refuse at init instead.
+    Speculative decoding is admitted only without async scheduling. Async keeps
+    ``num_computed_tokens_cpu`` optimistic (all drafts accepted) during the forward
+    and corrects it afterwards, so ``step_slots_cpu`` would mirror rows at the wrong
+    slots. The stage projection refuses that pairing, and the save runs after
+    sampling, so the rows it keeps are the committed ones.
+    ``prefix_match_unit`` smaller than the block enables sub-block hits, which the
+    hit registry rejects as unaligned on the first hit; refuse at init instead.
     """
-    if speculative_config is not None:
+    if speculative_config is not None and getattr(cache_config, "async_scheduling", False):
         raise OmniPrefixCacheUnmatchError(
-            "omni prefix caching is not supported together with speculative decoding; "
-            "disable enable_prefix_caching on this stage"
+            "omni prefix caching is not supported together with speculative decoding under "
+            "async scheduling; set async_scheduling: false or disable enable_prefix_caching"
         )
     unit = getattr(cache_config, "prefix_match_unit", None)
     block_size = getattr(cache_config, "block_size", None)

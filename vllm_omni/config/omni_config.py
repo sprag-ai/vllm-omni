@@ -102,6 +102,11 @@ _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 
+# Fields that must name their stage once a pipeline has more than one. A speculative
+# config pairs a draft model with one specific target, so applying a pipeline-wide value
+# would hand it to stages that are not that target and cannot draft for it.
+_STAGE_SCOPED_ONLY_ENGINE_FIELDS = frozenset({"speculative_config"})
+
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
     quantization_config: _QuantizationConfigType
@@ -293,6 +298,7 @@ class _StageEngineValues:
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
+    speculative_config: Mapping[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -367,6 +373,7 @@ def _stage_cli_overrides(
     cli_overrides: Mapping[str, Any],
     *,
     execution_type: StageExecutionType | None = None,
+    stage_count: int = 1,
 ) -> dict[str, Any]:
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
@@ -394,6 +401,15 @@ def _stage_cli_overrides(
             and not stage_specific
         ):
             continue
+        # On a one-stage pipeline the global value is that stage's value, so there is
+        # nothing to fan out and it applies unchanged. On more stages it is ambiguous
+        # rather than wrong, and dropping it silently would leave the caller believing
+        # a feature is on, so say which key to use instead.
+        if key in _STAGE_SCOPED_ONLY_ENGINE_FIELDS and not stage_specific and stage_count > 1:
+            raise ValueError(
+                f"{key} must name the stage it applies to in a {stage_count}-stage pipeline; "
+                f"pass stage_<id>_{key} instead of a pipeline-wide value."
+            )
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
@@ -1222,7 +1238,8 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config"})
+# Projected verbatim into engine args; see stage_init_utils._project_omni_stage_engine_args.
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1584,6 +1601,7 @@ def _stage_engine_values(
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
+        speculative_config=_copy_value(engine.get("speculative_config")),
     )
 
 
@@ -1647,6 +1665,11 @@ class BaseVllmOmniStageConfig:
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
+    # Stays a mapping where the two fields above are typed: this dataclass is
+    # pydantic-validated, so a SpeculativeConfig annotation coerces the stage dict
+    # and runs that class's own validation, which dereferences a target model
+    # config this stage has not built yet (AttributeError on hf_overrides).
+    speculative_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1809,6 +1832,7 @@ def _build_common_stage_config_kwargs(
             "parallel_config": parallel_config,
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
+            "speculative_config": _copy_value(engine.speculative_config),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,
@@ -2321,6 +2345,7 @@ class VllmOmniConfig:
                         topology.stage_id,
                         cli_overrides,
                         execution_type=topology.execution_type,
+                        stage_count=len(pipeline_cfg.stages),
                     ),
                 ),
                 model=model,

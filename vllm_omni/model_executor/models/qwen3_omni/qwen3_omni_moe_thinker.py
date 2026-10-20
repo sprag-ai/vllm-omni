@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -550,6 +551,18 @@ ISO639_1_SUPPORTED_LANGS = {
     }
 )
 class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Auxiliary states are collected into a rank-local list, and a non-final rank
+        # returns IntermediateTensors without them, so a drafter would see only the layers
+        # the last rank captured. Both SupportsEagle3 entry points resolve to this method,
+        # so refusing here covers the combined model and a bare thinker alike.
+        if get_pp_group().world_size > 1:
+            raise ValueError(
+                "Qwen3-Omni cannot produce EAGLE3 auxiliary hidden states across pipeline "
+                "ranks; serve the thinker with pipeline_parallel_size 1 to use a drafter."
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -559,7 +572,11 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
         capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor, OmniPayload | None, list[torch.Tensor] | None]
+    ):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -572,6 +589,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
+        aux_hidden_states = self._maybe_add_hidden_state([], self.start_layer, hidden_states, residual)
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
             for layer_idx in capture_set:
@@ -602,6 +620,11 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
+            # After the deepstack add, so the drafter sees the state the next
+            # layer does. The speculator reapplies the verifier norm itself, so
+            # the last layer is collected here too, before self.norm below.
+            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "residual": residual}
             if captured_hidden_states:
@@ -613,10 +636,12 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                 )
             return IntermediateTensors(tensors)
         hidden_states, _ = self.norm(hidden_states, residual)
-        if captured_hidden_states is not None:
-            return hidden_states, captured_hidden_states
-        else:
-            return hidden_states, None
+        # Both extra values ride the return so a CUDA-graph replay, which does
+        # not re-run this body, still yields the current step's tensors. The
+        # wrapper below reduces this to the shape vLLM expects.
+        if captured_hidden_states is not None or aux_hidden_states:
+            return hidden_states, captured_hidden_states, aux_hidden_states or None
+        return hidden_states
 
 
 class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
@@ -1022,6 +1047,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 )
 class Qwen3OmniMoeThinkerForConditionalGeneration(
     nn.Module,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     SupportsLoRA,
@@ -1032,6 +1058,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     # PEFT stores the expert LoRA matrices with an explicit expert dimension.
     is_3d_moe_weight: bool = True
+    # Accept-layer capture from the most recent forward, consumed by the combined
+    # model's make_omni_output. None when no capture was requested. Pairing a read
+    # with its own step depends on the thinker never running under a full CUDA
+    # graph: _returns_tuple forces _exclude_full_graph in the v2 runner, so this
+    # attribute is rewritten on every step rather than skipped by a replay.
+    captured_layers: OmniPayload | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1415,14 +1447,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if isinstance(model_output, IntermediateTensors):
             # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
-        hidden_states, captured_hidden_states = model_output
-        if capture_layer_indices is None and not return_hidden_states:
-            # No capture requested. Return a bare tensor: stock vLLM's
-            # GPUModelRunner indexes the forward output directly, so a tuple
-            # here breaks non-staged runs that resolve this class through the
-            # global registry (e.g. plain `vllm serve` of the thinker).
+        if isinstance(model_output, tuple) and len(model_output) == 3:
+            hidden_states, captured_layers, aux_hidden_states = model_output
+            # Published here rather than in the decoder: this method is outside
+            # the compiled region, so it runs on every step including a replay.
+            self.captured_layers = captured_layers
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            # Bare tensor when only the capture was requested: stock vLLM's
+            # GPUModelRunner indexes the forward output directly, so a tuple here
+            # breaks non-staged runs that resolve this class through the global
+            # registry (e.g. plain `vllm serve` of the thinker).
             return hidden_states
-        return hidden_states, captured_hidden_states
+        return model_output
 
     def compute_logits(
         self,

@@ -427,6 +427,8 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
         slots_cpu=view.step_slots_cpu(["a"], {"a": n}),
         req_order=["a"],
         num_sched={"a": n},
+        num_keep={"a": n},
+        keep_start={"a": 0},
         query_start={"a": 0},
     )
     assert HIDDEN_KEY in step_outputs.immediate and "tok" in step_outputs.immediate
@@ -673,10 +675,40 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def test_check_kv_groups_accepts_a_uniform_type_group_of_full_attention():
+    """Attaching a drafter wraps the group rather than changing a slot's meaning.
+
+    A drafter shares the target's KV type, so vLLM reports one
+    ``UniformTypeKVCacheSpecs`` group — layers that always need the same number of
+    token slots, which is the property the row-to-slot mapping relies on. A group
+    whose members are not all full attention carries no such guarantee.
+    """
+    kv = pytest.importorskip("vllm.v1.kv_cache_interface")
+
+    def group(**specs):
+        uniform = kv.UniformTypeKVCacheSpecs.__new__(kv.UniformTypeKVCacheSpecs)
+        object.__setattr__(uniform, "kv_cache_specs", specs)
+        return [SimpleNamespace(kv_cache_spec=uniform)]
+
+    full = kv.FullAttentionSpec.__new__(kv.FullAttentionSpec)
+    check_prefix_cache_kv_groups(group(target=full, drafter=full))  # admitted
+
+    for bad in (group(target=full, sliding=object()), group()):
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="full-attention layers"):
+            check_prefix_cache_kv_groups(bad)
+
+
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, async_sched=False
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
-        cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=enable,
+            block_size=BLOCK_SIZE,
+            prefix_match_unit=match_unit,
+            async_scheduling=async_sched,
+        ),
         kv_transfer_config=kv_transfer,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_model_len=128),
         model_config=None,
@@ -695,7 +727,12 @@ def test_stage_prefix_cache_config_gate():
     with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
         _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), groups=())
     assert _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), enable=False) is None
+    # Speculation refuses only under async scheduling, where num_computed_tokens_cpu
+    # stays optimistic through the forward and the slot map would mirror rows wrongly.
     with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
+        _stage_cfg(spec=SimpleNamespace(method="ngram"), async_sched=True, groups=())
+    # Without async it reaches the group check instead of being refused outright.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
         _stage_cfg(spec=SimpleNamespace(method="ngram"), groups=())
     with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
         _stage_cfg(match_unit=BLOCK_SIZE // 2, groups=())
@@ -987,6 +1024,56 @@ def test_save_slot_mismatch_fails_fast():
     hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
     with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
+
+
+def test_save_keeps_only_committed_rows_of_a_speculative_step():
+    """A rejected draft's row must not be cached: vLLM reclaims its slot.
+
+    Two requests, 4 scheduled rows each, 2 committed each. The hidden tensor
+    arrives in the scheduled packing, so request b's committed rows start at row
+    4 while its slots start at slot index 2 — the two bases that only coincide
+    when nothing was rejected.
+    """
+    mgr, view = make_manager()
+    view.order = ["a", "b"]
+    view.req_blocks["a"], view.computed["a"] = [0], 0
+    view.req_blocks["b"], view.computed["b"] = [1], 0
+    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("b")], num_scheduled={"a": 4, "b": 4}))
+    slots_a = view.slots_for("a", 0, 2)
+    slots_b = view.slots_for("b", 0, 2)
+    hidden = torch.cat(
+        [
+            view.slots_for("a", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
+            view.slots_for("b", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
+        ]
+    )
+    sid = mgr.save_outputs(hidden, {}, num_tokens_unpadded=8, num_tokens_padded=8, committed={"a": 2, "b": 2})
+    mgr.materialize(sid, ["a", "b"])
+    for req_id, slots in (("a", slots_a), ("b", slots_b)):
+        got = plan_fetch(mgr, slots, HIDDEN_KEY, req_id=req_id)
+        torch.testing.assert_close(got, expected_rows(slots))
+
+
+def test_save_requires_a_committed_count_for_every_scheduled_request():
+    """An omission must raise, not fall back to the untrimmed span.
+
+    Defaulting a missing request to its scheduled count would cache exactly the
+    rejected-draft rows the argument exists to drop. Requests in the batch that
+    this step did not schedule need no entry.
+    """
+    mgr, view = make_manager()
+    view.order = ["a", "idle"]
+    view.req_blocks["a"], view.computed["a"] = [0], 0
+    view.req_blocks["idle"], view.computed["idle"] = [1], 0
+    hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("idle")], num_scheduled={"a": 4})
+
+    mgr.new_step_starts(sched)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="omit"):
+        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={})
+
+    mgr.new_step_starts(sched)
+    mgr.discard_step(mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={"a": 4}))
 
 
 def test_materialize_rejects_out_of_snapshot_ids():
