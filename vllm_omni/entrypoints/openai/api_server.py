@@ -193,6 +193,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _unpack_video_generation_result,
     video_response_from_request,
 )
+from vllm_omni.entrypoints.openai.websocket_sessions import WebSocketSessionGauge
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 from vllm_omni.entrypoints.serve.profile.protocol import ProfileRequest
@@ -340,6 +341,7 @@ async def omni_run_server_worker(
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
+        app.add_middleware(WebSocketSessionGauge)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
