@@ -1128,9 +1128,7 @@ class OmniPrefixCacheManager:
             slot_start = keep_start[req_id]
             tensors = {k: v[row_start : row_start + keep] for k, v in device_snapshot.items()}
             tid = self._request_tasks.alloc_tid()
-            chunk = _WriteChunk(
-                slots_cpu=slots_cpu[slot_start : slot_start + keep], tensors=tensors, budget=budget
-            )
+            chunk = _WriteChunk(slots_cpu=slots_cpu[slot_start : slot_start + keep], tensors=tensors, budget=budget)
             # Host rows are views into the slot; the committer only waits
             # the shared step event. Device→host is already in flight.
             chunk.host = {k: v[row_start : row_start + keep] for k, v in host_views.items()}

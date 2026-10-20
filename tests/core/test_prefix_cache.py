@@ -675,6 +675,29 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
+def test_check_kv_groups_accepts_a_uniform_type_group_of_full_attention():
+    """Attaching a drafter wraps the group rather than changing a slot's meaning.
+
+    A drafter shares the target's KV type, so vLLM reports one
+    ``UniformTypeKVCacheSpecs`` group — layers that always need the same number of
+    token slots, which is the property the row-to-slot mapping relies on. A group
+    whose members are not all full attention carries no such guarantee.
+    """
+    kv = pytest.importorskip("vllm.v1.kv_cache_interface")
+
+    def group(**specs):
+        uniform = kv.UniformTypeKVCacheSpecs.__new__(kv.UniformTypeKVCacheSpecs)
+        object.__setattr__(uniform, "kv_cache_specs", specs)
+        return [SimpleNamespace(kv_cache_spec=uniform)]
+
+    full = kv.FullAttentionSpec.__new__(kv.FullAttentionSpec)
+    check_prefix_cache_kv_groups(group(target=full, drafter=full))  # admitted
+
+    for bad in (group(target=full, sliding=object()), group()):
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="full-attention layers"):
+            check_prefix_cache_kv_groups(bad)
+
+
 def _stage_cfg(
     *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, async_sched=False
 ):
@@ -1015,9 +1038,7 @@ def test_save_keeps_only_committed_rows_of_a_speculative_step():
     view.order = ["a", "b"]
     view.req_blocks["a"], view.computed["a"] = [0], 0
     view.req_blocks["b"], view.computed["b"] = [1], 0
-    mgr.new_step_starts(
-        FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("b")], num_scheduled={"a": 4, "b": 4})
-    )
+    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("b")], num_scheduled={"a": 4, "b": 4}))
     slots_a = view.slots_for("a", 0, 2)
     slots_b = view.slots_for("b", 0, 2)
     hidden = torch.cat(
@@ -1026,9 +1047,7 @@ def test_save_keeps_only_committed_rows_of_a_speculative_step():
             view.slots_for("b", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
         ]
     )
-    sid = mgr.save_outputs(
-        hidden, {}, num_tokens_unpadded=8, num_tokens_padded=8, committed={"a": 2, "b": 2}
-    )
+    sid = mgr.save_outputs(hidden, {}, num_tokens_unpadded=8, num_tokens_padded=8, committed={"a": 2, "b": 2})
     mgr.materialize(sid, ["a", "b"])
     for req_id, slots in (("a", slots_a), ("b", slots_b)):
         got = plan_fetch(mgr, slots, HIDDEN_KEY, req_id=req_id)
@@ -1054,9 +1073,7 @@ def test_save_requires_a_committed_count_for_every_scheduled_request():
         mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={})
 
     mgr.new_step_starts(sched)
-    mgr.discard_step(
-        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={"a": 4})
-    )
+    mgr.discard_step(mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={"a": 4}))
 
 
 def test_materialize_rejects_out_of_snapshot_ids():
