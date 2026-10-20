@@ -1177,6 +1177,16 @@ def _project_omni_stage_engine_args(
             "on this stage; the committed-row span cannot be derived asynchronously."
         )
 
+    if stage_config.speculative_config is not None and stage_config.model_config.use_v2_model_runner:
+        # The v2 runner reads a two-tuple model output as its own
+        # (text_hidden, captured_layers) pair and sets aux_hidden_states=None on
+        # ExecuteModelState, so EagleModelMixin's (hidden, aux) return would be taken
+        # for a capture payload and the drafter would receive nothing.
+        raise ValueError(
+            f"Stage {stage_config.stage_id}: speculative decoding requires model_runner: v1 on this "
+            "stage; the v2 runner does not carry the auxiliary hidden states a drafter consumes."
+        )
+
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
