@@ -1,0 +1,55 @@
+name: Sprag PR tests
+
+# The only tests that run before a change reaches a release branch: images build after the merge, and upstream's
+# pre-merge suite lives on Buildkite, which this fork does not have.
+on:
+  pull_request:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sprag-pr-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      # vLLM's CUDA wheels, torch included, need more space than the runner leaves free.
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install
+        run: |
+          version="$(sed -n 's|^ARG BASE_IMAGE=vllm/vllm-openai:v\(.*\)$|\1|p' docker/Dockerfile.cuda | head -1)"
+          [ -n "${version}" ] || { echo "::error::could not read the vLLM version from docker/Dockerfile.cuda"; exit 1; }
+          uv venv --python 3.12
+          uv pip install "vllm==${version}"
+          VLLM_OMNI_TARGET_DEVICE=cuda SETUPTOOLS_SCM_PRETEND_VERSION="${version}" uv pip install -e .
+          uv pip install pytest==9.1.1 pytest-asyncio==1.4.0 pytest-mock==3.15.1 pytest-xdist==3.8.0 \
+            pytest-subtests==0.15.0 pytest-shard==0.1.2
+
+      # A fixed core set (the areas sprag patches: scheduling, metrics and the OpenAI entrypoints) plus every test
+      # file the change adds or edits. The full suite is not green on a GPU-less runner.
+      - name: Test
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "1"
+        run: |
+          mapfile -t changed < <(git diff --name-only --diff-filter=AM "${BASE_SHA}" HEAD -- 'tests/**/test_*.py')
+          # Marked cpu, but it runs real audio generation and needs a CUDA device.
+          uv run --no-sync python -m pytest -q -n auto -m "core_model and cpu" \
+            --deselect tests/entrypoints/openai_api/test_serving_audio_generate.py::TestAudioGenerateAPI::test_with_all_params \
+            tests/core/sched tests/metrics tests/entrypoints/openai_api "${changed[@]}"
