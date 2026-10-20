@@ -87,6 +87,15 @@ def _committed_num_scheduled_tokens(
     non-final prefill chunk does. Those are never given drafts, so the full span
     is already the committed one.
 
+    An accepted chain whose stop token is not its last element is deliberately
+    not trimmed to the stop. This count matches vLLM's own
+    ``num_computed_tokens``, which is derived from the same untrimmed emission
+    and is the base ``step_slots_cpu`` indexes against; the stop is applied
+    afterwards, in the scheduler. The rows past it are unreachable rather than
+    stale, because ``KVCacheManager.allocate_slots`` caps ``num_tokens_to_cache``
+    at ``request.num_tokens`` to exclude non-committable tokens, so no published
+    block hash covers them.
+
     ``scheduled_spec_decode_tokens`` is read directly rather than through
     ``getattr``: a default would return the untrimmed span if upstream renamed
     the field, handing rejected draft rows to the next stage with no error.
