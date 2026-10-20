@@ -28,7 +28,6 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
-from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
@@ -294,7 +293,7 @@ class _StageEngineValues:
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
-    speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
+    speculative_config: Mapping[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -1651,7 +1650,11 @@ class BaseVllmOmniStageConfig:
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
-    speculative_config: VllmSpeculativeConfig | None = None
+    # Stays a mapping where the two fields above are typed: this dataclass is
+    # pydantic-validated, so a SpeculativeConfig annotation coerces the stage dict
+    # and runs that class's own validation, which dereferences a target model
+    # config this stage has not built yet (AttributeError on hf_overrides).
+    speculative_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
