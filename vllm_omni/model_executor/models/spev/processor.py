@@ -62,6 +62,7 @@ class SPEVInput:
     state: object
     image_bytes: bytes | None
     video_bytes: bytes | None = None
+    decision_layout: dict | None = None
 
 
 class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
@@ -236,7 +237,9 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
         if prompt.video_bytes is not None:
             media["video"] = [self.decode_video(prompt.video_bytes)]
             content.append({"type": "video", "video": "provided-array"})
-        content.append({"type": "text", "text": self.render(prompt)})
+        isolated = self.config.architecture == "isolated_evidence_v1"
+        text = self.config.task_prompt + "\nState: " + literal(prompt.state) + "\n" if isolated else self.render(prompt)
+        content.append({"type": "text", "text": text})
         with self.lock:
             rendered = self.processor.apply_chat_template(
                 [
@@ -247,6 +250,22 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
                 add_generation_prompt=False,
             )
             ids = self.processor.tokenizer.encode(rendered, add_special_tokens=False)
+            if isolated:
+                from .decision_layout import pack_candidates
+
+                ending = self.processor.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+                if ids[-len(ending) :] != ending:
+                    raise ValueError("Evidence chat template has an unexpected ending")
+                questions = {
+                    str(index): {
+                        "type": question.type,
+                        "instructions": question.instructions,
+                        "criteria": dict(enumerate(candidates(question))),
+                    }
+                    for index, question in enumerate(prompt.request.questions)
+                }
+                ids, layout = pack_candidates(self.processor.tokenizer, ids[: -len(ending)], questions)
+                prompt.decision_layout = layout.to_dict()
         result = {"prompt_token_ids": ids}
         if media:
             result["multi_modal_data"] = media
@@ -254,6 +273,14 @@ class SPEVProcessor(IOProcessor[SPEVInput, list[DecisionAnswer] | list[float]]):
 
     def merge_pooling_params(self, params=None):
         return PoolingParams(task="plugin", requires_token_ids=True)
+
+    def prepare_pooling_params(self, prompt: SPEVInput, params=None):
+        params = self.merge_pooling_params(params)
+        if self.config.architecture == "isolated_evidence_v1":
+            if prompt.decision_layout is None:
+                raise ValueError("SPEV input must be preprocessed before preparing pooling parameters")
+            params.extra_kwargs = {"spev_layout": prompt.decision_layout}
+        return params
 
     def post_process(
         self,

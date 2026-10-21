@@ -15,8 +15,11 @@ architecture in the model registry. A decision model provides:
 - An installed `vllm.io_processor_plugins` entry point selected by the model's
   Hugging Face `config.json` through `io_processor_plugin`.
 
-The route invokes `parse_data`, `pre_process`, `EngineClient.encode`, and
-`post_process`. It passes the parsed input to `post_process` as `prompt`, so a
+The route invokes `parse_data`, `pre_process`, `prepare_pooling_params`,
+`EngineClient.encode`, and `post_process`. Parameter preparation receives the
+parsed input after preprocessing and returns request-local `PoolingParams`.
+The default implementation delegates to `merge_pooling_params`.
+The route passes the parsed input to `post_process` as `prompt`, so a
 processor can interpret request-specific questions without retaining shared
 request state. Decisions processors return the shared `DecisionAnswer` types.
 The current Decisions route requires one prepared prompt and one pooled result
@@ -38,8 +41,13 @@ Oversized requests return HTTP 413. Model-specific media limits still apply.
 ## SPEV
 
 SPEV uses a Qwen3-Omni backbone, FP32 residual adapters, and a contextual
-candidate head. Its pooler reads candidate anchor positions from native pooling
-metadata and returns the scores through ordinary pooling outputs.
+candidate head. Isolated-head checkpoints share an evidence prefix, keep
+candidate attention within its own branch, and score all questions in a batch
+with one head invocation. Scores use ordinary pooling outputs.
+
+Isolated-head checkpoints require vLLM's `SupportsPoolingMetadata` interface.
+The model receives request-aligned pooling metadata before its forward pass;
+the existing MLP checkpoint format does not require that interface.
 
 Standalone Transformers checkpoints select `SPEVModel`. The native loader reads
 the nested Thinker configuration and indexed backbone, adapter, and head tensors.
@@ -50,7 +58,7 @@ required. Select the `spev_decisions` I/O processor when serving this format.
 separate, hash-verified `adapter.safetensors` and `head.safetensors` files.
 
 ```bash
-vllm serve /models/spev --omni --runner pooling \
+VLLM_BATCH_INVARIANT=0 vllm-omni serve /models/spev --omni --runner pooling \
   --trust-remote-code --io-processor-plugin spev_decisions \
   --served-model-name spev --dtype bfloat16 --max-model-len 8192 \
   --enforce-eager --no-enable-chunked-prefill --no-enable-prefix-caching \
@@ -61,6 +69,10 @@ vllm serve /models/spev --omni --runner pooling \
 SPEV currently requires TP=1 and PP=1 with complete eager prefills. The normal
 vLLM scheduler batches requests. The head produces all candidate scores in one
 prefill, without generating a completion token.
+Isolated-head checkpoints require unquantized BF16 weights and
+`VLLM_FLOAT32_MATMUL_PRECISION=highest` (the default). Their model implementation
+preserves checkpoint arithmetic and isolates each request and candidate branch;
+vLLM's global batch-invariant kernels must remain disabled.
 
 ```json
 {

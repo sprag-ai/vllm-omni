@@ -38,6 +38,9 @@ class AlternateProcessor:
     def merge_pooling_params(self):
         return PoolingParams(task="plugin")
 
+    def prepare_pooling_params(self, prompt):
+        return self.merge_pooling_params()
+
     def post_process(self, output, *, prompt, request_id):
         assert prompt.questions[0].name == "condition"
         return [{"type": "predicate", "name": "condition", "probability": 0.75}]
@@ -118,7 +121,7 @@ def test_http_usage_preserves_upstream_multimodal_counts(monkeypatch, modalities
         counted.append(prompt)
         return _get_mm_token_counts(prompt)
 
-    class NativeRenderer:
+    class NativeRenderer(Renderer):
         async def render_cmpl_async(self, prompts):
             return [engine_input]
 
@@ -331,7 +334,7 @@ def test_video_http_forwarding_and_native_token_accounting(monkeypatch, video_fa
 
     processor.post_process = post_process
 
-    class VideoRenderer:
+    class VideoRenderer(Renderer):
         async def render_cmpl_async(self, prompts):
             (prompt,) = prompts
             assert set(prompt["multi_modal_data"]) == {"video"}

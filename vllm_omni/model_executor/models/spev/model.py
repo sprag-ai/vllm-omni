@@ -5,6 +5,10 @@
 import torch
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder as TransformersAudioEncoder,
+)
+from vllm import envs
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -13,8 +17,27 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.spev.attention_backend import checkpoint_attention
+from vllm_omni.model_executor.models.spev.checkpoint_ops import (
+    CheckpointDecoderLayer,
+    CheckpointExperts,
+    CheckpointLinear,
+    CheckpointQKV,
+    CheckpointRotary,
+)
 from vllm_omni.model_executor.models.spev.config import SPEVConfig
-from vllm_omni.model_executor.models.spev.pooler import CandidatePooler, OptionHead
+from vllm_omni.model_executor.models.spev.decision_head import IsolatedDecisionHead
+from vllm_omni.model_executor.models.spev.isolated_attention import IsolatedAttention, isolated_batch
+from vllm_omni.model_executor.models.spev.normalization import CheckpointRMSNorm
+from vllm_omni.model_executor.models.spev.pooler import (
+    CandidatePooler,
+    IsolatedCandidatePooler,
+    OptionHead,
+    decision_layouts,
+)
+from vllm_omni.model_executor.models.spev.vision import CheckpointVisionEncoder
+
+MISSING_POOLING_METADATA = object()
 
 
 class SPEVProcessingInfo(Qwen3OmniMoeThinkerProcessingInfo):
@@ -54,8 +77,94 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
             self.language_model.lm_head = torch.nn.Identity()
         self.spev_config = SPEVConfig.from_hf(hf_config, tokenizer)
         self.spev_model_config = vllm_config.model_config
-        head = OptionHead(self.spev_config.hidden_size, self.spev_config.width).float().cpu().eval()
-        self.pooler = CandidatePooler(head, self.spev_config.marker_token_ids)
+        self.supports_pooling_metadata = self.spev_config.architecture == "isolated_evidence_v1"
+        if self.supports_pooling_metadata:
+            config = self.spev_config
+            if envs.VLLM_BATCH_INVARIANT:
+                raise ValueError("SPEV isolated checkpoints require VLLM_BATCH_INVARIANT=0")
+            if vllm_config.model_config.dtype != torch.bfloat16 or vllm_config.quant_config is not None:
+                raise ValueError("SPEV isolated checkpoints require unquantized BF16 weights")
+            if envs.VLLM_FLOAT32_MATMUL_PRECISION != "highest":
+                raise ValueError("SPEV isolated checkpoints require highest FP32 matmul precision")
+            thinker_config = hf_config.thinker_config if self.standalone_checkpoint else hf_config
+            thinker_config.audio_config._attn_implementation = "sdpa"
+            self.audio_tower = TransformersAudioEncoder(thinker_config.audio_config)
+            thinker_config.vision_config._attn_implementation = "sdpa"
+            self.visual = CheckpointVisionEncoder(thinker_config.vision_config)
+            head = IsolatedDecisionHead(
+                config.hidden_size, config.width, config.head_heads, config.head_ff, config.head_depth
+            )
+            self.pooler = IsolatedCandidatePooler(head.float().eval(), self._embed_criteria)
+            for layer in self.language_model.model.layers:
+                layer.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
+                layer.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
+                layer.self_attn.q_norm = CheckpointRMSNorm(layer.self_attn.q_norm)
+                layer.self_attn.k_norm = CheckpointRMSNorm(layer.self_attn.k_norm)
+                layer.self_attn = IsolatedAttention(layer.self_attn)
+                attention = layer.self_attn
+                attention.qkv_proj = CheckpointQKV(attention.qkv_proj, attention.q_size, attention.kv_size)
+                attention.o_proj = CheckpointLinear(attention.o_proj)
+                attention.rotary_emb = CheckpointRotary(
+                    thinker_config.text_config, attention.qkv_proj.weight.device, attention.head_dim
+                )
+                layer.mlp = CheckpointExperts(layer.mlp, thinker_config.text_config)
+            for index in range(len(thinker_config.vision_config.deepstack_visual_indexes)):
+                self.language_model.model.layers[index] = CheckpointDecoderLayer(
+                    self.language_model.model.layers[index]
+                )
+            self.language_model.model.norm = CheckpointRMSNorm(self.language_model.model.norm)
+        else:
+            head = OptionHead(self.spev_config.hidden_size, self.spev_config.width).float().cpu().eval()
+            self.pooler = CandidatePooler(head, self.spev_config.marker_token_ids)
+
+    def _embed_criteria(self, ids):
+        return self.language_model.model.embed_tokens(ids)
+
+    def _process_audio_input(self, audio_input):
+        if not self.supports_pooling_metadata:
+            return super()._process_audio_input(audio_input)
+        features = audio_input["input_features"].to(self.audio_tower.dtype)
+        lengths = audio_input["audio_feature_lengths"].to(features.device)
+        outputs, offset = [], 0
+        with checkpoint_attention():
+            for index, length in enumerate(lengths.tolist()):
+                outputs.append(
+                    self.audio_tower(
+                        features[:, offset : offset + length], feature_lens=lengths[index : index + 1]
+                    ).last_hidden_state
+                )
+                offset += length
+        if offset != features.shape[-1]:
+            raise ValueError("SPEV audio features do not match their sequence lengths")
+        return tuple(outputs)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        pooling_metadata=MISSING_POOLING_METADATA,
+        **kwargs,
+    ):
+        if not self.supports_pooling_metadata:
+            return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        if pooling_metadata is MISSING_POOLING_METADATA:
+            raise RuntimeError("This SPEV checkpoint requires vLLM pooling metadata input support")
+        if pooling_metadata is None:
+            return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        layouts = decision_layouts(pooling_metadata)
+        if sum(layout.tree.length for layout in layouts) != positions.shape[-1]:
+            raise ValueError("SPEV requires complete prefills for every batched request")
+        positions = positions.clone()
+        offset = 0
+        for layout in layouts:
+            tree = layout.tree
+            prefix = positions[:, offset : offset + tree.prefix_length][:, None, :]
+            positions[:, offset : offset + tree.length] = tree.position_ids(prefix)[:, 0]
+            offset += tree.length
+        with isolated_batch(layouts), checkpoint_attention():
+            return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
     def load_weights(self, weights):
         device = next(self.language_model.parameters()).device
@@ -87,6 +196,8 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
             )
         self.pooler.head.load_state_dict(head)
         self.pooler.head.requires_grad_(False)
+        if self.spev_config.architecture == "isolated_evidence_v1":
+            self.pooler.head.to(device=device, dtype=torch.float32)
         scale = self.spev_config.alpha / self.spev_config.rank
         self._spev_adapter = tensors
         self._spev_handles = []
@@ -99,6 +210,9 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
             if any(t.dtype != torch.float32 for t in (qa, qb, va, vb)):
                 raise ValueError("SPEV adapter requires FP32 tensors")
             consumed.update(keys)
+            if self.spev_config.architecture == "isolated_evidence_v1":
+                layer.self_attn.qkv_proj.bind_adapters(qa, qb, va, vb, scale)
+                continue
 
             def apply(module, args, output, qa=qa, qb=qb, va=va, vb=vb):
                 result, bias = output
