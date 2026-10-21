@@ -15,7 +15,7 @@ from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
 from .branch_attention import REQUEST
 from .isolated_attention import LAYOUTS
-from .token_operations import PackingCache, grouped_forward
+from .token_operations import BatchPackingCache, PackingCache, grouped_forward
 
 
 class CheckpointDecoderLayer(Qwen3MoeDecoderLayer):
@@ -49,6 +49,29 @@ def canonical_projection(value, operation):
     return torch.cat(outputs)
 
 
+def batched_linear(value, weight, bias=None):
+    if value.ndim != 3 or value.shape[0] == 1:
+        return nn.functional.linear(value, weight, bias)
+    if value.dtype == torch.float32:
+        # Preserve the checkpoint adapters' per-matrix FP32 accumulation.
+        return torch.stack([nn.functional.linear(matrix, weight, bias) for matrix in value])
+    matrices = weight.T.expand(value.shape[0], -1, -1)
+    if bias is None:
+        return torch.bmm(value, matrices)
+    return torch.baddbmm(bias.expand(value.shape[0], value.shape[1], -1), value, matrices)
+
+
+def batch_projection(value, operation, *, batch_prefix=True):
+    requests = LAYOUTS.get()
+    if requests is None:
+        return operation(value)
+    if not requests or requests[-1][1] != len(value):
+        raise ValueError("Decision projections require complete request prefills")
+    if requests.projection is None:
+        requests.projection = BatchPackingCache(requests, value.device)
+    return requests.projection.forward(value, operation, batch_prefix=batch_prefix)
+
+
 class CheckpointLinear(nn.Module):
     def __init__(self, source):
         super().__init__()
@@ -56,7 +79,7 @@ class CheckpointLinear(nn.Module):
         self.bias = source.bias
 
     def forward(self, value):
-        return canonical_projection(value, lambda x: nn.functional.linear(x, self.weight, self.bias)), None
+        return batch_projection(value, lambda x: batched_linear(x, self.weight, self.bias), batch_prefix=False), None
 
 
 class CheckpointQKV(CheckpointLinear):
@@ -84,15 +107,15 @@ class CheckpointQKV(CheckpointLinear):
             biases = self.bias.split(sizes) if self.bias is not None else (None, None, None)
             outputs = []
             for weight, bias, adapter in zip(weights, biases, self._adapters):
-                output = nn.functional.linear(x, weight, bias)
+                output = batched_linear(x, weight, bias)
                 if adapter is not None:
                     a, b = adapter
-                    residual = nn.functional.linear(nn.functional.linear(x.float(), a), b) * self.scale
+                    residual = batched_linear(batched_linear(x.float(), a), b) * self.scale
                     output = output + residual.to(x.dtype)
                 outputs.append(output)
             return torch.cat(outputs, dim=-1)
 
-        return canonical_projection(value, operation), None
+        return batch_projection(value, operation), None
 
 
 class CheckpointRotary(nn.Module):
@@ -149,6 +172,9 @@ class CheckpointExperts(nn.Module):
 
     def forward(self, value):
         requests = LAYOUTS.get()
-        if requests is None:
+        if requests is None or len(requests) == 1:
             return self._forward_request(value)
-        return torch.cat([self._forward_request(value[start:end]) for start, end, _, _ in requests])
+        routing = [Qwen3OmniMoeThinkerTextTopKRouter.forward(self, value[start:end]) for start, end, _, _ in requests]
+        weights = torch.cat([item[1] for item in routing])
+        indices = torch.cat([item[2] for item in routing])
+        return Qwen3OmniMoeThinkerTextExperts.forward(self, value, indices, weights)

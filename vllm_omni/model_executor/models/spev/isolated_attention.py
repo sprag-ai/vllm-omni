@@ -8,15 +8,22 @@ from contextvars import ContextVar
 import torch
 from torch import nn
 
-from .branch_attention import REQUEST, RequestMaskCache, branch_attention
+from .branch_attention import BatchAttentionPlan, RequestMaskCache
 
 LAYOUTS = ContextVar("spev_batch_layouts", default=None)
+
+
+class BatchLayouts(list):
+    def __init__(self):
+        super().__init__()
+        self.projection = None
+        self.attention = None
 
 
 @contextmanager
 def isolated_batch(layouts):
     offset = 0
-    requests = []
+    requests = BatchLayouts()
     for layout in layouts:
         requests.append((offset, offset + layout.tree.length, layout.tree, RequestMaskCache()))
         offset += layout.tree.length
@@ -47,16 +54,13 @@ class IsolatedAttention(nn.Module):
         else:
             if not requests or requests[-1][1] != len(query):
                 raise ValueError("Decision attention requires complete request prefills")
-            output = torch.empty_like(query)
-            for start, end, tree, cache in requests:
-                q = query[start:end].view(1, end - start, self.num_heads, self.head_dim).transpose(1, 2)
-                k = key[start:end].view(1, end - start, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                v = value[start:end].view(1, end - start, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                token = REQUEST.set((tree, cache))
-                try:
-                    result, _ = branch_attention(self, q, k, v, scaling=self.scaling)
-                finally:
-                    REQUEST.reset(token)
-                output[start:end] = result.reshape(end - start, self.q_size)
+            if requests.attention is None:
+                requests.attention = BatchAttentionPlan(requests, query.device)
+            output = requests.attention.forward(
+                query.view(-1, self.num_heads, self.head_dim),
+                key.view(-1, self.num_kv_heads, self.head_dim),
+                value.view(-1, self.num_kv_heads, self.head_dim),
+                self.scaling,
+            ).reshape(-1, self.q_size)
         result, _ = self.o_proj(output)
         return result
