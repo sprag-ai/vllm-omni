@@ -54,7 +54,8 @@ class IsolatedDecisionHead(nn.Module):
         self.gate = nn.Parameter(torch.zeros(()))
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        memory = self.memory(self.norm(batch["memory"]))
+        projected = self.memory(self.norm(batch["memory"]))
+        memory = nn.utils.rnn.pad_sequence(projected.split(batch["memory_lengths"].tolist()), batch_first=True)
         question = self.norm(batch["questions"])
         context = self.norm(batch["options"])
         global_feature = self.norm(batch["global"])
@@ -101,13 +102,14 @@ def score_questions(head: IsolatedDecisionHead, records: list[QuestionFeatures])
     batch = {
         name: torch.zeros(shape, device=device, dtype=torch.float32)
         for name, shape in {
-            "memory": (len(records), memories, hidden),
             "questions": (len(records), 1, hidden),
             "options": (len(records), candidates, hidden),
             "lexical": (len(records), candidates, hidden),
             "global": (len(records), hidden),
         }.items()
     }
+    batch["memory"] = torch.cat([record.memory.to(device=device, dtype=torch.float32) for record in records])
+    batch["memory_lengths"] = torch.tensor([len(record.memory) for record in records], device="cpu")
     batch["memory_pad"] = torch.ones(len(records), memories, device=device, dtype=torch.bool)
     batch["option_pad"] = torch.ones(len(records), candidates, device=device, dtype=torch.bool)
     batch["types"] = torch.tensor([[record.question_type] for record in records], device=device)
@@ -116,7 +118,7 @@ def score_questions(head: IsolatedDecisionHead, records: list[QuestionFeatures])
             raise ValueError("Invalid question features")
         if record.lexical.shape != record.options.shape:
             raise ValueError("Criterion embeddings must match candidate features")
-        for name, value in (("memory", record.memory), ("options", record.options), ("lexical", record.lexical)):
+        for name, value in (("options", record.options), ("lexical", record.lexical)):
             batch[name][index, : len(value)] = value.to(device=device, dtype=torch.float32)
         batch["questions"][index, 0] = record.question.to(device=device, dtype=torch.float32)
         batch["global"][index] = record.global_feature.to(device=device, dtype=torch.float32)
