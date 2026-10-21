@@ -41,7 +41,12 @@ jobs:
             exit 1
           }
           commit="$(git rev-parse HEAD)"
-          image="ghcr.io/sprag-ai/native-audio-decision:0.30.1.dev1.${commit}"
+          version="$(sed -n 's/^ARG PACKAGE_VERSION=//p' docker/Dockerfile.audio-decision-openai)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.dev[0-9]+)?$ ]] || {
+            echo '::error::Expected a package version in the native serving Dockerfile'
+            exit 1
+          }
+          image="ghcr.io/sprag-ai/native-audio-decision:${version}.${commit}"
           echo "ref=$image" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
