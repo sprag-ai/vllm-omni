@@ -3,9 +3,10 @@
 # introduced in transformers 5.13. Keep the tested upper bound: 5.15 has
 # a reported model-construction regression; later versions need validation.
 # This range also satisfies vLLM 0.30.0's transformers>=5.10.4 requirement.
+# SPEV uses the Qwen3-Omni grouped-expert interface from 5.14.1.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.
-transformers >= 5.13.0, < 5.15
+transformers >= 5.14.1, < 5.15
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.40.0

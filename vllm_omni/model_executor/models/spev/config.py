@@ -15,9 +15,12 @@ PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 class SPEVConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    architecture: Literal["contextual_candidate_mlp_v1"]
+    architecture: Literal["contextual_candidate_mlp_v1", "isolated_evidence_v1"]
     hidden_size: int = Field(gt=0)
     width: int = Field(gt=0)
+    head_heads: int = Field(default=8, gt=0)
+    head_ff: int = Field(default=1024, gt=0)
+    head_depth: int = Field(default=2, gt=0)
     rank: int = Field(gt=0)
     alpha: PositiveFloat
     temperature: PositiveFloat
@@ -43,9 +46,12 @@ class SPEVConfig(BaseModel):
             if tokenizer is None:
                 raise ValueError("SPEV checkpoint requires its tokenizer for scoring markers")
             return cls(
-                architecture="contextual_candidate_mlp_v1",
+                architecture=getattr(hf_config, "head_architecture", "contextual_candidate_mlp_v1"),
                 hidden_size=hf_config.thinker_config.text_config.hidden_size,
                 width=hf_config.head_width,
+                head_heads=getattr(hf_config, "head_heads", 8),
+                head_ff=getattr(hf_config, "head_ff", 1024),
+                head_depth=getattr(hf_config, "head_depth", 2),
                 rank=hf_config.adapter_rank,
                 alpha=hf_config.adapter_alpha,
                 temperature=hf_config.temperature,

@@ -1,0 +1,128 @@
+diff --git a/vllm/entrypoints/pooling/pooling/io_processor.py b/vllm/entrypoints/pooling/pooling/io_processor.py
+index 4b18cfc9e..4f54b622d 100644
+--- a/vllm/entrypoints/pooling/pooling/io_processor.py
++++ b/vllm/entrypoints/pooling/pooling/io_processor.py
+@@ -86,7 +86,7 @@ class PluginWithIOProcessorPlugins(PoolingIOProcessor):
+
+         tok_params = ctx.request.build_tok_params(self.model_config)
+
+-        pooling_params = self.io_processor.merge_pooling_params()
++        pooling_params = self.io_processor.prepare_pooling_params(validated_prompt)
+         if pooling_params.task is None:
+             pooling_params.task = "plugin"
+         ctx.pooling_params = pooling_params
+@@ -168,7 +168,7 @@ class PluginWithIOProcessorPlugins(PoolingIOProcessor):
+             pooling_params = ctx.pooling_params
+
+         params_seq: list[PoolingParams] = [
+-            self.io_processor.merge_pooling_params(param)
++            self.io_processor.prepare_pooling_params(validated_prompt, param)
+             for param in self._params_to_seq(
+                 pooling_params,
+                 num_requests,
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 2e79001ad..3805ef301 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -62,6 +62,7 @@ if TYPE_CHECKING:
+     from vllm.sequence import IntermediateTensors
+     from vllm.tasks import ScoreType
+     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++    from vllm.v1.pool.metadata import PoolingMetadata
+     from vllm.v1.worker.encoder_cudagraph_defs import (
+         EncoderCudaGraphCaptureInputs,
+         EncoderCudaGraphConfig,
+@@ -71,6 +72,22 @@ if TYPE_CHECKING:
+
+ logger = init_logger(__name__)
+
++
++@runtime_checkable
++class SupportsPoolingMetadata(Protocol):
++    """Receive request-aligned pooling metadata during model execution."""
++
++    supports_pooling_metadata: ClassVar[Literal[True]] = True
++
++    def forward(self, *, pooling_metadata: "PoolingMetadata", **kwargs): ...
++
++
++def supports_pooling_metadata(model: object) -> TypeIs[SupportsPoolingMetadata]:
++    return (
++        isinstance(model, SupportsPoolingMetadata) and model.supports_pooling_metadata
++    )
++
++
+ MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
+ """
+ The output embeddings must be one of the following formats:
+diff --git a/vllm/plugins/io_processors/interface.py b/vllm/plugins/io_processors/interface.py
+index 15ba2ba88..55804e1cf 100644
+--- a/vllm/plugins/io_processors/interface.py
++++ b/vllm/plugins/io_processors/interface.py
+@@ -38,6 +38,14 @@ class IOProcessor(ABC, Generic[IOProcessorInput, IOProcessorOutput]):
+     ) -> PoolingParams:
+         return params or PoolingParams(task="plugin")
+
++    def prepare_pooling_params(
++        self,
++        prompt: IOProcessorInput,
++        params: PoolingParams | None = None,
++    ) -> PoolingParams:
++        """Build parameters after preprocessing the request-local input."""
++        return self.merge_pooling_params(params)
++
+     @abstractmethod
+     def pre_process(
+         self,
+diff --git a/vllm/v1/pool/metadata.py b/vllm/v1/pool/metadata.py
+index ffa14fbb0..e2d2aa10a 100644
+--- a/vllm/v1/pool/metadata.py
++++ b/vllm/v1/pool/metadata.py
+@@ -64,6 +64,7 @@ class PoolingMetadata:
+     pooling_params: list[PoolingParams]
+     pooling_states: list[PoolingStates]
+     pooling_cursor: PoolingCursor | None = None
++    is_dummy: bool = False
+
+     def __post_init__(self) -> None:
+         pooling_params = self.pooling_params
+@@ -95,6 +96,7 @@ class PoolingMetadata:
+             pooling_cursor=None
+             if self.pooling_cursor is None
+             else self.pooling_cursor[indices],
++            is_dummy=self.is_dummy,
+         )
+
+     def _get_prompt_token_ids(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 97a59bd27..d2402235b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -85,6 +85,7 @@ from vllm.model_executor.models.interfaces import (
+     supports_eagle3,
+     supports_mrope,
+     supports_multimodal_pruning,
++    supports_pooling_metadata,
+     supports_realtime,
+     supports_transcription,
+ )
+@@ -1100,6 +1101,11 @@ class GPUModelRunner(
+         if not self.is_pooling_model:
+             return model_kwargs
+
++        if supports_pooling_metadata(self.get_model()):
++            model_kwargs["pooling_metadata"] = (
++                None if num_reqs == 0 else self.input_batch.get_pooling_metadata()
++            )
++
+         num_reqs = self.input_batch.num_reqs
+         pooling_params = self.input_batch.get_pooling_params()
+
+@@ -6407,6 +6413,7 @@ class GPUModelRunner(
+             prompt_token_ids_cpu=dummy_token_ids.cpu(),
+             pooling_params=[dummy_pooling_params] * num_reqs,
+             pooling_states=[PoolingStates() for i in range(num_reqs)],
++            is_dummy=True,
+         )
+
+         dummy_metadata.build_pooling_cursor(

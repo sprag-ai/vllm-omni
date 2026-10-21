@@ -1,10 +1,16 @@
 # syntax=docker/dockerfile:1
-ARG BASE_IMAGE=vllm/vllm-omni:v0.30.0@sha256:fc77cfaac7b1b43c30cbf32eaea214864434c6e0f303e6e9eb9f64104241a994
+ARG BASE_IMAGE=ghcr.io/sprag-ai/native-audio-decision@sha256:82649e1f66eec7b813240b06824365f156f92636fb97e36387be726b9b6211dd
 FROM ${BASE_IMAGE}
 WORKDIR /opt/vllm-omni-decision
 COPY . .
-RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.30.0 uv pip install --system --no-deps --no-build-isolation .
-ENV HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false VLLM_ENABLE_V1_MULTIPROCESSING=0
+RUN test "$(python -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')" = 0.30.0 \
+    && cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("vllm").origin).parent.parent)')" \
+    && git apply --check /opt/vllm-omni-decision/docker/patches/vllm-pooling-metadata.patch \
+    && git apply /opt/vllm-omni-decision/docker/patches/vllm-pooling-metadata.patch
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.30.1.dev1 uv pip install --system --no-deps --no-build-isolation . \
+    && python -c 'import importlib.metadata; assert importlib.metadata.version("transformers") == "5.14.1"'
+ENV HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_BATCH_INVARIANT=0 VLLM_FLOAT32_MATMUL_PRECISION=highest VLLM_USE_V2_MODEL_RUNNER=0
 EXPOSE 8000
-ENTRYPOINT ["vllm", "serve"]
-CMD ["/models/qwen3-omni", "--omni", "--decision-bundle", "/models/decision", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["vllm-omni", "serve"]
+CMD ["/models/spev", "--omni", "--runner", "pooling", "--trust-remote-code", "--io-processor-plugin", "spev_decisions", "--served-model-name", "spev", "--dtype", "bfloat16", "--enforce-eager", "--no-enable-chunked-prefill", "--no-enable-prefix-caching", "--max-num-seqs", "8", "--max-model-len", "8192", "--max-num-batched-tokens", "16384", "--host", "0.0.0.0", "--port", "8000"]

@@ -69,13 +69,15 @@ class DecisionsServing:
 
             def prepare():
                 parsed = self.processor.parse_data(request)
-                return parsed, self.processor.pre_process(parsed, request_id=request_id)
+                prompt = self.processor.pre_process(parsed, request_id=request_id)
+                params = self.processor.prepare_pooling_params(parsed)
+                return parsed, prompt, params
 
-            parsed, prompt = await asyncio.to_thread(prepare)
+            parsed, prompt, params = await asyncio.to_thread(prepare)
             (engine_input,) = await self.engine.renderer.render_cmpl_async([prompt])
             modalities = _get_mm_token_counts(engine_input)
             result = None
-            async for output in self.engine.encode(engine_input, self.processor.merge_pooling_params(), request_id):
+            async for output in self.engine.encode(engine_input, params, request_id):
                 result = output
         except (ValueError, VLLMClientError, EngineGenerateError) as exc:
             logger.warning("Decision inference failed: %s", type(exc).__name__)

@@ -36,14 +36,12 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor HEAD origin/prototype/audio-decision-v030
           base="$(sed -n 's/^ARG BASE_IMAGE=\(.*\)$/\1/p' docker/Dockerfile.audio-decision-openai)"
-          [[ "$base" =~ ^vllm/vllm-omni:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[a-f0-9]{64}$ ]] || {
-            echo '::error::Expected a versioned, digest-pinned vLLM-Omni base'
+          [[ "$base" =~ ^ghcr.io/sprag-ai/native-audio-decision@sha256:[a-f0-9]{64}$ ]] || {
+            echo '::error::Expected the validated digest-pinned native serving base'
             exit 1
           }
-          version="${base%@*}"
-          version="${version##*:}"
           commit="$(git rev-parse HEAD)"
-          image="ghcr.io/sprag-ai/native-audio-decision:${version}-audio-decision.${commit}"
+          image="ghcr.io/sprag-ai/native-audio-decision:0.30.1.dev1.${commit}"
           echo "ref=$image" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
