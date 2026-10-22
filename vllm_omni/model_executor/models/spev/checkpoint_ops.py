@@ -8,12 +8,12 @@ from transformers.activations import ACT2FN
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextExperts,
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
-    Qwen3OmniMoeThinkerTextTopKRouter,
     apply_rotary_pos_emb,
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
 from .branch_attention import REQUEST
+from .expert_operations import batched_linear, expert_forward
 from .isolated_attention import LAYOUTS
 from .token_operations import BatchPackingCache, PackingCache, grouped_forward
 
@@ -47,18 +47,6 @@ def canonical_projection(value, operation):
         finally:
             REQUEST.reset(token)
     return torch.cat(outputs)
-
-
-def batched_linear(value, weight, bias=None):
-    if value.ndim != 3 or value.shape[0] == 1:
-        return nn.functional.linear(value, weight, bias)
-    if value.dtype == torch.float32:
-        # Preserve the checkpoint adapters' per-matrix FP32 accumulation.
-        return torch.stack([nn.functional.linear(matrix, weight, bias) for matrix in value])
-    matrices = weight.T.expand(value.shape[0], -1, -1)
-    if bias is None:
-        return torch.bmm(value, matrices)
-    return torch.baddbmm(bias.expand(value.shape[0], value.shape[1], -1), value, matrices)
 
 
 def batch_projection(value, operation, *, batch_prefix=True):
@@ -135,11 +123,25 @@ class CheckpointRotary(nn.Module):
         return q.transpose(1, 2).reshape(length, -1), k.transpose(1, 2).reshape(length, -1)
 
 
+class CheckpointExpertWeights(nn.Module):
+    """Reuse upstream loading without applying an unused fused kernel's weight layout."""
+
+    def __init__(self, source):
+        super().__init__()
+        self.routed_experts = nn.Module()
+        for name in ("w13_weight", "w2_weight"):
+            self.routed_experts.register_parameter(name, getattr(source.routed_experts, name))
+        self._load_experts = source.load_weights
+
+    def load_weights(self, weights):
+        return ("routed_experts." + name for name in self._load_experts(weights))
+
+
 class CheckpointExperts(nn.Module):
     def __init__(self, source, config):
         super().__init__()
         self.gate = source.gate
-        self.experts = source.experts
+        self.experts = CheckpointExpertWeights(source.experts)
         self.config = type(config).from_dict(config.to_dict())
         self.config._experts_implementation = "grouped_mm"
         self.hidden_dim = config.hidden_size
@@ -166,15 +168,14 @@ class CheckpointExperts(nn.Module):
     def _apply_gate(self, value):
         return Qwen3OmniMoeThinkerTextExperts._apply_gate(self, value)
 
-    def _forward_request(self, value):
-        _, weights, indices = Qwen3OmniMoeThinkerTextTopKRouter.forward(self, value)
-        return Qwen3OmniMoeThinkerTextExperts.forward(self, value, indices, weights)
-
     def forward(self, value):
         requests = LAYOUTS.get()
-        if requests is None or len(requests) == 1:
-            return self._forward_request(value)
-        routing = [Qwen3OmniMoeThinkerTextTopKRouter.forward(self, value[start:end]) for start, end, _, _ in requests]
-        weights = torch.cat([item[1] for item in routing])
-        indices = torch.cat([item[2] for item in routing])
-        return Qwen3OmniMoeThinkerTextExperts.forward(self, value, indices, weights)
+        if value.dtype == torch.float32 and requests:
+            logits = torch.cat([nn.functional.linear(value[start:end], self.weight) for start, end, _, _ in requests])
+        else:
+            logits = canonical_projection(value, lambda part: nn.functional.linear(part, self.weight))
+        probabilities = logits.softmax(-1, dtype=torch.float32)
+        weights, indices = probabilities.topk(self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            weights = weights / weights.sum(-1, keepdim=True)
+        return expert_forward(self, value, indices, weights.to(logits.dtype))
