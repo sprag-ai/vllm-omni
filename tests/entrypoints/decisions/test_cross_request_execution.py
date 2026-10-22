@@ -52,9 +52,32 @@ def test_projection_ragged_order_gradients_and_grouping(dtype, bias, monkeypatch
     torch.testing.assert_close(repeated, actual.detach(), atol=0, rtol=0)
     if dtype == torch.bfloat16:
         assert calls and max(shape[0] for shape in calls) > 1
-        assert all(shape[1] % 256 == 0 for shape in calls)
+        assert all(shape[1] % 32 == 0 for shape in calls)
     else:
         assert not calls
+
+
+def test_long_criterion_projection_preserves_checkpoint_slot_shape(monkeypatch):
+    torch.manual_seed(79)
+    layouts = [CandidateTree(39, (7620, 22)), CandidateTree(6536, (22, 22))]
+    items = [SimpleNamespace(tree=tree) for tree in layouts]
+    source = nn.Linear(16, 12).to(torch.bfloat16)
+    model = CheckpointLinear(source)
+    value = torch.randn(sum(tree.length for tree in layouts), 16, dtype=torch.bfloat16)
+    shapes = []
+    product = torch.baddbmm
+
+    def checked_product(bias, left, right):
+        shapes.append(left.shape)
+        return product(bias, left, right)
+
+    monkeypatch.setattr(torch, "baddbmm", checked_product)
+    with torch.no_grad(), isolated_batch(items):
+        actual, _ = model(value)
+        expected = canonical_projection(value, source)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert max(shape[1] for shape in shapes) == 7648
+    assert all(shape[0] % 8 == 0 for shape in shapes)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
