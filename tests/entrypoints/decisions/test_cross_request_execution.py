@@ -113,3 +113,36 @@ def test_batch_metadata_expires_with_context_and_restores_nested_context():
         with pytest.raises(ValueError, match="complete request"):
             model(torch.ones(6, 4))
     assert LAYOUTS.get() is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA prefix-attention batch regression")
+def test_cuda_long_prefix_retains_checkpoint_attention_shape(monkeypatch):
+    from torch.nn import functional as F
+
+    from vllm_omni.model_executor.models.spev.attention_backend import checkpoint_attention
+    from vllm_omni.model_executor.models.spev.isolated_attention import LAYOUTS
+
+    torch.manual_seed(943)
+    tree = CandidateTree(331, (26, 26, 25, 25, 26, 26))
+    q = torch.randn(tree.length, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(tree.length, 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    calls = []
+    original = F.scaled_dot_product_attention
+
+    def attention(query, *args, **kwargs):
+        calls.append((len(query), kwargs.get("is_causal", False)))
+        return original(query, *args, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", attention)
+    expected = None
+    with torch.no_grad(), checkpoint_attention():
+        for count in (1, 2, 4):
+            with isolated_batch([SimpleNamespace(tree=tree)] * count):
+                plan = BatchAttentionPlan(LAYOUTS.get(), q.device)
+                actual = plan.forward(q.repeat(count, 1, 1), k.repeat(count, 1, 1), v.repeat(count, 1, 1), 128**-0.5)
+            if expected is None:
+                expected = actual.clone()
+            torch.testing.assert_close(actual[: tree.length], expected, atol=0, rtol=0)
+    assert all(count == 1 for count, causal in calls if causal)
+    assert any(count > 8 for count, causal in calls if not causal)
