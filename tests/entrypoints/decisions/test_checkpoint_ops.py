@@ -73,7 +73,8 @@ def test_qkv_delegates_loading_with_native_shard_metadata():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_experts_reuse_loaded_weights_and_match_hf_grouped_mm(dtype):
+@pytest.mark.parametrize("lengths", [(9,), (9, 9), (9, 5, 13)])
+def test_experts_reuse_loaded_weights_and_match_hf_grouped_mm(dtype, lengths, monkeypatch):
     torch.manual_seed(78)
     config = Qwen3OmniMoeTextConfig(hidden_size=16, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=8)
     config._experts_implementation = "grouped_mm"
@@ -92,11 +93,42 @@ def test_experts_reuse_loaded_weights_and_match_hf_grouped_mm(dtype):
     assert model.gate_up_proj is reference.experts.gate_up_proj
     assert model.down_proj is reference.experts.down_proj
     assert len(list(model.parameters())) == 3
-    value = torch.randn(18, 16, dtype=dtype)
-    with torch.no_grad(), isolated_batch(layouts()):
+    value = torch.randn(sum(lengths), 16, dtype=dtype)
+    with torch.no_grad():
+        expected = torch.cat([reference(part[None])[0] for part in value.split(lengths)])
+    from types import SimpleNamespace
+
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeThinkerTextExperts,
+        Qwen3OmniMoeThinkerTextTopKRouter,
+    )
+
+    calls = []
+    expert_forward = Qwen3OmniMoeThinkerTextExperts.forward
+    router_forward = Qwen3OmniMoeThinkerTextTopKRouter.forward
+
+    def experts(self, hidden, indices, weights):
+        calls.append(("experts", len(hidden)))
+        return expert_forward(self, hidden, indices, weights)
+
+    def router(self, hidden):
+        calls.append(("router", len(hidden)))
+        return router_forward(self, hidden)
+
+    monkeypatch.setattr(Qwen3OmniMoeThinkerTextExperts, "forward", experts)
+    monkeypatch.setattr(Qwen3OmniMoeThinkerTextTopKRouter, "forward", router)
+    items = [SimpleNamespace(tree=CandidateTree(1, (length - 1,))) for length in lengths]
+    with torch.no_grad(), isolated_batch(items):
         actual = model(value)
-        expected = torch.cat([reference(value[:9][None])[0], reference(value[9:][None])[0]])
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual, expected, atol=1e-8 if dtype == torch.float32 and lengths == (9, 5, 13) else 0, rtol=0
+    )
+    assert calls == [("router", length) for length in lengths] + [("experts", sum(lengths))]
+    value.requires_grad_()
+    with isolated_batch(items):
+        model(value)[0].sum().backward()
+    assert value.grad[0].abs().sum() > 0
+    assert torch.count_nonzero(value.grad[1:]) == 0
 
 
 def test_attention_scope_restores_imported_runtime_defaults():

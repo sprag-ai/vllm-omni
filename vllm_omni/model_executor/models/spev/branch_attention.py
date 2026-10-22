@@ -5,11 +5,32 @@
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 import torch
 from torch.nn import functional as F
 
 REQUEST = ContextVar("spev_attention_request", default=None)
+
+
+@dataclass(frozen=True)
+class AttentionBlock:
+    width: int
+    branches: tuple[tuple[int, int], ...]
+    allowed: torch.Tensor
+    query_indices: torch.Tensor
+    key_indices: torch.Tensor
+    query_padding: torch.Tensor
+    key_padding: torch.Tensor
+    output_indices: torch.Tensor
+    valid_indices: torch.Tensor
+
+    def pack(self, value, *, keys=False):
+        indices = self.key_indices if keys else self.query_indices
+        padding = self.key_padding if keys else self.query_padding
+        heads, _, dim = value.shape
+        packed = value.index_select(1, indices).reshape(heads, 8, -1, dim).transpose(0, 1).contiguous()
+        return packed.masked_fill(padding[:, None, :, None], 0)
 
 
 class RequestMaskCache:
@@ -42,7 +63,29 @@ class RequestMaskCache:
                     allowed[slot, 0, :length, p : p + length] = torch.ones(
                         length, length, device=device, dtype=torch.bool
                     ).tril()
-                plan.append((width, block, allowed))
+                positions = torch.arange(width, device=device)[None, :]
+                starts = torch.tensor([s for s, _ in block] + [0] * (8 - len(block)), device=device)[:, None]
+                lengths = torch.tensor([n for _, n in block] + [0] * (8 - len(block)), device=device)[:, None]
+                query_padding = positions >= lengths
+                query_indices = (starts + positions).masked_fill(query_padding, 0)
+                prefix = torch.arange(p, device=device)[None, :].expand(8, -1)
+                prefix_padding = (lengths == 0).expand(-1, p)
+                key_padding = torch.cat((prefix_padding, query_padding), dim=1)
+                key_indices = torch.cat((prefix, query_indices), dim=1).masked_fill(key_padding, 0)
+                valid_indices = (~query_padding).flatten().nonzero().flatten()
+                plan.append(
+                    AttentionBlock(
+                        width,
+                        tuple(block),
+                        allowed,
+                        query_indices.flatten(),
+                        key_indices.flatten(),
+                        query_padding,
+                        key_padding,
+                        query_indices.flatten()[valid_indices],
+                        valid_indices,
+                    )
+                )
         self.tree = tree
         self.device = device
         self.plan = plan
@@ -54,8 +97,77 @@ class RequestMaskCache:
             builds=self.builds,
             hits=self.hits,
             blocks=len(self.plan or []),
-            branches=sum(len(block) for _, block, _ in self.plan or []),
+            branches=sum(len(block.branches) for block in self.plan or []),
         )
+
+
+class BatchAttentionPlan:
+    """Combine equally shaped attention blocks with independent batch masks."""
+
+    max_packed_key_tokens = 65536
+
+    def __init__(self, requests, device):
+        prefixes, branches = defaultdict(list), defaultdict(list)
+        for start, _, tree, cache in requests:
+            p = tree.prefix_length
+            prefixes[p].append(torch.arange(start, start + p, device=device))
+            for block in cache(tree, device):
+                branches[(p, block.width)].append((start, block))
+        self.prefixes = [(p, len(items), torch.cat(items)) for p, items in prefixes.items()]
+        self.branches = []
+        for (prefix, width), items in branches.items():
+            limit = max(1, self.max_packed_key_tokens // (8 * (prefix + width)))
+            bucket = items
+            for begin in range(0, len(bucket), limit):
+                items = bucket[begin : begin + limit]
+                count = 8 * len(items)
+                self.branches.append(
+                    (
+                        width,
+                        prefix + width,
+                        count,
+                        torch.cat([block.query_indices + start for start, block in items]),
+                        torch.cat([block.key_indices + start for start, block in items]),
+                        torch.cat([block.query_padding for _, block in items]),
+                        torch.cat([block.key_padding for _, block in items]),
+                        torch.cat([block.allowed for _, block in items]),
+                        torch.cat([block.output_indices + start for start, block in items]),
+                        torch.cat([block.valid_indices + i * 8 * width for i, (_, block) in enumerate(items)]),
+                    )
+                )
+
+    def forward(self, query, key, value, scaling):
+        heads, dim = query.shape[1:]
+        groups = heads // key.shape[1]
+        if groups > 1:
+            key = key.repeat_interleave(groups, dim=1)
+            value = value.repeat_interleave(groups, dim=1)
+        output = torch.empty_like(query)
+
+        def pack(source, indices, count, width, padding=None):
+            result = source.index_select(0, indices).view(count, width, heads, dim).transpose(1, 2).contiguous()
+            return result if padding is None else result.masked_fill(padding[:, None, :, None], 0)
+
+        for width, count, indices in self.prefixes:
+            result = F.scaled_dot_product_attention(
+                pack(query, indices, count, width),
+                pack(key, indices, count, width),
+                pack(value, indices, count, width),
+                is_causal=True,
+                scale=scaling,
+            )
+            output.index_copy_(0, indices, result.transpose(1, 2).reshape(-1, heads, dim))
+        for width, key_width, count, qi, ki, qp, kp, allowed, oi, valid in self.branches:
+            result = F.scaled_dot_product_attention(
+                pack(query, qi, count, width, qp),
+                pack(key, ki, count, key_width, kp),
+                pack(value, ki, count, key_width, kp),
+                attn_mask=allowed,
+                scale=scaling,
+            )
+            selected = result.transpose(1, 2).reshape(-1, heads, dim).index_select(0, valid)
+            output.index_copy_(0, oi, selected)
+        return output
 
 
 def branch_attention(
@@ -80,20 +192,13 @@ def branch_attention(
     )
     cache = request[1]
     heads, dim = query.shape[1], query.shape[-1]
-    batch_slots = 8
-    for width, block, allowed in cache(tree, query.device):
-        q = query.new_zeros(batch_slots, heads, width, dim)
-        k = key.new_zeros(batch_slots, heads, p + width, dim)
-        v = value.new_zeros(batch_slots, heads, p + width, dim)
-        for slot, (start, length) in enumerate(block):
-            q[slot, :, :length] = query[0, :, start : start + length]
-            k[slot, :, :p] = key[0, :, :p]
-            v[slot, :, :p] = value[0, :, :p]
-            k[slot, :, p : p + length] = key[0, :, start : start + length]
-            v[slot, :, p : p + length] = value[0, :, start : start + length]
-        values = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, scale=scaling)
-        for slot, (start, length) in enumerate(block):
-            output[0, :, start : start + length] = values[slot, :, :length]
+    for block in cache(tree, query.device):
+        q = block.pack(query[0])
+        k = block.pack(key[0], keys=True)
+        v = block.pack(value[0], keys=True)
+        values = F.scaled_dot_product_attention(q, k, v, attn_mask=block.allowed, scale=scaling)
+        selected = values.transpose(1, 2).reshape(8 * block.width, heads, dim).index_select(0, block.valid_indices)
+        output[0].transpose(0, 1).index_copy_(0, block.output_indices, selected)
     return output.transpose(1, 2).contiguous(), None
 
 

@@ -10,6 +10,49 @@ import torch
 DEPTH = ContextVar("spev_vectorized_token_ops_depth", default=0)
 
 
+class BatchPackingCache:
+    """Gather compatible canonical matrices without joining their token axes."""
+
+    def __init__(self, requests, device):
+        buckets = defaultdict(list)
+        for start, _, tree, cache in requests:
+            if not hasattr(cache, "packing"):
+                cache.packing = PackingCache()
+            blocks, order = cache.packing(tree, device)
+            prefix = torch.arange(start, start + tree.prefix_length, device=device)
+            buckets[("prefix", tree.prefix_length)].append((prefix, torch.ones_like(prefix, dtype=torch.bool), prefix))
+            offset = 0
+            restore = torch.empty(sum(8 * width for width, _, _ in blocks), device=device, dtype=torch.long)
+            restore.scatter_(0, order, torch.arange(len(order), device=device))
+            for width, indices, valid in blocks:
+                count = 8 * width
+                positions = valid.nonzero().flatten()
+                outputs = start + tree.prefix_length + restore[positions + offset]
+                buckets[("branch", count)].append((indices + start, valid, outputs))
+                offset += count
+        self.groups = []
+        for (kind, rows), items in buckets.items():
+            indices = torch.cat([item[0] for item in items])
+            valid = torch.cat([item[1] for item in items])
+            outputs = torch.cat([item[2] for item in items])
+            self.groups.append((kind, rows, len(items), indices, valid, valid.nonzero().flatten(), outputs))
+
+    def forward(self, value, operation, *, batch_prefix=True):
+        output = None
+        for kind, rows, count, indices, valid, positions, outputs in self.groups:
+            packed = value.index_select(0, indices).masked_fill(~valid[:, None], 0)
+            matrices = packed.reshape(count, rows, value.shape[-1])
+            if kind == "prefix" and not batch_prefix:
+                result = torch.cat([operation(matrix[None]) for matrix in matrices])
+            else:
+                result = operation(matrices)
+            if output is None:
+                output = result.new_empty((len(value), result.shape[-1]))
+            selected = result.reshape(count * rows, -1).index_select(0, positions)
+            output.index_copy_(0, outputs, selected)
+        return output
+
+
 class PackingCache:
     def __init__(self):
         self.tree = None
