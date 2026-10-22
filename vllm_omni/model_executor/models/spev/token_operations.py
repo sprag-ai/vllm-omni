@@ -43,7 +43,7 @@ class BatchPackingCache:
             packed = value.index_select(0, indices).masked_fill(~valid[:, None], 0)
             matrices = packed.reshape(count, rows, value.shape[-1])
             if kind == "prefix" and not batch_prefix:
-                result = torch.cat([operation(matrix[None]) for matrix in matrices])
+                result = torch.stack([operation(matrix) for matrix in matrices])
             else:
                 result = operation(matrices)
             if output is None:

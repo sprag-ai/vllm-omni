@@ -149,12 +149,15 @@ class BatchAttentionPlan:
             return result if padding is None else result.masked_fill(padding[:, None, :, None], 0)
 
         for width, count, indices in self.prefixes:
-            result = F.scaled_dot_product_attention(
-                pack(query, indices, count, width),
-                pack(key, indices, count, width),
-                pack(value, indices, count, width),
-                is_causal=True,
-                scale=scaling,
+            q, k, v = (pack(source, indices, count, width) for source in (query, key, value))
+            # Causal SDPA kernels can change arithmetic with batch size; retain the checkpoint's prefix shape.
+            result = torch.cat(
+                [
+                    F.scaled_dot_product_attention(
+                        q[i : i + 1], k[i : i + 1], v[i : i + 1], is_causal=True, scale=scaling
+                    )
+                    for i in range(count)
+                ]
             )
             output.index_copy_(0, indices, result.transpose(1, 2).reshape(-1, heads, dim))
         for width, key_width, count, qi, ki, qp, kp, allowed, oi, valid in self.branches:
