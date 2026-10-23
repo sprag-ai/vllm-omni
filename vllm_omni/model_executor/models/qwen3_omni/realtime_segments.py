@@ -72,7 +72,7 @@ class SilenceAlignedBuffer:
     def __init__(
         self,
         sampling_rate: int,
-        segment_duration_s: float,
+        segment_duration_s: float | None,
         search_duration_s: float,
         energy_window_samples: int,
     ) -> None:
@@ -80,7 +80,8 @@ class SilenceAlignedBuffer:
 
         Args:
             sampling_rate: Sample rate of the written audio, in Hz.
-            segment_duration_s: Longest segment released before the final flush, in seconds.
+            segment_duration_s: Longest segment released before the final flush, in seconds; None releases
+                nothing before the flush.
             search_duration_s: Span before the segment limit searched for the quietest cut, in seconds;
                 must be shorter than ``segment_duration_s``.
             energy_window_samples: Width of each energy measurement window, in samples.
@@ -88,9 +89,9 @@ class SilenceAlignedBuffer:
         Raises:
             ValueError: If the search span is not shorter than the segment, or the window is not positive.
         """
-        self._segment_size = int(segment_duration_s * sampling_rate)
+        self._segment_size = None if segment_duration_s is None else int(segment_duration_s * sampling_rate)
         self._search_size = int(search_duration_s * sampling_rate)
-        if not 0 <= self._search_size < self._segment_size:
+        if self._segment_size is not None and not 0 <= self._search_size < self._segment_size:
             raise ValueError("search_duration_s must be non-negative and shorter than segment_duration_s")
         if energy_window_samples <= 0:
             raise ValueError("energy_window_samples must be positive")
@@ -105,9 +106,10 @@ class SilenceAlignedBuffer:
         """Release the next segment once enough audio is buffered.
 
         Returns:
-            The audio up to the cut point, or None while the buffer holds less than one segment.
+            The audio up to the cut point, or None while the buffer holds less than one segment or the buffer
+            has no segment length.
         """
-        if len(self._buffer) < self._segment_size:
+        if self._segment_size is None or len(self._buffer) < self._segment_size:
             return None
         cut = self._quietest_cut(self._segment_size - self._search_size, self._segment_size)
         segment, self._buffer = self._buffer[:cut], self._buffer[cut:]

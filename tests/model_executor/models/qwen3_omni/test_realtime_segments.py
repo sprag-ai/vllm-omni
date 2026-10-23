@@ -16,7 +16,7 @@ RATE = 16_000
 WINDOW = 1_600
 
 
-def buffer(segment_s: float = 5.0, search_s: float = 1.0) -> SilenceAlignedBuffer:
+def buffer(segment_s: float | None = 5.0, search_s: float = 1.0) -> SilenceAlignedBuffer:
     return SilenceAlignedBuffer(
         sampling_rate=RATE, segment_duration_s=segment_s, search_duration_s=search_s, energy_window_samples=WINDOW
     )
@@ -63,6 +63,14 @@ def test_holds_audio_until_a_full_segment_is_buffered():
     buf = buffer()
     buf.write_audio(speech(4.9))
     assert buf.read_audio() is None
+
+
+def test_without_a_segment_length_holds_the_whole_turn_until_flush():
+    buf = buffer(segment_s=None, search_s=0.0)
+    audio = speech(130.0)
+    buf.write_audio(audio)
+    assert buf.read_audio() is None
+    np.testing.assert_array_equal(buf.flush(), audio)
 
 
 def test_cuts_at_the_quietest_window_in_the_search_span():
