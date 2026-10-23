@@ -81,9 +81,6 @@ _DEFAULT_AUDIO_CHUNK_S = 90
 _SPLIT_SEARCH_SAMPLES = 1600
 """Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
 
-_DEFAULT_CONVERSATION_SEGMENT_S = 5.0
-"""Longest conversational realtime audio segment decoded as one generation, in seconds."""
-
 _DEFAULT_TRANSCRIPTION_CUT_SEARCH_S = 1.0
 """Span before the segment limit searched for a transcription session's quietest cut, in seconds."""
 
@@ -124,18 +121,23 @@ def _transcription_segmentation() -> tuple[float, float] | None:
     return segment, search
 
 
-def _conversation_segment_seconds() -> float:
+def _conversation_segment_seconds() -> float | None:
     """Conversation segment length in seconds, from ``SPRAG_REALTIME_CONVERSATION_SEGMENT_S``.
 
-    An unparseable, infinite, or non-positive value falls back to the default.
+    Returns:
+        None when the value is unset, unparseable, infinite, or not positive; each turn is then decoded once at
+        its end.
     """
+    raw = os.environ.get("SPRAG_REALTIME_CONVERSATION_SEGMENT_S")
+    if not raw:
+        return None
     try:
-        segment = float(os.environ.get("SPRAG_REALTIME_CONVERSATION_SEGMENT_S", _DEFAULT_CONVERSATION_SEGMENT_S))
+        segment = float(raw)
     except ValueError:
         segment = -1.0
     if not (math.isfinite(segment) and segment > 0):
-        logger.warning_once("invalid SPRAG_REALTIME_CONVERSATION_SEGMENT_S; using %ss", _DEFAULT_CONVERSATION_SEGMENT_S)
-        return _DEFAULT_CONVERSATION_SEGMENT_S
+        logger.warning_once("invalid SPRAG_REALTIME_CONVERSATION_SEGMENT_S; decoding each conversation turn once")
+        return None
     return segment
 
 
@@ -461,10 +463,14 @@ class Qwen3OmniMoeForConditionalGeneration(
                 search_duration_s=segmentation[1] if segmentation else 0.0,
                 energy_window_samples=_SPLIT_SEARCH_SAMPLES,
             )
+        elif (conversation_segment_s := _conversation_segment_seconds()) is not None:
+            buffer = Qwen3ASRRealtimeBuffer(sampling_rate=sampling_rate, segment_duration_s=conversation_segment_s)
         else:
-            buffer = Qwen3ASRRealtimeBuffer(
+            buffer = SilenceAlignedBuffer(
                 sampling_rate=sampling_rate,
-                segment_duration_s=_conversation_segment_seconds(),
+                segment_duration_s=None,
+                search_duration_s=0.0,
+                energy_window_samples=_SPLIT_SEARCH_SAMPLES,
             )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
