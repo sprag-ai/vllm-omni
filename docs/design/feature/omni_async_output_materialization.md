@@ -341,9 +341,14 @@ runtime conditions hold:
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
-| Speculative decoding is disabled | Speculative output state is not included in this deferred path |
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
 | Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns. Eager postprocess sees the scheduled slice (`None, None` combined tensors), not the prefix-cache-merged full prompt; it must only consume the tail |
+
+Speculative decoding runs on this path. The builder parses the step's verified
+tokens from the sampled-token host copy, as `get_output()` does, and sizes each
+request's payload by them, so rejected draft rows never reach the next stage. A
+speculative stage with async scheduling that fails any condition above refuses
+to load, since a synchronous build cannot see those counts.
 
 These checks are evaluated per stage on runners based on `GPUARModelRunner`.
 An unsupported combination does not prevent serving; it only falls back to

@@ -427,8 +427,6 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
         slots_cpu=view.step_slots_cpu(["a"], {"a": n}),
         req_order=["a"],
         num_sched={"a": n},
-        num_keep={"a": n},
-        keep_start={"a": 0},
         query_start={"a": 0},
     )
     assert HIDDEN_KEY in step_outputs.immediate and "tok" in step_outputs.immediate
@@ -698,42 +696,27 @@ def test_check_kv_groups_accepts_a_uniform_type_group_of_full_attention():
             check_prefix_cache_kv_groups(bad)
 
 
-def _stage_cfg(
-    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, async_sched=False
-):
+def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), match_unit=None):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
-        cache_config=SimpleNamespace(
-            enable_prefix_caching=enable,
-            block_size=BLOCK_SIZE,
-            prefix_match_unit=match_unit,
-            async_scheduling=async_sched,
-        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
         kv_transfer_config=kv_transfer,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_model_len=128),
         model_config=None,
         is_pooling_model=pooling,
-        speculative_config=spec,
     )
 
 
 def test_stage_prefix_cache_config_gate():
     """The runner-side gate the GPU and NPU runners share: off / pooling
-    stages get no cache; kv_consumer, spec decode, sub-block matching and
-    hybrid groups refuse loudly."""
+    stages get no cache; kv_consumer, sub-block matching and hybrid groups
+    refuse loudly."""
     assert _stage_cfg(enable=False) is None
     assert _stage_cfg(pooling=True) is None
     # kv_consumer / kv_both refuse before the group check, on both platforms.
     with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
         _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), groups=())
     assert _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), enable=False) is None
-    # Speculation refuses only under async scheduling, where num_computed_tokens_cpu
-    # stays optimistic through the forward and the slot map would mirror rows wrongly.
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
-        _stage_cfg(spec=SimpleNamespace(method="ngram"), async_sched=True, groups=())
-    # Without async it reaches the group check instead of being refused outright.
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
-        _stage_cfg(spec=SimpleNamespace(method="ngram"), groups=())
     with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
         _stage_cfg(match_unit=BLOCK_SIZE // 2, groups=())
     # A unit equal to the block is a whole-block match; only the group check is left.
@@ -1026,54 +1009,61 @@ def test_save_slot_mismatch_fails_fast():
         mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
 
 
-def test_save_keeps_only_committed_rows_of_a_speculative_step():
-    """A rejected draft's row must not be cached: vLLM reclaims its slot.
+def _save_rows(mgr, view, req_id, blocks, start_pos, rows, *, hit=0) -> int:
+    """One single-request step whose hidden rows are given rather than derived from slots."""
+    view.order = [req_id]
+    view.req_blocks[req_id], view.computed[req_id] = blocks, start_pos
+    n = int(rows.shape[0])
+    new_req = FakeNewReq(req_id, num_computed_tokens=hit, block_ids=[list(blocks)])
+    mgr.new_step_starts(FakeSchedOut(new_reqs=[new_req], num_scheduled={req_id: n}))
+    return mgr.save_outputs(rows, {}, num_tokens_unpadded=n, num_tokens_padded=n)
 
-    Two requests, 4 scheduled rows each, 2 committed each. The hidden tensor
-    arrives in the scheduled packing, so request b's committed rows start at row
-    4 while its slots start at slot index 2 — the two bases that only coincide
-    when nothing was rejected.
+
+def test_materialize_caps_a_speculative_step_at_its_committed_rows():
+    """Rows for rejected drafts are saved but never emitted downstream.
+
+    Both requests verify drafts over 4 rows. `a` keeps 2; `b` has no entry and
+    keeps its full span, as a request without drafts does.
     """
     mgr, view = make_manager()
     view.order = ["a", "b"]
     view.req_blocks["a"], view.computed["a"] = [0], 0
     view.req_blocks["b"], view.computed["b"] = [1], 0
     mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("b")], num_scheduled={"a": 4, "b": 4}))
-    slots_a = view.slots_for("a", 0, 2)
-    slots_b = view.slots_for("b", 0, 2)
-    hidden = torch.cat(
-        [
-            view.slots_for("a", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
-            view.slots_for("b", 0, 4).to(DTYPE).unsqueeze(1).expand(4, HIDDEN).clone(),
-        ]
-    )
-    sid = mgr.save_outputs(hidden, {}, num_tokens_unpadded=8, num_tokens_padded=8, committed={"a": 2, "b": 2})
-    mgr.materialize(sid, ["a", "b"])
-    for req_id, slots in (("a", slots_a), ("b", slots_b)):
-        got = plan_fetch(mgr, slots, HIDDEN_KEY, req_id=req_id)
-        torch.testing.assert_close(got, expected_rows(slots))
+    hidden = torch.cat([expected_rows(view.slots_for("a", 0, 4)), expected_rows(view.slots_for("b", 0, 4))])
+    sid = mgr.save_outputs(hidden.clone(), {}, num_tokens_unpadded=8, num_tokens_padded=8)
+
+    outs = mgr.materialize(sid, ["a", "b"], committed={"a": 2})
+
+    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 2)))
+    assert torch.equal(outs.hidden_states["b"], expected_rows(view.slots_for("b", 0, 4)))
 
 
-def test_save_requires_a_committed_count_for_every_scheduled_request():
-    """An omission must raise, not fall back to the untrimmed span.
+def test_rejected_draft_rows_are_rewritten_before_a_hit_reads_them():
+    """The write side keeps rejected rows, as vLLM keeps their KV.
 
-    Defaulting a missing request to its scheduled count would cache exactly the
-    rejected-draft rows the argument exists to drop. Requests in the batch that
-    this step did not schedule need no entry.
+    `a` prefills block 0, then verifies drafts at positions 4..8 and accepts one,
+    so the rows for 6..8 came from rejected inputs. The next step re-runs 6..10
+    with committed tokens. A later hit on blocks 0 and 1 covers positions 6 and 7
+    and must read the rewritten rows, not the rejected ones.
     """
     mgr, view = make_manager()
-    view.order = ["a", "idle"]
-    view.req_blocks["a"], view.computed["a"] = [0], 0
-    view.req_blocks["idle"], view.computed["idle"] = [1], 0
-    hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
-    sched = FakeSchedOut(new_reqs=[FakeNewReq("a"), FakeNewReq("idle")], num_scheduled={"a": 4})
+    view.req_blocks["a"] = [0, 1, 2]
+    true_rows = expected_rows(view.slots_for("a", 0, 12))
+    rejected = torch.full((3, HIDDEN), -1.0, dtype=DTYPE)
 
-    mgr.new_step_starts(sched)
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="omit"):
-        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={})
+    mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 0, true_rows[:4].clone()), ["a"])
+    verify = torch.cat([true_rows[4:6], rejected])
+    outs = mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 4, verify), ["a"], committed={"a": 2})
+    assert torch.equal(outs.hidden_states["a"], true_rows[4:6])
+    mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 6, true_rows[6:11].clone()), ["a"])
 
-    mgr.new_step_starts(sched)
-    mgr.discard_step(mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4, committed={"a": 4}))
+    view.req_blocks["b"] = [0, 1, 3]
+    b_row = expected_rows(view.slots_for("b", 8, 9))
+    merged = mgr.materialize(_save_rows(mgr, view, "b", [0, 1, 3], 8, b_row.clone(), hit=8), ["b"]).hidden_states["b"]
+
+    assert torch.equal(merged[:8], true_rows[:8])
+    assert torch.equal(merged[8:], b_row)
 
 
 def test_materialize_rejects_out_of_snapshot_ids():

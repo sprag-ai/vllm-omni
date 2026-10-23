@@ -29,6 +29,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -73,7 +74,7 @@ def _committed_num_scheduled_tokens(
     scheduler_output: SchedulerOutput,
     valid_sampled_token_ids: list[list[int]],
     req_id: str,
-    idx: int | None,
+    idx: int,
     num_scheduled: int,
 ) -> int:
     """Rows of a speculative step that survive verification.
@@ -81,20 +82,9 @@ def _committed_num_scheduled_tokens(
     The target forward also produces rows for rejected draft tokens. Only the
     previously unprocessed token plus the accepted draft prefix are committed,
     and the rejection sampler's emitted count is that number. Requests without
-    drafts, prefill included, keep their full scheduled span.
-
-    ``idx`` is None for a request the step scheduled but did not sample, as a
-    non-final prefill chunk does. Those are never given drafts, so the full span
-    is already the committed one.
-
-    An accepted chain whose stop token is not its last element is deliberately
-    not trimmed to the stop. This count matches vLLM's own
-    ``num_computed_tokens``, which is derived from the same untrimmed emission
-    and is the base ``step_slots_cpu`` indexes against; the stop is applied
-    afterwards, in the scheduler. The rows past it are unreachable rather than
-    stale, because ``KVCacheManager.allocate_slots`` caps ``num_tokens_to_cache``
-    at ``request.num_tokens`` to exclude non-committable tokens, so no published
-    block hash covers them.
+    drafts, prefill included, keep their full scheduled span. Under async
+    scheduling the emitted tokens come from the step's host copy, so this is
+    only called where that copy has been parsed.
 
     ``scheduled_spec_decode_tokens`` is read directly rather than through
     ``getattr``: a default would return the untrimmed span if upstream renamed
@@ -103,7 +93,7 @@ def _committed_num_scheduled_tokens(
     drafts = scheduler_output.scheduled_spec_decode_tokens
     if not drafts or not drafts.get(req_id):
         return num_scheduled
-    if idx is None or idx >= len(valid_sampled_token_ids):
+    if idx >= len(valid_sampled_token_ids):
         return num_scheduled
     sampled = valid_sampled_token_ids[idx]
     if not sampled:
@@ -239,7 +229,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
         self,
         *,
-        model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        model_runner_output_builder: Callable[[list[list[int]] | None], OmniModelRunnerOutput],
         cuda_device: torch.device | int | str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -288,7 +278,9 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self._num_nans_cpu = self._num_nans.to("cpu", non_blocking=True) if self._num_nans is not None else None
             self.async_copy_ready_event.record()
 
-        self._model_runner_output_builder: Callable[[], OmniModelRunnerOutput] | None = model_runner_output_builder
+        self._model_runner_output_builder: Callable[[list[list[int]] | None], OmniModelRunnerOutput] | None = (
+            model_runner_output_builder
+        )
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
@@ -299,12 +291,27 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         )
         self._background_thread.start()
 
+    def _verified_token_ids(self) -> list[list[int]] | None:
+        """Tokens a speculative step committed, or None for a step without drafts.
+
+        Async scheduling leaves them on the device at bookkeeping. They are parsed
+        from this step's host copy exactly as ``get_output`` parses them, so the Omni
+        payload is sized by the same counts the scheduler receives.
+        """
+        if self.sampled_token_ids_cpu.shape[-1] == 1:
+            return None
+        self.async_copy_ready_event.synchronize()
+        verified, _ = RejectionSampler.parse_output(
+            self.sampled_token_ids_cpu, self.vocab_size, self._invalid_req_indices
+        )
+        return verified
+
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
             return
         with record_function_or_nullcontext("omni_async_output:get_output/build_model_runner_output"):
             assert self._model_runner_output_builder is not None
-            self._model_runner_output = self._model_runner_output_builder()
+            self._model_runner_output = self._model_runner_output_builder(self._verified_token_ids())
         self._model_runner_output_builder = None
 
     def _build_output_in_background(self) -> None:
@@ -440,6 +447,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if (
+            self.speculative_config is not None
+            and self.use_async_scheduling
+            and not self._should_use_async_omni_output()
+        ):
+            # Under async scheduling the verified tokens reach the host only after the
+            # step's output copy, which the deferred Omni output waits on. A synchronous
+            # build would size every payload by its scheduled rows, rejected drafts included.
+            raise ValueError(
+                "Speculative decoding with async scheduling requires the deferred Omni output "
+                "path (async_chunk, a model that sets use_async_omni_output, no routed-expert "
+                "return); otherwise set async_scheduling: false on this stage."
+            )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -775,11 +795,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
         step_id: int | None,
+        committed: dict[str, int],
     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
         """Prefix-cache payload sources for the pooler payload build.
 
         req_ids must be the step's snapshot, not ``input_batch.req_ids``: under
         async omni output this runs a step late, when the live batch has moved on.
+        ``committed`` caps the merged rows of requests whose drafts were verified.
         """
         if not get_pp_group().is_last_rank:
             raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
@@ -794,7 +816,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
             return hidden_states_cpu, None, None
-        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
+        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids), committed)
         return hidden_states_cpu, combined_hidden, combined_mm
 
     def _build_omni_pooler_payload(
@@ -1228,13 +1250,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             hidden_states_cpu = None
-            # The prefix-cache write happens after sampling (sample_tokens), because the
-            # committed-row span it must not exceed is a sampling result; only the
-            # question of whether it will write at all is answerable here.
-            prefix_cache_step_id = None
-            self._prefix_cache_num_tokens_padded = num_tokens_padded
+            # Under async scheduling, num_computed_tokens_cpu still assumes the previous
+            # step accepted every draft, and the save derives its slots from it. Apply the
+            # correction first, as vLLM does before preprocess_mamba; the forward is already
+            # queued, so this waits only on the previous step's count copy.
+            if deferred_state_corrections_fn and self.omni_prefix_cache is not None:
+                deferred_state_corrections_fn()
+                deferred_state_corrections_fn = None
+            # Prefix-cache write: freeze + submit; policy gating (full
+            # hidden, skip/deferred keys) happens inside the manager. A speculative step
+            # writes its rejected draft rows too, as vLLM writes their KV: the next step
+            # rewrites those slots before any block hash covers them.
+            prefix_cache_step_id = self._prefix_cache_save_step(
+                hidden_states,
+                multimodal_outputs,
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+            )
             if (
-                self._prefix_cache_will_write()
+                prefix_cache_step_id is not None
                 and not self._model_needs_full_prefix_hidden_states()
                 and self._model_omni_pooler_payload_include_hidden()
             ):
@@ -1638,8 +1672,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
-        if self.speculative_config is not None:
-            return False
 
         model_config = getattr(self, "model_config", None)
         if model_config is None:
@@ -1855,6 +1887,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
+                    committed={
+                        rid: _committed_num_scheduled_tokens(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                            rid,
+                            idx,
+                            int(num_scheduled_tokens_np[idx]),
+                        )
+                        for rid, idx in req_id_to_index_output_copy.items()
+                    },
                 )
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
@@ -2110,33 +2152,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        # Prefix-cache write: freeze + submit; policy gating (full hidden,
-        # skip/deferred keys) happens inside the manager. Runs here rather than in
-        # execute_model because only a sampled step knows how many of each request's
-        # rows were committed, and caching a rejected draft row would key stage output
-        # to a slot vLLM reclaims. `multimodal_outputs` is the pre-talker-MTP value the
-        # cache has always stored, so the save precedes that reassignment below.
-        if self._prefix_cache_will_write():
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded=scheduler_output.total_num_scheduled_tokens,
-                num_tokens_padded=self._prefix_cache_step_num_tokens_padded(),
-                # Keyed over every scheduled request, not over the sampler's output
-                # map: the manager requires an entry wherever the step produced rows,
-                # and one it had to default would keep that request's rejected drafts.
-                committed={
-                    rid: _committed_num_scheduled_tokens(
-                        scheduler_output,
-                        valid_sampled_token_ids,
-                        rid,
-                        req_id_to_index_output_copy.get(rid),
-                        int(num_scheduled),
-                    )
-                    for rid, num_scheduled in scheduler_output.num_scheduled_tokens.items()
-                },
-            )
-
         multimodal_outputs = self._run_post_sample_talker_mtp(
             req_ids=req_ids_output_copy,
             valid_sampled_token_ids=valid_sampled_token_ids,
@@ -2207,7 +2222,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("omni_async_output:get_omni_connector_output"):
             omni_connector_output = self.get_omni_connector_output()
 
-        def output_builder() -> OmniModelRunnerOutput:
+        def output_builder(verified_token_ids: list[list[int]] | None = None) -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
@@ -2219,7 +2234,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
-                    valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
+                    valid_sampled_token_ids=(
+                        valid_sampled_token_ids_snapshot if verified_token_ids is None else verified_token_ids
+                    ),
                     logprobs_lists=logprobs_lists_snapshot,
                     prompt_logprobs_dict=prompt_logprobs_dict_snapshot,
                     num_nans_in_logits=num_nans_in_logits_snapshot,

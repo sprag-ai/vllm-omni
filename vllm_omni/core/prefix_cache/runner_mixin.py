@@ -52,9 +52,6 @@ class PrefixCacheRunnerMixin:
 
     omni_prefix_cache: OmniPrefixCacheManager | None = None
     _omni_prefix_cache_cfg: PrefixCacheConfig | None = None
-    # Set by a runner whose save runs in a later call than its forward; see
-    # _prefix_cache_step_num_tokens_padded. None outside that window.
-    _prefix_cache_num_tokens_padded: int | None = None
     # Snapshotted once at load_model; the hot path must not re-probe model
     # attributes every step. The same object is registered on the manager.
     _omni_cache_policy: ModelCachePolicy = ModelCachePolicy()
@@ -105,28 +102,10 @@ class PrefixCacheRunnerMixin:
         """Per-step lifecycle entry; must run before ``_update_states``
         removes finished requests (finished/abort escalation happens inside
         ``new_step_starts``). Builds the manager on the first real step."""
-        self._prefix_cache_num_tokens_padded = None
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.new_step_starts(scheduler_output)
-
-    def _prefix_cache_step_num_tokens_padded(self) -> int:
-        """Padded width of the hidden-state tensor this step's forward produced.
-
-        A runner that samples in a separate call from its forward cannot pass the
-        value down an argument, and ``ExecuteModelState`` packs positionally in both
-        runners (see ``prefix_cache_step_id``), so it rides the instance. Cleared
-        each ``_prefix_cache_step_begin``: a step that skipped the forward raises
-        rather than sizing the write from the previous batch.
-        """
-        num_tokens_padded = self._prefix_cache_num_tokens_padded
-        if num_tokens_padded is None:
-            raise OmniPrefixCacheUnmatchError(
-                "prefix-cache save reached without this step's padded token count; "
-                "the forward must record it before sampling"
-            )
-        return num_tokens_padded
 
     def _prefix_cache_save_step(
         self,
@@ -135,40 +114,29 @@ class PrefixCacheRunnerMixin:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
-        committed: dict[str, int] | None = None,
     ) -> int | None:
         """Write this step's outputs into the cache.
 
         None when this stage/rank does not write (pooling, cache off, or not
         the last PP rank). The returned step id must be consumed exactly once
         — materialize or discard_step — by the output path.
-
-        ``committed`` caps each request's kept rows. A speculative step also
-        produces rows for rejected draft tokens, whose slots vLLM reclaims, so
-        omitting it caches state against slots that later hold other tokens.
         """
-        if not self._prefix_cache_will_write():
+        from vllm.distributed.parallel_state import get_pp_group
+
+        if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
             return None
         return self.omni_prefix_cache.save_outputs(
             hidden_states,
             flatten_payload(multimodal_outputs) if multimodal_outputs else {},
             num_tokens_unpadded=num_tokens_unpadded,
             num_tokens_padded=num_tokens_padded,
-            committed=committed,
         )
 
-    def _prefix_cache_will_write(self) -> bool:
-        """Whether a save on this stage/rank would produce a step id.
-
-        The save itself runs after sampling, because the committed-row span it
-        needs is a sampling result; callers that must branch before then ask here.
-        """
-        from vllm.distributed.parallel_state import get_pp_group
-
-        return not (self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank)
-
     def _prefix_cache_materialize(
-        self, step_id: int | None, req_ids: list[str]
+        self,
+        step_id: int | None,
+        req_ids: list[str],
+        committed: dict[str, int] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
         """Per-request merged outputs for a saved step.
 
@@ -176,8 +144,9 @@ class PrefixCacheRunnerMixin:
         ``input_batch`` (under async output this runs a step late).
         ``step_id`` None means save did not run — nothing to consume.
         ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
+        ``committed`` caps each request's rows from this step; see ``materialize``.
         """
         if step_id is None or self.omni_prefix_cache is None:
             return None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
+        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids), committed)
         return outs.hidden_states, (outs.mm_outputs or None)
