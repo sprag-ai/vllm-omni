@@ -29,6 +29,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
@@ -712,6 +713,24 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+def test_load_model_refuses_async_speculation_without_the_deferred_output(monkeypatch):
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *a, **k: None)
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_duplex_sampling_hook", lambda self, force=False: None)
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.speculative_config = SimpleNamespace(method="eagle3", num_speculative_tokens=4)
+    runner.model.use_async_omni_output = True
+
+    GPUARModelRunner.load_model(runner)
+
+    runner.model.has_postprocess = True
+    with pytest.raises(ValueError, match="requires the deferred Omni output path"):
+        GPUARModelRunner.load_model(runner)
+
+    runner.use_async_scheduling = False
+    GPUARModelRunner.load_model(runner)
 
 
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
