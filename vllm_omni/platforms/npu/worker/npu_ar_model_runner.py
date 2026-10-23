@@ -704,11 +704,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states, aux_hidden_states = hidden_states
 
             #  -------------------------------------- Omni-new -------------------------------------------------
-            # The save derives slots from num_computed_tokens_cpu, which async scheduling
-            # leaves optimistic until vLLM's deferred correction runs.
-            if deferred_state_corrections_fn and self.omni_prefix_cache is not None:
-                deferred_state_corrections_fn()
-                deferred_state_corrections_fn = None
             prefix_cache_step_id = self._prefix_cache_save_step(
                 hidden_states,
                 multimodal_outputs,
