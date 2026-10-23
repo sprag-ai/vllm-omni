@@ -1163,20 +1163,6 @@ def _project_omni_stage_engine_args(
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
-    # An unset async_scheduling resolves to True, and AR stages are defaulted to it, so
-    # the permissive case has to be spelled out rather than compared against False.
-    if stage_config.speculative_config is not None and (
-        stage_config.scheduler_config.async_scheduling is not False
-    ):
-        # The committed-row span is derived from the rejection sampler's emitted
-        # counts, which are not available while the payload is built under async
-        # scheduling; the span would fall back to every scheduled row and the next
-        # stage would receive rejected draft tokens.
-        raise ValueError(
-            f"Stage {stage_config.stage_id}: speculative decoding requires async_scheduling: false "
-            "on this stage; the committed-row span cannot be derived asynchronously."
-        )
-
     if stage_config.speculative_config is not None and stage_config.model_config.use_v2_model_runner:
         # The v2 runner reads a two-tuple model output as its own
         # (text_hidden, captured_layers) pair and sets aux_hidden_states=None on

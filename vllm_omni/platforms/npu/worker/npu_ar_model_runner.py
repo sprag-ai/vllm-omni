@@ -135,6 +135,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if self.speculative_config is not None and self.use_async_scheduling:
+            # The NPU output path has no deferred build that parses the verified tokens,
+            # so every payload would carry the step's rejected draft rows.
+            raise ValueError("Speculative decoding on NPU requires async_scheduling: false on this stage.")
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)

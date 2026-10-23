@@ -29,6 +29,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
@@ -436,8 +437,8 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     calls = []
     sync_calls = []
 
-    def builder():
-        calls.append("build")
+    def builder(verified_token_ids):
+        calls.append(("build", verified_token_ids))
         return OmniModelRunnerOutput(req_ids=["r1"], req_id_to_index={"r1": 0})
 
     async_output._model_runner_output = None
@@ -454,11 +455,47 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
 
     output = async_output.get_output()
 
-    assert calls == ["build"]
+    # A step without drafts has nothing to verify, so the builder keeps its snapshot.
+    assert calls == [("build", None)]
     assert sync_calls == ["sync"]
     assert async_output._model_runner_output_builder is None
     assert output.req_ids == ["r1"]
     assert output.sampled_token_ids == [[7]]
+
+
+def test_omni_async_output_builds_from_the_verified_tokens_of_a_speculative_step():
+    """Async scheduling leaves the accepted drafts on the device at bookkeeping.
+
+    The builder must size payloads by the counts the scheduler will receive, so it
+    is handed the step's host copy parsed exactly as ``get_output`` parses it:
+    placeholders dropped, discarded requests emptied, and only after the copy event.
+    """
+    async_output = object.__new__(OmniAsyncGPUModelRunnerOutput)
+    events = []
+
+    def builder(verified_token_ids):
+        events.append(("build", verified_token_ids))
+        return OmniModelRunnerOutput(req_ids=["a", "b", "c"], req_id_to_index={"a": 0, "b": 1, "c": 2})
+
+    placeholder = -1
+    async_output._model_runner_output = None
+    async_output._model_runner_output_builder = builder
+    async_output._invalid_req_indices = [2]
+    async_output.sampled_token_ids_cpu = torch.tensor(
+        [[11, 12, placeholder], [21, placeholder, placeholder], [31, 32, 33]], dtype=torch.long
+    )
+    async_output.async_copy_ready_event = SimpleNamespace(synchronize=lambda: events.append("sync"))
+    async_output._sampled_token_ids = async_output.sampled_token_ids_cpu
+    async_output._logprobs_tensors = None
+    async_output._logprobs_tensors_cpu = None
+    async_output._routed_experts = None
+    async_output._routed_experts_cpu = None
+    async_output.vocab_size = 100
+
+    output = async_output.get_output()
+
+    assert events[:2] == ["sync", ("build", [[11, 12], [21], []])]
+    assert output.sampled_token_ids == [[11, 12], [21], []]
 
 
 def test_omni_async_gpu_model_runner_output_reraises_background_exception():
@@ -662,6 +699,10 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
+    # The deferred builder parses verified drafts from the step's host copy.
+    runner.speculative_config = SimpleNamespace(method="eagle3", num_speculative_tokens=4)
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+
     # Prefix cache no longer forces the sync output path; leftover mm is
     # snapshotted at save so the builder can materialize a step late.
     runner.omni_prefix_cache = object()
@@ -672,6 +713,24 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+def test_load_model_refuses_async_speculation_without_the_deferred_output(monkeypatch):
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *a, **k: None)
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_duplex_sampling_hook", lambda self, force=False: None)
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.speculative_config = SimpleNamespace(method="eagle3", num_speculative_tokens=4)
+    runner.model.use_async_omni_output = True
+
+    GPUARModelRunner.load_model(runner)
+
+    runner.model.has_postprocess = True
+    with pytest.raises(ValueError, match="requires the deferred Omni output path"):
+        GPUARModelRunner.load_model(runner)
+
+    runner.use_async_scheduling = False
+    GPUARModelRunner.load_model(runner)
 
 
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
@@ -909,18 +968,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         runner.query_start_loc = query_start_loc
     else:
         runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    # Cache on, but this step produced no saved context: the payload path must then
-    # serve the freshly staged slice rather than a merged read.
-    runner.omni_prefix_cache = SimpleNamespace(save_outputs=lambda *a, **k: None)
-    # What execute_model records for the save; unset means no forward ran, which the
-    # save rejects rather than sizing the write from a previous step.
-    runner._prefix_cache_num_tokens_padded = 3
-    runner.is_pooling_model = False
-    # One rank, so it is the last one; get_pp_group asserts rather than defaulting.
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True, world_size=1),
-    )
+    runner.omni_prefix_cache = object()
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner.requests = {}
