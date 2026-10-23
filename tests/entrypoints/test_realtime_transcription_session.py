@@ -243,7 +243,15 @@ def _prompts(transcription: bool, seconds: float) -> list[dict]:
 
 @pytest.mark.usefixtures("fake_model_io")
 class TestTranscriptionPrompts:
-    def test_first_segment_opens_the_conversation_and_later_segments_continue_it(self) -> None:
+    def test_a_transcription_turn_is_decoded_once_by_default(self, monkeypatch) -> None:
+        monkeypatch.delenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", raising=False)
+        prompts = _prompts(transcription=True, seconds=12.0)
+
+        assert len(prompts) == 1
+        assert prompts[0]["prompt_token_ids"][0].startswith("<|im_start|>user\n")
+
+    def test_first_segment_opens_the_conversation_and_later_segments_continue_it(self, monkeypatch) -> None:
+        monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "5")
         prompts = _prompts(transcription=True, seconds=12.0)
 
         token_ids = [prompt["prompt_token_ids"][0] for prompt in prompts]
@@ -251,15 +259,24 @@ class TestTranscriptionPrompts:
         assert token_ids[0].startswith("<|im_start|>user\n")
         assert all(ids.startswith("<|im_end|>\n<|im_start|>user\n") for ids in token_ids[1:])
 
-    def test_segments_are_cut_inside_the_search_span(self) -> None:
+    def test_segments_are_cut_inside_the_search_span(self, monkeypatch) -> None:
+        monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "5")
         prompts = _prompts(transcription=True, seconds=12.0)
 
         lengths = [len(prompt["multi_modal_data"]["audio"]) for prompt in prompts[:-1]]
         assert all(4 * RATE <= length <= 5 * RATE for length in lengths)
 
-    def test_conversational_segments_keep_the_fixed_cut_and_repeated_prompt(self) -> None:
+    def test_conversational_segments_keep_the_fixed_cut_and_repeated_prompt(self, monkeypatch) -> None:
+        monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "120")
         prompts = _prompts(transcription=False, seconds=12.0)
 
         lengths = [len(prompt["multi_modal_data"]["audio"]) for prompt in prompts]
         assert lengths == [5 * RATE, 5 * RATE, 2 * RATE]
         assert len({prompt["prompt_token_ids"][0] for prompt in prompts}) == 1
+
+    def test_conversational_segment_length_comes_from_its_own_setting(self, monkeypatch) -> None:
+        monkeypatch.setenv("SPRAG_REALTIME_CONVERSATION_SEGMENT_S", "4")
+        prompts = _prompts(transcription=False, seconds=12.0)
+
+        lengths = [len(prompt["multi_modal_data"]["audio"]) for prompt in prompts]
+        assert lengths == [4 * RATE, 4 * RATE, 4 * RATE]
