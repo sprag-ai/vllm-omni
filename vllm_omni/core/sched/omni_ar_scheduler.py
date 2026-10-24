@@ -348,12 +348,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.pending_stop_after_extraction.add(req_id)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Before any admission: upstream would re-prefill a preempted talker.
+        self._finish_unresumable_preemptions()
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
         waiting = getattr(self, "waiting")
-        self._finish_unresumable_preemptions()
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
@@ -1181,6 +1182,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
     STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
+    TALKER_PREEMPTED_STOP_REASON = "talker_preempted"
 
     def _streaming_update_overflows(
         self,
@@ -1280,7 +1282,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pending = self._unresumable_preemptions = {}
         pending[request.request_id] = (
             int(getattr(request, "client_index", 0) or 0),
-            "talker request preempted under KV cache pressure; it cannot be resumed",
+            f"{self.TALKER_PREEMPTED_STOP_REASON}: the talker request was preempted and cannot be resumed",
         )
 
     def _finish_unresumable_preemptions(self) -> None:

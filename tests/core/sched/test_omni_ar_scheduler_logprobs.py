@@ -360,3 +360,34 @@ def test_pooling_decode_failure_finishes_request_with_error() -> None:
     assert output.finish_reason is FinishReason.ERROR
     assert output.pooling_output is None
     assert "pooling output decode failed" in str(request.stop_reason)
+
+
+def test_failed_talker_preemption_reaches_its_client_as_one_error_output() -> None:
+    reason = f"{OmniARScheduler.TALKER_PREEMPTED_STOP_REASON}: preempted"
+    scheduler = _make_scheduler_stub([])
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    scheduler._failed_preemptions = {"req-talker": (1, reason)}
+    scheduler.finished_req_ids_dict[1].add("req-talker")
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+        routed_experts=None,
+    )
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+
+    (output,) = [o for o in outputs[1].outputs if o.request_id == "req-talker"]
+    assert output.finish_reason is FinishReason.ERROR
+    assert output.stop_reason == reason
+    assert scheduler._failed_preemptions == {}
