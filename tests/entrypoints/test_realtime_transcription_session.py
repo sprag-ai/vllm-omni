@@ -266,8 +266,14 @@ class TestTranscriptionPrompts:
         lengths = [len(prompt["multi_modal_data"]["audio"]) for prompt in prompts[:-1]]
         assert all(4 * RATE <= length <= 5 * RATE for length in lengths)
 
+    def test_a_conversation_turn_is_decoded_once_by_default(self, monkeypatch) -> None:
+        monkeypatch.delenv("SPRAG_REALTIME_CONVERSATION_SEGMENT_S", raising=False)
+        prompts = _prompts(transcription=False, seconds=12.0)
+
+        assert len(prompts) == 1
+
     def test_conversational_segments_keep_the_fixed_cut_and_repeated_prompt(self, monkeypatch) -> None:
-        monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "120")
+        monkeypatch.setenv("SPRAG_REALTIME_CONVERSATION_SEGMENT_S", "5")
         prompts = _prompts(transcription=False, seconds=12.0)
 
         lengths = [len(prompt["multi_modal_data"]["audio"]) for prompt in prompts]
