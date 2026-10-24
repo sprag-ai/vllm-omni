@@ -164,6 +164,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     scheduler._emit_streaming_context_overflow_outputs = MethodType(
         OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler
     )
+    scheduler._emit_failed_preemption_outputs = MethodType(OmniARScheduler._emit_failed_preemption_outputs, scheduler)
     scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
     scheduler.make_stats = lambda *args, **kwargs: None
     return scheduler

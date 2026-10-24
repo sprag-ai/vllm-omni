@@ -141,6 +141,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Talker requests preempted since the last schedule(): request_id ->
+        # (client_index, reason). Finished before upstream can resume them.
+        self._unresumable_preemptions: dict[str, tuple[int, str]] = {}
+        # Talker requests finished for preemption, drained into an explicit
+        # FinishReason.ERROR output on the next update_from_output.
+        self._failed_preemptions: dict[str, tuple[int, str]] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -347,6 +353,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
         waiting = getattr(self, "waiting")
+        self._finish_unresumable_preemptions()
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
@@ -793,6 +800,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             outputs,
         )
         self._emit_streaming_context_overflow_outputs(outputs)
+        self._emit_failed_preemption_outputs(outputs)
         if self.chunk_transfer_adapter is not None:
             for request in failed_requests:
                 self.chunk_transfer_adapter.cleanup_receiver(request.request_id)
@@ -1254,6 +1262,62 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return True
         self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
         return True
+
+    def _preempt_request(self, request: Request, timestamp: float, drop_stale_output: bool = False) -> None:
+        """Preempt as upstream does, recording a talker request so it is never resumed.
+
+        Upstream resumes a preempted request by re-prefilling its prompt plus every
+        token it already generated. A talker's decode inputs are per-step embeddings
+        (code-predictor sums plus the trailing thinker text state) that its token ids
+        cannot reproduce, so the re-prefill schedules more tokens than the talker can
+        build inputs for and the worker dies on an out-of-bounds gather.
+        """
+        super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
+        if getattr(self.vllm_config.model_config, "model_stage", None) != "talker":
+            return
+        pending = getattr(self, "_unresumable_preemptions", None)
+        if pending is None:
+            pending = self._unresumable_preemptions = {}
+        pending[request.request_id] = (
+            int(getattr(request, "client_index", 0) or 0),
+            "talker request preempted under KV cache pressure; it cannot be resumed",
+        )
+
+    def _finish_unresumable_preemptions(self) -> None:
+        """Fail every talker request preempted since the last step instead of resuming it.
+
+        Must run before upstream admission in ``schedule()``: upstream does not
+        resume a request in the step that preempted it, so this is the last point
+        before the re-prefill.
+        """
+        pending = getattr(self, "_unresumable_preemptions", None)
+        if not pending:
+            return
+        failed = getattr(self, "_failed_preemptions", None)
+        if failed is None:
+            failed = self._failed_preemptions = {}
+        finished = {request.request_id for request in self.finish_requests(list(pending), RequestStatus.FINISHED_ERROR)}
+        for request_id, entry in pending.items():
+            if request_id in finished:
+                logger.warning("[Omni] %s: %s; finishing the request", request_id, entry[1])
+                failed[request_id] = entry
+        pending.clear()
+
+    def _emit_failed_preemption_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Turn talker requests finished for preemption into explicit error outputs."""
+        failed = getattr(self, "_failed_preemptions", None)
+        if not failed:
+            return
+        for request_id, (client_index, reason) in list(failed.items()):
+            outputs.setdefault(client_index, []).append(
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                )
+            )
+        failed.clear()
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Do not resume a session whose queued update overflowed the model.
