@@ -1190,9 +1190,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
         if self.vllm_config.model_config.async_chunk:
-            self._queue_unspoken_prefill_text(
-                thinker_sequence_embeds, ids_chatml, thinker_sequences, embed, update_dict
-            )
+            self._queue_unspoken_prefill_text(thinker_sequence_embeds, ids_chatml, embed, meta, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
@@ -1200,16 +1198,21 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         thinker_embeds: torch.Tensor,
         prompt_ids: torch.Tensor,
-        all_ids: torch.Tensor | None,
         embed: Embeddings,
+        meta: OmniPayloadMeta,
         update_dict: OmniPayload,
     ) -> None:
         """Queue the prefill's output text rows after the first, ahead of later decode rows.
 
         Under async_chunk the talker reads text only from the decode queue, and a
         speculative thinker step can land several output rows in the prefill
-        payload; the assistant bootstrap speaks only the first of them.
+        payload; the assistant bootstrap speaks only the first of them. Safe to
+        call on every chunk of a prefill split across scheduler steps.
         """
+        # A chunked prefill re-enters with the queue this call already filled.
+        if meta.get("unspoken_prefill_rows_queued") == thinker_embeds.shape[0]:
+            return
+        update_dict.setdefault("meta", {})["unspoken_prefill_rows_queued"] = thinker_embeds.shape[0]
         starts = torch.nonzero(prompt_ids[0] == self.config.im_start_token_id).squeeze(-1)
         if starts.numel() == 0:
             return
@@ -1218,10 +1221,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             return
         # Matches the bootstrap's split: im_start, role, newline, first text, then the rest.
         first_unspoken = last_start + 4
-        end = thinker_embeds.shape[0] if all_ids is None else min(int(all_ids.shape[-1]), thinker_embeds.shape[0])
-        if end <= first_unspoken:
+        if thinker_embeds.shape[0] <= first_unspoken:
             return
-        unspoken = thinker_embeds[first_unspoken:end]
+        unspoken = thinker_embeds[first_unspoken:]
         queued = update_dict.get("embed", {}).get("cached_decode")
         if queued is None:
             queued = embed.get("cached_decode")
