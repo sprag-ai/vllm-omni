@@ -1189,8 +1189,48 @@ class Qwen3OmniMoeForConditionalGeneration(
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
+        if self.vllm_config.model_config.async_chunk:
+            self._queue_unspoken_prefill_text(thinker_sequence_embeds, ids_chatml, embed, meta, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+
+    def _queue_unspoken_prefill_text(
+        self,
+        thinker_embeds: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        embed: Embeddings,
+        meta: OmniPayloadMeta,
+        update_dict: OmniPayload,
+    ) -> None:
+        """Queue the prefill's output text rows after the first, ahead of later decode rows.
+
+        Under async_chunk the talker reads text only from the decode queue, and a
+        speculative thinker step can land several output rows in the prefill
+        payload; the assistant bootstrap speaks only the first of them. Safe to
+        call on every chunk of a prefill split across scheduler steps.
+        """
+        # A chunked prefill re-enters with the queue this call already filled.
+        if meta.get("unspoken_prefill_rows_queued") == thinker_embeds.shape[0]:
+            return
+        update_dict.setdefault("meta", {})["unspoken_prefill_rows_queued"] = thinker_embeds.shape[0]
+        starts = torch.nonzero(prompt_ids[0] == self.config.im_start_token_id).squeeze(-1)
+        if starts.numel() == 0:
+            return
+        last_start = int(starts[-1].item())
+        if last_start + 1 >= prompt_ids.shape[-1] or prompt_ids[0][last_start + 1] != self.config.assistant_token_id:
+            return
+        # Matches the bootstrap's split: im_start, role, newline, first text, then the rest.
+        first_unspoken = last_start + 4
+        if thinker_embeds.shape[0] <= first_unspoken:
+            return
+        unspoken = thinker_embeds[first_unspoken:]
+        queued = update_dict.get("embed", {}).get("cached_decode")
+        if queued is None:
+            queued = embed.get("cached_decode")
+        queued = _as_row_matrix(queued, unspoken.device)
+        if queued is not None:
+            unspoken = torch.cat([unspoken, queued.to(dtype=unspoken.dtype)], dim=0)
+        update_dict.setdefault("embed", {})["cached_decode"] = unspoken
 
     def _talker_cache_thinker_decode_embeds(
         self,
