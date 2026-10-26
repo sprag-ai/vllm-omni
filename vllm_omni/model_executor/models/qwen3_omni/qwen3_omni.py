@@ -437,6 +437,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         return [0, int(accept_layer)] if self.is_staged_run and accept_layer is not None else []
 
     @classmethod
+    def realtime_audio_placeholder(cls) -> str:
+        """Return the prompt text that stands for one audio item in a realtime conversation."""
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
+
+    @classmethod
     async def buffer_realtime_audio(
         cls,
         audio_stream: AsyncGenerator[np.ndarray, None],

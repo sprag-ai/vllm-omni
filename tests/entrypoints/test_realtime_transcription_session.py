@@ -75,7 +75,7 @@ def _connection(transcription: bool, engine: _FakeEngine | None = None) -> Realt
     return conn
 
 
-def _run(conn: RealtimeConnection, mocker, transcription: bool | None = None) -> tuple[list[str], str]:
+def _run(conn: RealtimeConnection, mocker) -> tuple[list[str], str]:
     send = mocker.patch.object(conn, "send", new_callable=mocker.AsyncMock)
     mocker.patch.object(conn, "send_json", new_callable=mocker.AsyncMock)
 
@@ -83,8 +83,7 @@ def _run(conn: RealtimeConnection, mocker, transcription: bool | None = None) ->
         return
         yield
 
-    mode = conn._transcription if transcription is None else transcription
-    asyncio.run(conn._run_generation(no_input(), asyncio.Queue(), mode))
+    asyncio.run(conn._run_generation(no_input(), asyncio.Queue()))
     events = [call.args[0] for call in send.await_args_list]
     deltas = [event.delta for event in events if isinstance(event, TranscriptionDelta)]
     done = [event.text for event in events if isinstance(event, TranscriptionDone)]
@@ -113,23 +112,26 @@ class TestSessionTypeRouting:
         base.assert_awaited_once()
         assert conn._transcription is False
 
-    def test_a_generation_keeps_the_mode_it_started_with(self, mocker) -> None:
-        conn = _connection(transcription=True)
-        run = mocker.patch.object(conn, "_run_generation", new_callable=mocker.MagicMock)
-        buffered = mocker.patch.object(conn, "_buffer_realtime_audio_with_tools")
+    @pytest.mark.parametrize("transcription", [True, False])
+    def test_a_turn_takes_the_path_of_the_mode_it_started_in(self, mocker, transcription: bool) -> None:
+        conn = _connection(transcription=transcription)
+        transcribe = mocker.patch.object(conn, "_run_generation", new_callable=mocker.MagicMock)
+        converse = mocker.patch.object(conn, "_run_conversation_turn", new_callable=mocker.MagicMock)
+        mocker.patch.object(conn, "_buffer_realtime_audio")
         mocker.patch.object(conn, "audio_stream_generator")
         conn.generation_task = None
         conn._tool_result_queue = asyncio.Queue()
 
         async def start():
-            run.return_value = asyncio.sleep(0)
+            transcribe.return_value = asyncio.sleep(0)
+            converse.return_value = asyncio.sleep(0)
             await conn.start_generation()
+            conn._transcription = not transcription
             await conn.generation_task
 
         asyncio.run(start())
-        conn._transcription = False
-        assert run.call_args.args[2] is True
-        assert buffered.call_args.args[2] is True
+        assert transcribe.called is transcription
+        assert converse.called is not transcription
 
     def test_transcription_session_type_enables_transcription(self, mocker) -> None:
         conn = _connection(transcription=False)
@@ -161,11 +163,6 @@ class TestTranscriptionGeneration:
         _run(_connection(transcription=True, engine=engine), mocker)
         assert engine.generate_kwargs["output_modalities"] == ["text"]
 
-    def test_conversational_session_keeps_every_output_modality(self, mocker) -> None:
-        engine = _FakeEngine([_segment_output("Hello.", finished=True)])
-        _run(_connection(transcription=False, engine=engine), mocker)
-        assert engine.generate_kwargs["output_modalities"] is None
-
     def test_joins_segments_with_a_space(self, mocker) -> None:
         engine = _FakeEngine(
             [
@@ -194,18 +191,6 @@ class TestTranscriptionGeneration:
         engine = _FakeEngine([_segment_output("我开始听。", finished=True), _segment_output("他说", finished=True)])
         _, text = _run(_connection(transcription=True, engine=engine), mocker)
         assert text == "我开始听。他说"
-
-    def test_output_follows_the_generation_mode_not_the_live_session(self, mocker) -> None:
-        engine = _FakeEngine([_segment_output("listening.", finished=True), _segment_output("To him.", finished=True)])
-        conn = _connection(transcription=False, engine=engine)
-        _, text = _run(conn, mocker, transcription=True)
-        assert text == "listening. To him."
-        assert engine.generate_kwargs["output_modalities"] == ["text"]
-
-    def test_conversational_session_text_is_unchanged(self, mocker) -> None:
-        engine = _FakeEngine([_segment_output("listening.", finished=True), _segment_output("To him.", finished=True)])
-        _, text = _run(_connection(transcription=False, engine=engine), mocker)
-        assert text == "listening.To him."
 
 
 class _FakeTokenizer:
