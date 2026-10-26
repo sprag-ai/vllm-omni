@@ -635,7 +635,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         logits_index: int | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | OmniOutput
+        | tuple[torch.Tensor, list[torch.Tensor]]
+    ):
         """
         Unified forward pass for all model stages.
 
