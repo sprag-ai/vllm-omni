@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
@@ -48,8 +47,13 @@ class ConversationItem:
     """Whether the reply audio voices all of ``text``; False for a reply cancelled while its text ran ahead."""
     audio_tokens: int | None = None
     """Expanded prompt tokens of the user audio, as the last render reported them."""
-    audio_uuid: str = field(default_factory=lambda: uuid4().hex)
-    """Cache key of the user audio; unique per item instance, so a reused item id never matches stale features."""
+    token_ids: list[int] | None = None
+    """The ids the model generated for an assistant reply, as it generated them; None once the text is edited."""
+    revision: int = 0
+    """Count of edits to the item's content."""
+    instance_id: str = field(default_factory=lambda: uuid4().hex)
+    """Unique per item instance; keys its cached audio features and prompt tokens, so a reused item id never matches
+    stale entries."""
 
     def estimated_audio_tokens(self) -> int:
         """Return the expanded prompt tokens of this item's audio, measured when known."""
@@ -61,14 +65,28 @@ class ConversationItem:
 
 
 @dataclass
+class RenderedUnit:
+    """Consecutive items that render as one stretch of the chat template: a message, or a run of tool results."""
+
+    items: list[ConversationItem]
+    messages: list[dict[str, Any]]
+
+
+@dataclass
 class RenderedConversation:
     """A conversation as chat messages plus the audio its placeholders stand for, in order."""
 
-    messages: list[dict[str, Any]]
+    system: list[dict[str, Any]]
+    """The system message, or nothing when the session has no instructions."""
+    units: list[RenderedUnit]
     audio: list[np.ndarray]
     audio_item_ids: list[str]
-    audio_uuids: list[str]
-    item_ids: list[str]
+    audio_instance_ids: list[str]
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        """The whole conversation as chat messages."""
+        return self.system + [message for unit in self.units for message in unit.messages]
 
 
 @dataclass
@@ -138,21 +156,30 @@ class Conversation:
             cut = min(int(played * self.speaking_rate()), len(item.text))
         if 0 < cut < len(item.text) and not item.text[cut].isspace():
             cut = max(item.text.rfind(" ", 0, cut), 0)
-        item.text = item.text[:cut].rstrip()
+        text = item.text[:cut].rstrip()
+        if text != item.text:
+            item.text = text
+            item.token_ids = None
+            item.revision += 1
         item.audio_out_seconds = played
         item.audio_complete = True
         return True
 
     def render(self, audio_placeholder: str, instructions: str | None = None) -> RenderedConversation:
         """Return the conversation as chat messages, merging the items of one response into one assistant message."""
-        messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}] if instructions else []
+        units: list[RenderedUnit] = []
         audio: list[np.ndarray] = []
         audio_item_ids: list[str] = []
-        audio_uuids: list[str] = []
+        audio_instance_ids: list[str] = []
         open_response: str | None = None
         for item in self.items:
             if item.kind == "function_call_output":
-                messages.append({"role": "tool", "content": item.text})
+                message = {"role": "tool", "content": item.text}
+                if units and units[-1].items[-1].kind == "function_call_output":
+                    units[-1].items.append(item)
+                    units[-1].messages.append(message)
+                else:
+                    units.append(RenderedUnit([item], [message]))
                 open_response = None
             elif item.role == "user":
                 content = item.text
@@ -160,48 +187,24 @@ class Conversation:
                     content = audio_placeholder + content
                     audio.append(item.audio)
                     audio_item_ids.append(item.item_id)
-                    audio_uuids.append(item.audio_uuid)
-                messages.append({"role": "user", "content": content})
+                    audio_instance_ids.append(item.instance_id)
+                units.append(RenderedUnit([item], [{"role": "user", "content": content}]))
                 open_response = None
             else:
                 if open_response is None or item.response_id != open_response:
-                    messages.append({"role": "assistant", "content": ""})
+                    units.append(RenderedUnit([], [{"role": "assistant", "content": ""}]))
                     open_response = item.response_id
-                message = messages[-1]
+                unit = units[-1]
+                unit.items.append(item)
+                message = unit.messages[0]
                 if item.kind == "function_call":
                     message.setdefault("tool_calls", []).append(
                         {"type": "function", "function": {"name": item.name, "arguments": _arguments(item.arguments)}}
                     )
                 else:
                     message["content"] += item.text
-        return RenderedConversation(messages, audio, audio_item_ids, audio_uuids, [item.item_id for item in self.items])
-
-    def fit(self, max_tokens: int, retention: float, count_tokens: Callable[[], int]) -> list[str]:
-        """Drop the oldest items until the conversation fits ``max_tokens``.
-
-        Once over the cap it drops down to ``retention * max_tokens`` rather than to the cap, so the prompt prefix stays
-        unchanged for several turns between drops. A dropped run always ends before a user message, and the newest
-        user message is never dropped.
-
-        Args:
-            count_tokens: Returns the current conversation's expanded prompt length.
-
-        Returns:
-            The ids of the dropped items, oldest first.
-        """
-        if count_tokens() <= max_tokens:
-            return []
-        target = int(max_tokens * retention)
-        last_user = max((i for i, item in enumerate(self.items) if item.role == "user"), default=0)
-        dropped: list[str] = []
-        while last_user > 0 and count_tokens() > target:
-            cut = 1
-            while cut < last_user and self.items[cut].role != "user":
-                cut += 1
-            dropped += [item.item_id for item in self.items[:cut]]
-            self.items = self.items[cut:]
-            last_user -= cut
-        return dropped
+        system = [{"role": "system", "content": instructions}] if instructions else []
+        return RenderedConversation(system, units, audio, audio_item_ids, audio_instance_ids)
 
 
 def _arguments(raw: str | None) -> Any:

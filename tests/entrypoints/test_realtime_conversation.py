@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""A realtime session's conversation: rendering, item edits, truncation, and the context cap."""
+"""A realtime session's conversation: rendering, item edits, and truncation."""
 
 from __future__ import annotations
 
@@ -54,6 +54,7 @@ class TestRender:
         ]
         assert rendered.audio_item_ids == ["u1", "u2"]
         assert len(rendered.audio) == 2
+        assert [[item.item_id for item in unit.items] for unit in rendered.units] == [["u1"], ["a1"], ["u2"]]
 
     def test_a_response_with_text_and_a_tool_call_is_one_assistant_message(self) -> None:
         conversation = Conversation(
@@ -75,6 +76,21 @@ class TestRender:
         }
         assert messages[2] == {"role": "tool", "content": "sunny"}
         assert messages[3] == {"role": "assistant", "content": "It is sunny."}
+
+    def test_a_run_of_tool_results_is_one_unit(self) -> None:
+        conversation = Conversation(
+            [
+                _call("c1", "call_1", "r1"),
+                _call("c2", "call_2", "r1"),
+                ConversationItem("o1", "function_call_output", "tool", text="sunny", call_id="call_1"),
+                ConversationItem("o2", "function_call_output", "tool", text="warm", call_id="call_2"),
+            ]
+        )
+
+        units = conversation.render(AUDIO).units
+
+        assert [[item.item_id for item in unit.items] for unit in units] == [["c1", "c2"], ["o1", "o2"]]
+        assert [len(unit.messages) for unit in units] == [1, 2]
 
     def test_text_user_messages_carry_no_audio(self) -> None:
         rendered = Conversation([ConversationItem("t1", "message", "user", text="hello")]).render(AUDIO)
@@ -115,11 +131,22 @@ class TestTruncate:
         assert item.text == "The train to"
         assert item.audio_out_seconds == 2.0
 
+    def test_cutting_the_text_drops_the_generated_ids_and_bumps_the_revision(self) -> None:
+        item = _assistant("a1", "The train to Chicago leaves at six.", audio_out=4.0)
+        item.token_ids = [1, 2, 3]
+
+        Conversation([item]).truncate("a1", 2000)
+
+        assert (item.token_ids, item.revision) == (None, 1)
+
     def test_playing_past_the_end_keeps_the_whole_reply(self) -> None:
         item = _assistant("a1", "Hello there.", audio_out=1.0)
 
+        item.token_ids = [1, 2]
+
         assert Conversation([item]).truncate("a1", 5000) is True
         assert item.text == "Hello there."
+        assert (item.token_ids, item.revision) == ([1, 2], 0)
 
     def test_nothing_played_empties_the_reply(self) -> None:
         item = _assistant("a1", "Hello there.", audio_out=1.0)
@@ -167,52 +194,3 @@ class TestTruncate:
     def test_only_assistant_messages_truncate(self) -> None:
         assert Conversation([_user_audio("u1")]).truncate("u1", 100) is False
         assert Conversation([]).truncate("a1", 100) is False
-
-
-class TestFit:
-    @staticmethod
-    def _tokens(conversation: Conversation):
-        return lambda: sum(item.estimated_audio_tokens() + 10 for item in conversation.items)
-
-    def test_a_conversation_under_the_cap_is_untouched(self) -> None:
-        conversation = Conversation([_user_audio("u1"), _assistant("a1", "Hi.")])
-
-        assert conversation.fit(1000, 0.7, self._tokens(conversation)) == []
-        assert len(conversation.items) == 2
-
-    def test_over_the_cap_the_oldest_turns_go_down_to_the_retention_share(self) -> None:
-        items = []
-        for turn in range(6):
-            items += [_user_audio(f"u{turn}", seconds=10), _assistant(f"a{turn}", "ok")]
-        conversation = Conversation(items)
-        count = self._tokens(conversation)
-        assert count() > 600
-
-        dropped = conversation.fit(600, 0.6, count)
-
-        assert dropped == ["u0", "a0", "u1", "a1", "u2", "a2", "u3", "a3"]
-        assert count() <= 360
-        assert conversation.items[0].item_id == "u4"
-
-    def test_the_newest_user_message_is_never_dropped(self) -> None:
-        conversation = Conversation([_assistant("a0", "hi"), _user_audio("u1", seconds=100)])
-
-        dropped = conversation.fit(10, 0.5, self._tokens(conversation))
-
-        assert dropped == ["a0"]
-        assert [item.item_id for item in conversation.items] == ["u1"]
-
-    def test_a_tool_call_is_dropped_with_its_output(self) -> None:
-        conversation = Conversation(
-            [
-                _user_audio("u1", seconds=10),
-                _call("c1", "call_1", "r1"),
-                ConversationItem("o1", "function_call_output", "tool", text="sunny", call_id="call_1"),
-                _assistant("a1", "Sunny.", response_id="r1"),
-                _user_audio("u2", seconds=10),
-            ]
-        )
-
-        dropped = conversation.fit(200, 0.9, self._tokens(conversation))
-
-        assert dropped == ["u1", "c1", "o1", "a1"]

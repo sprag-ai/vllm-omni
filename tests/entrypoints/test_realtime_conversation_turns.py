@@ -16,9 +16,10 @@ from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnecti
 from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDone
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.entrypoints.openai import realtime_connection
+from vllm_omni.entrypoints.openai.realtime_compaction import DropOldest
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.realtime_conversation import Conversation, ConversationItem
+from vllm_omni.entrypoints.openai.realtime_prompt import ChatPromptBuilder
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -77,6 +78,23 @@ class _FakeEngine:
         return stream()
 
 
+def _render_chat(messages: list[dict], tools: list[dict] | None, add_generation_prompt: bool) -> str:
+    rendered = "".join(f"<{m['role']}>{m['content']}{json.dumps(m.get('tool_calls', ''))}</>" for m in messages)
+    return (
+        (f"<tools>{json.dumps(tools)}</>" if tools else "")
+        + rendered
+        + ("<assistant>" if add_generation_prompt else "")
+    )
+
+
+async def _encode_texts(texts: list[str]) -> list[list[int]]:
+    return [[ord(c) for c in text] for text in texts]
+
+
+def _prompt_text(prompt: dict) -> str:
+    return "".join(map(chr, prompt["prompt_token_ids"]))
+
+
 @pytest.fixture
 def conn(mocker) -> RealtimeConnection:
     conn = RealtimeConnection.__new__(RealtimeConnection)
@@ -100,13 +118,11 @@ def conn(mocker) -> RealtimeConnection:
     conn._live_item_id = None
     conn._live_truncate_ms = None
     conn._realtime_audio_ref = None
-    mocker.patch.object(conn, "_chat_text", side_effect=lambda messages: json.dumps(messages))
+    mocker.patch.object(conn, "_render_chat", side_effect=_render_chat)
+    mocker.patch.object(conn, "_encode_texts", side_effect=_encode_texts)
     mocker.patch.object(conn, "_sampling_rate", return_value=16_000)
-    mocker.patch.object(
-        realtime_connection,
-        "cached_tokenizer_from_config",
-        return_value=SimpleNamespace(encode=lambda text: [0] * 10),
-    )
+    conn._compactor = DropOldest(0.7)
+    conn._prompt_builder = ChatPromptBuilder(conn._render_chat, conn._encode_texts, "<audio>")
 
     async def render(prompt):
         audio = (prompt.get("multi_modal_data") or {}).get("audio") or []
@@ -170,7 +186,7 @@ class TestHistory:
 
         prompt = conn.engine.prompts[-1]
         assert len(prompt["multi_modal_data"]["audio"]) == 2
-        keys = [conn._conversation.get(i).audio_uuid for i in ("u1", "u2")]
+        keys = [conn._conversation.get(i).instance_id for i in ("u1", "u2")]
         assert prompt["multi_modal_uuids"] == {"audio": [f"ws1:{key}" for key in keys]}
 
     def test_a_reused_item_id_never_reuses_the_old_audio_cache_key(self, conn) -> None:
@@ -328,8 +344,7 @@ class TestToolRounds:
             ("function_call_output", "tool"),
             ("message", "assistant"),
         ]
-        second_round_messages = conn._chat_text.call_args_list[-1].args[0]
-        assert {"role": "tool", "content": "sunny"} in second_round_messages
+        assert "<tool>sunny" in _prompt_text(conn.engine.prompts[-1])
         done = _event(conn.sent, "response.done")
         assert done["usage"]["prompt_tokens"] == 230
         assert done["usage"]["prompt_tokens_details"]["cached_tokens"] == 100

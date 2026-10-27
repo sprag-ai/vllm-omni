@@ -303,7 +303,7 @@ class TestToolChainIsBounded:
         conn._is_connected = True
         conn._next_user_item_id = conn._next_response_item_id = None
         conn.audio_queue = asyncio.Queue()
-        mocker.patch.object(conn, "_fit_context", return_value=[])
+        mocker.patch.object(conn, "_prepare_prompt", new_callable=mocker.AsyncMock, return_value=(None, [], []))
         generate = mocker.patch.object(conn, "_generate_round", new_callable=mocker.AsyncMock, side_effect=rounds)
         mocker.patch.object(
             conn,

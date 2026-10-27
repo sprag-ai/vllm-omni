@@ -27,7 +27,9 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.realtime_compaction import Compactor, ContextBudget, DropOldest
 from vllm_omni.entrypoints.openai.realtime_conversation import Conversation, ConversationItem
+from vllm_omni.entrypoints.openai.realtime_prompt import ChatPrompt, ChatPromptBuilder
 from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallDelta, ToolCallStreamState, extract_deltas
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.qwen3_omni.realtime_segments import segment_separator
@@ -82,6 +84,8 @@ class _Round:
     sent_audio: bool = False
     audio_seconds: float = 0.0
     cancelled: bool = False
+    token_ids: list[int] | None = None
+    """The ids the model generated, when they are exactly the spoken reply."""
 
 
 @dataclass
@@ -186,9 +190,11 @@ class RealtimeConnection(VllmRealtimeConnection):
     `response.done`, carrying the turn's usage
     in the chat-completions shape over the whole context (summed over tool
     rounds), the ids of the items it created, the ids in context, and the ids
-    the context cap dropped. The cap is `SPRAG_REALTIME_CONTEXT_TOKENS`; once it
-    is exceeded the oldest items are dropped down to
-    `SPRAG_REALTIME_CONTEXT_RETENTION` of it.
+    compaction dropped and added. The prompt is joined from per-message token
+    ids, each tokenized once off the event loop. Before each generate the
+    session's compactor sees the prompt's cost per item against the cap,
+    `SPRAG_REALTIME_CONTEXT_TOKENS`; the default drops the oldest items, once
+    the cap is exceeded, down to `SPRAG_REALTIME_CONTEXT_RETENTION` of it.
 
     Tool calling mirrors OpenAI's Realtime API: `session.update` carries
     `tools`; the server streams `response.output_item.added`,
@@ -226,6 +232,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._cancel_requested = False
         self._live_item_id: str | None = None
         self._live_truncate_ms: int | None = None
+        self._compactor: Compactor = DropOldest(_context_limits()[1])
+        self._prompt_builder: ChatPromptBuilder | None = None
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -643,6 +651,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         usage = _TurnUsage()
         created: list[str] = []
         dropped: list[str] = []
+        added: list[str] = []
         spoken = ""
         sent_audio = False
         status = "completed"
@@ -661,10 +670,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                     created.append(user_item_id)
             for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
-                dropped += self._fit_context()
+                chat_prompt, round_dropped, round_added = await self._prepare_prompt()
+                dropped += round_dropped
+                added += round_added
                 message_item_id = response_id if tool_round == 0 else _new_item_id()
                 self._live_item_id, self._live_truncate_ms = message_item_id, None
-                result = await self._generate_round(usage, message_item_id)
+                result = await self._generate_round(usage, message_item_id, chat_prompt)
                 sent_audio |= result.sent_audio
                 spoken += result.spoken
                 created += self._record_round(result, message_item_id, response_id)
@@ -716,6 +727,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "item_ids": created,
                     "context_item_ids": [item.item_id for item in self._conversation.items],
                     "dropped_item_ids": dropped,
+                    "added_item_ids": added,
                     "usage": usage.as_dict(),
                 }
             )
@@ -733,8 +745,10 @@ class RealtimeConnection(VllmRealtimeConnection):
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
 
-    def _chat_text(self, messages: list[dict[str, Any]]) -> str:
-        """Render chat messages and the session's tools through the checkpoint's own chat template."""
+    def _render_chat(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, add_generation_prompt: bool
+    ) -> str:
+        """Render chat messages and tools through the checkpoint's own chat template."""
         model_config = self.serving.model_config
         # Pass the processor's chat_template explicitly: with `tools` set,
         # safe_apply_chat_template's own resolution skips the processor, where
@@ -743,50 +757,74 @@ class RealtimeConnection(VllmRealtimeConnection):
             model_config,
             cached_tokenizer_from_config(model_config),
             messages,
-            tools=self._tools,
+            tools=tools,
             chat_template=cached_processor_from_config(model_config).chat_template,
-            add_generation_prompt=True,
+            add_generation_prompt=add_generation_prompt,
             tokenize=False,
         )
+
+    async def _encode_texts(self, texts: list[str]) -> list[list[int]]:
+        """Tokenize template text in a worker thread, without adding special tokens."""
+        tokenizer = cached_tokenizer_from_config(self.serving.model_config)
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is None:
+            return await asyncio.to_thread(lambda: [tokenizer.encode(t, add_special_tokens=False) for t in texts])
+        # encode holds the GIL throughout, stalling the event loop even from a thread; the batch call releases it.
+        encodings = await asyncio.to_thread(backend.encode_batch_fast, texts, add_special_tokens=False)
+        return [encoding.ids for encoding in encodings]
 
     def _audio_placeholder(self) -> str:
         """Return the prompt text that stands for one audio item."""
         return self.serving.model_cls.realtime_audio_placeholder()
 
-    def _fit_context(self) -> list[str]:
-        """Drop the oldest conversation items over the context cap; return their ids."""
-        max_tokens, retention = _context_limits()
-        tokenizer = cached_tokenizer_from_config(self.serving.model_config)
+    async def _prepare_prompt(self) -> tuple[ChatPrompt, list[str], list[str]]:
+        """Compact the conversation against the context cap and return its prompt.
 
-        def count_tokens() -> int:
-            rendered = self._conversation.render(self._audio_placeholder(), self._instructions)
-            # Each audio placeholder expands from one pad token to the audio's token run.
-            audio_tokens = sum(
-                item.estimated_audio_tokens() - 1 for item in self._conversation.items if item.audio is not None
-            )
-            return len(tokenizer.encode(self._chat_text(rendered.messages))) + audio_tokens
+        Returns:
+            The prompt, then the ids of the items compaction dropped and the ids of those it added.
 
-        return self._conversation.fit(max_tokens, retention, count_tokens)
+        Raises:
+            ValueError: The compactor returned an item id twice.
+        """
+        if self._prompt_builder is None:
+            self._prompt_builder = ChatPromptBuilder(self._render_chat, self._encode_texts, self._audio_placeholder())
+        prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+        budget = ContextBudget(_context_limits()[0], prompt.overhead_tokens, prompt.item_tokens)
+        before = self._conversation.items
+        after = await self._compactor.compact(list(before), budget)
+        after_ids = [item.item_id for item in after]
+        if len(set(after_ids)) != len(after_ids):
+            raise ValueError("compaction returned an item id twice")
+        if [item.instance_id for item in after] == [item.instance_id for item in before]:
+            return prompt, [], []
+        before_ids = {item.item_id for item in before}
+        kept_ids = set(after_ids)
+        dropped = [item.item_id for item in before if item.item_id not in kept_ids]
+        added = [item_id for item_id in after_ids if item_id not in before_ids]
+        self._conversation.items = after
+        prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+        return prompt, dropped, added
 
-    async def _generate_round(self, usage: _TurnUsage, message_item_id: str) -> _Round:
+    async def _generate_round(self, usage: _TurnUsage, message_item_id: str, chat_prompt: ChatPrompt) -> _Round:
         """Generate one reply over the current conversation, streaming its text, audio and tool-call events.
 
         Args:
             message_item_id: The id the round's spoken reply is announced and recorded under.
+            chat_prompt: The conversation's prompt, built after compaction.
         """
-        rendered = self._conversation.render(self._audio_placeholder(), self._instructions)
-        tokenizer = cached_tokenizer_from_config(self.serving.model_config)
-        prompt = TokensPrompt(prompt_token_ids=tokenizer.encode(self._chat_text(rendered.messages)))
-        if rendered.audio:
-            prompt["multi_modal_data"] = {"audio": rendered.audio}
+        prompt = TokensPrompt(prompt_token_ids=chat_prompt.token_ids)
+        if chat_prompt.audio:
+            prompt["multi_modal_data"] = {"audio": chat_prompt.audio}
             # Session-scoped: another session's identical id must never stand in for this audio.
-            prompt["multi_modal_uuids"] = {"audio": [f"{self.connection_id}:{u}" for u in rendered.audio_uuids]}
+            prompt["multi_modal_uuids"] = {
+                "audio": [f"{self.connection_id}:{key}" for key in chat_prompt.audio_instance_ids]
+            }
         if self._speaker:
             prompt["additional_information"] = {"speaker": [self._speaker]}
         streaming_input = await self._render_prompt(prompt)
         engine_input = streaming_input.prompt
         placeholders = (engine_input.get("mm_placeholders") or {}).get("audio") or []
-        for item_id, placeholder in zip(rendered.audio_item_ids, placeholders):
+        for item_id, placeholder in zip(chat_prompt.audio_item_ids, placeholders):
             item = self._conversation.get(item_id)
             if item is not None:
                 item.audio_tokens = placeholder.length
@@ -812,6 +850,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._pending_tool_calls = {}
         tool_state = ToolCallStreamState()
         full_text = ""
+        generated: list[int] = []
         prompt_tokens = completion_tokens = 0
         cached_tokens: int | None = None
         sampling_params_list = coerce_param_message_types(
@@ -831,6 +870,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if getattr(output, "stage_id", None) == 0 and output.outputs:
                     first_output = output.outputs[0]
                     completion_tokens += len(first_output.token_ids)
+                    generated += first_output.token_ids
                     if output.prompt_token_ids:
                         prompt_tokens = max(prompt_tokens, len(output.prompt_token_ids))
                     if getattr(output, "num_cached_tokens", None) is not None:
@@ -876,6 +916,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         usage.add(prompt_tokens, completion_tokens, cached_tokens, _get_mm_token_counts(engine_input))
         if tool_state.has_tool_calls():
             result.tool_calls = [self._pending_tool_calls[i] for i in sorted(self._pending_tool_calls)]
+        elif not result.cancelled and full_text.strip() == result.spoken.strip():
+            result.token_ids = generated
         return result
 
     def _record_round(self, result: _Round, message_item_id: str, response_id: str) -> list[str]:
@@ -891,6 +933,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     response_id=response_id,
                     audio_out_seconds=result.audio_seconds,
                     audio_complete=not result.cancelled,
+                    token_ids=result.token_ids,
                 )
             )
             if self._live_truncate_ms is not None:
