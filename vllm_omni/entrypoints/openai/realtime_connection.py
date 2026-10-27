@@ -252,8 +252,8 @@ class RealtimeConnection(VllmRealtimeConnection):
             user_item_id = event.pop("item_id", None)
             response_item_id = event.pop("response_item_id", None)
             if not event.get("final"):
-                self._next_user_item_id = user_item_id if isinstance(user_item_id, str) else None
-                self._next_response_item_id = response_item_id if isinstance(response_item_id, str) else None
+                self._next_user_item_id = await self._free_item_id(user_item_id)
+                self._next_response_item_id = await self._free_item_id(response_item_id, taken=self._next_user_item_id)
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             await self._create_item(event)
@@ -283,6 +283,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                 self._cancel_requested = True
         else:
             await super().handle_event(event)
+
+    async def _free_item_id(self, item_id: Any, taken: str | None = None) -> str | None:
+        """Return a client-chosen id for a new item, or None after reporting an id that is already in use."""
+        if not isinstance(item_id, str) or not item_id:
+            return None
+        if item_id == taken or self._conversation.get(item_id) is not None:
+            await self.send_error(f"Conversation item {item_id!r} already exists; using a new id", "item_conflict")
+            return None
+        return item_id
 
     async def _create_item(self, event: dict) -> None:
         """Add a client item to the conversation, or hand a tool result to the turn waiting for it."""
@@ -670,8 +679,11 @@ class RealtimeConnection(VllmRealtimeConnection):
                     status = "failed"
                     break
                 results = await self._await_tool_results(result.tool_calls)
-                if results is None:
+                if not self._is_connected:
                     return
+                if results is None:
+                    status = "cancelled"
+                    break
                 for call, output in results:
                     item_id = _new_item_id()
                     self._conversation.add(
@@ -749,7 +761,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         if rendered.audio:
             prompt["multi_modal_data"] = {"audio": rendered.audio}
             # Session-scoped: another session's identical id must never stand in for this audio.
-            prompt["multi_modal_uuids"] = {"audio": [f"{self.connection_id}:{i}" for i in rendered.audio_item_ids]}
+            prompt["multi_modal_uuids"] = {"audio": [f"{self.connection_id}:{u}" for u in rendered.audio_uuids]}
         if self._speaker:
             prompt["additional_information"] = {"speaker": [self._speaker]}
         streaming_input = await self._render_prompt(prompt)
@@ -867,13 +879,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         """Block until the client has submitted a `function_call_output` for every call, in call order.
 
         Returns:
-            None when the client disconnected first.
+            None when the turn was cancelled or the client disconnected first.
         """
         call_ids = {call.call_id for call in calls}
         results: dict[str, str] = {}
         self._awaiting_tool_results = True
         try:
-            while len(results) < len(call_ids) and self._is_connected:
+            while len(results) < len(call_ids) and self._is_connected and not self._cancel_requested:
                 # Bounded wait so a client that disappears mid-tool-call cannot park
                 # this task forever; a slow-but-live client is unaffected.
                 try:
@@ -894,7 +906,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 results[call_id] = item["output"]
         finally:
             self._awaiting_tool_results = False
-        if not self._is_connected:
+        if len(results) < len(call_ids):
             return None
         return [(call, results[call.call_id]) for call in calls]
 

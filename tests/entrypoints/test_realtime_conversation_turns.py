@@ -166,7 +166,19 @@ class TestHistory:
 
         prompt = conn.engine.prompts[-1]
         assert len(prompt["multi_modal_data"]["audio"]) == 2
-        assert prompt["multi_modal_uuids"] == {"audio": ["ws1:u1", "ws1:u2"]}
+        keys = [conn._conversation.get(i).audio_uuid for i in ("u1", "u2")]
+        assert prompt["multi_modal_uuids"] == {"audio": [f"ws1:{key}" for key in keys]}
+
+    def test_a_reused_item_id_never_reuses_the_old_audio_cache_key(self, conn) -> None:
+        conn.engine = _FakeEngine([[_text("Hi.")], [_text("Again.")]])
+        _turn(conn, user="u1", response="r1")
+        first = conn.engine.prompts[0]["multi_modal_uuids"]["audio"]
+
+        conn._conversation.delete("u1")
+        conn._conversation.delete("r1")
+        _turn(conn, user="u1", response="r1")
+
+        assert conn.engine.prompts[1]["multi_modal_uuids"]["audio"] != first
         assert conn._conversation.get("u1").audio_tokens == AUDIO_TOKENS
 
     def test_a_turn_without_audio_generates_over_the_conversation_as_it_stands(self, conn) -> None:
@@ -205,6 +217,29 @@ class TestCancel:
 
 
 class TestToolRounds:
+    def test_cancel_releases_a_turn_waiting_for_tool_results(self, conn) -> None:
+        call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Austin"}}\n</tool_call>'
+        conn.engine = _FakeEngine([[_text(call)]])
+
+        async def cancel_when_waiting():
+            while not conn._awaiting_tool_results:
+                await asyncio.sleep(0.01)
+            conn._cancel_requested = True
+
+        async def run():
+            async def stream():
+                yield np.zeros(16_000, dtype=np.float32)
+
+            conn._next_user_item_id, conn._next_response_item_id = "u1", "r1"
+            await asyncio.wait_for(
+                asyncio.gather(conn._run_conversation_turn(stream()), cancel_when_waiting()), timeout=5
+            )
+
+        asyncio.run(run())
+
+        assert _event(conn.sent, "response.done")["status"] == "cancelled"
+        assert conn._awaiting_tool_results is False
+
     def test_a_tool_round_continues_with_the_result_and_usage_sums_over_rounds(self, conn) -> None:
         call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Austin"}}\n</tool_call>'
         conn.engine = _FakeEngine([[_text(call, prompt=100, cached=0)], [_text("Sunny.", prompt=130, cached=100)]])
@@ -260,6 +295,26 @@ class TestItemEvents:
 
         base.assert_awaited_once_with({"type": "input_audio_buffer.commit", "final": False})
         assert (conn._next_user_item_id, conn._next_response_item_id) == ("u1", "r1")
+
+    def test_a_commit_naming_a_taken_id_reports_it_and_uses_a_new_one(self, conn, mocker) -> None:
+        mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+        conn._conversation.add(ConversationItem("u1", "message", "user", text="hi"))
+
+        self._handle(
+            conn, {"type": "input_audio_buffer.commit", "final": False, "item_id": "u1", "response_item_id": "r1"}
+        )
+
+        assert conn.send_error.await_args.args[1] == "item_conflict"
+        assert (conn._next_user_item_id, conn._next_response_item_id) == (None, "r1")
+
+    def test_a_commit_naming_one_id_twice_keeps_it_for_the_user_item(self, conn, mocker) -> None:
+        mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+
+        self._handle(
+            conn, {"type": "input_audio_buffer.commit", "final": False, "item_id": "x1", "response_item_id": "x1"}
+        )
+
+        assert (conn._next_user_item_id, conn._next_response_item_id) == ("x1", None)
 
     def test_message_items_are_added_after_the_named_item(self, conn) -> None:
         conn._conversation.add(ConversationItem("u1", "message", "user", text="hi"))

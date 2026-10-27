@@ -46,6 +46,7 @@ def tool_call_conn() -> RealtimeConnection:
     conn._tool_result_queue = asyncio.Queue()
     conn._pending_tool_calls = {}
     conn._awaiting_tool_results = False
+    conn._cancel_requested = False
     conn._conversation = Conversation()
     conn.serving = _FakeServing()
     # handle_event's session.update branch now also assigns these.

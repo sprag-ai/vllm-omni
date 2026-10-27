@@ -9,6 +9,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from uuid import uuid4
 
 import numpy as np
 
@@ -39,6 +40,8 @@ class ConversationItem:
     """Seconds of reply audio sent for an assistant item; the basis for truncation."""
     audio_tokens: int | None = None
     """Expanded prompt tokens of the user audio, as the last render reported them."""
+    audio_uuid: str = field(default_factory=lambda: uuid4().hex)
+    """Cache key of the user audio; unique per item instance, so a reused item id never matches stale features."""
 
     def estimated_audio_tokens(self) -> int:
         """Return the expanded prompt tokens of this item's audio, measured when known."""
@@ -56,6 +59,7 @@ class RenderedConversation:
     messages: list[dict[str, Any]]
     audio: list[np.ndarray]
     audio_item_ids: list[str]
+    audio_uuids: list[str]
     item_ids: list[str]
 
 
@@ -118,6 +122,7 @@ class Conversation:
         messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}] if instructions else []
         audio: list[np.ndarray] = []
         audio_item_ids: list[str] = []
+        audio_uuids: list[str] = []
         open_response: str | None = None
         for item in self.items:
             if item.kind == "function_call_output":
@@ -129,6 +134,7 @@ class Conversation:
                     content = audio_placeholder + content
                     audio.append(item.audio)
                     audio_item_ids.append(item.item_id)
+                    audio_uuids.append(item.audio_uuid)
                 messages.append({"role": "user", "content": content})
                 open_response = None
             else:
@@ -142,7 +148,7 @@ class Conversation:
                     )
                 else:
                     message["content"] += item.text
-        return RenderedConversation(messages, audio, audio_item_ids, [item.item_id for item in self.items])
+        return RenderedConversation(messages, audio, audio_item_ids, audio_uuids, [item.item_id for item in self.items])
 
     def fit(self, max_tokens: int, retention: float, count_tokens: Callable[[], int]) -> list[str]:
         """Drop the oldest items until the conversation fits ``max_tokens``.
