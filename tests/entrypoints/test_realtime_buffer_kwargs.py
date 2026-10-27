@@ -50,7 +50,6 @@ def _connection(mocker, buffer) -> RealtimeConnection:
     conn._tools = SESSION["tools"]
     conn._speaker = SESSION["speaker"]
     conn._instructions = SESSION["instructions"]
-    conn._turn_prompt = None
     return conn
 
 
@@ -63,7 +62,7 @@ def test_a_session_on_a_three_argument_buffer_streams_its_prompts(mocker):
     conn = _connection(mocker, buffer)
 
     async def drain():
-        return [item async for item in conn._buffer_realtime_audio_with_tools(None, None, True)]
+        return [item async for item in conn._buffer_realtime_audio(None, None)]
 
     [streamed] = asyncio.run(drain())
     assert streamed.prompt["prompt_token_ids"] == [1]

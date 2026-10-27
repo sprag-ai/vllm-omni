@@ -7,13 +7,15 @@ import asyncio
 import base64
 import inspect
 import json
+import os
 from collections.abc import AsyncGenerator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
 from vllm.engine.protocol import StreamingInput
+from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts
 from vllm.entrypoints.serve.engine.protocol import UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
@@ -25,6 +27,9 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.realtime_compaction import Compactor, ContextBudget, DropOldest
+from vllm_omni.entrypoints.openai.realtime_conversation import Conversation, ConversationItem
+from vllm_omni.entrypoints.openai.realtime_prompt import ChatPrompt, ChatPromptBuilder
 from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallDelta, ToolCallStreamState, extract_deltas
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.qwen3_omni.realtime_segments import segment_separator
@@ -38,6 +43,15 @@ logger = init_logger(__name__)
 _TOOL_RESULT_POLL_S = 0.5
 
 _SESSION_TYPES = frozenset({"realtime", "transcription"})
+
+_DEFAULT_CONTEXT_TOKENS = 16_384
+"""Prompt-token cap of a conversation session."""
+
+_DEFAULT_CONTEXT_RETENTION = 0.7
+"""Share of the cap a conversation is cut back to once it exceeds it."""
+
+_PREPARE_ATTEMPTS = 3
+"""Builds of a round's prompt to try while client edits keep landing during the build or compaction."""
 
 
 def _declared_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -64,61 +78,140 @@ class _PendingToolCall:
     arguments: str = ""
 
 
+@dataclass
+class _Round:
+    """What one generate of a conversation turn produced."""
+
+    spoken: str = ""
+    tool_calls: list[_PendingToolCall] = field(default_factory=list)
+    sent_audio: bool = False
+    audio_seconds: float = 0.0
+    cancelled: bool = False
+    token_ids: list[int] | None = None
+    """The ids the model generated, when they are exactly the spoken reply."""
+
+
+@dataclass
+class _TurnUsage:
+    """Token usage summed over the rounds of one conversation turn."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    multimodal_tokens: dict[str, int] = field(default_factory=dict)
+
+    def add(self, prompt: int, completion: int, cached: int | None, multimodal: dict[str, int]) -> None:
+        """Fold one round's counts into the turn."""
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.cached_tokens += cached or 0
+        for modality, count in multimodal.items():
+            self.multimodal_tokens[modality] = self.multimodal_tokens.get(modality, 0) + count
+
+    def info(self) -> UsageInfo:
+        """Return the turn's totals without details."""
+        return UsageInfo(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.prompt_tokens + self.completion_tokens,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the turn's usage in the chat-completions shape."""
+        return {
+            **self.info().model_dump(exclude_none=True),
+            "prompt_tokens_details": {
+                "cached_tokens": self.cached_tokens,
+                "multimodal_tokens": dict(self.multimodal_tokens),
+            },
+        }
+
+
+def _new_item_id() -> str:
+    """Return a fresh conversation item id."""
+    return f"item_{uuid4().hex[:24]}"
+
+
+def _item_id(item: dict) -> str:
+    """Return a client item's `id`, or a fresh one when it carries none."""
+    item_id = item.get("id")
+    return item_id if isinstance(item_id, str) and item_id else _new_item_id()
+
+
+def _context_limits() -> tuple[int, float]:
+    """Return the conversation's prompt-token cap and retention fraction.
+
+    Read from ``SPRAG_REALTIME_CONTEXT_TOKENS`` and ``SPRAG_REALTIME_CONTEXT_RETENTION``; an unparseable or
+    out-of-range value falls back to its default.
+    """
+    try:
+        cap = int(os.environ.get("SPRAG_REALTIME_CONTEXT_TOKENS", _DEFAULT_CONTEXT_TOKENS))
+    except ValueError:
+        cap = 0
+    try:
+        retention = float(os.environ.get("SPRAG_REALTIME_CONTEXT_RETENTION", _DEFAULT_CONTEXT_RETENTION))
+    except ValueError:
+        retention = -1.0
+    if cap <= 0:
+        logger.warning_once("invalid SPRAG_REALTIME_CONTEXT_TOKENS; using %d", _DEFAULT_CONTEXT_TOKENS)
+        cap = _DEFAULT_CONTEXT_TOKENS
+    if not 0 < retention <= 1:
+        logger.warning_once("invalid SPRAG_REALTIME_CONTEXT_RETENTION; using %s", _DEFAULT_CONTEXT_RETENTION)
+        retention = _DEFAULT_CONTEXT_RETENTION
+    return cap, retention
+
+
 class RealtimeConnection(VllmRealtimeConnection):
     """Omni realtime connection with audio-only server events, plus
-    OpenAI-Realtime-shaped tool/function calling and voice (TTS speaker)
-    selection.
+    OpenAI-Realtime-shaped conversation history, tool/function calling and
+    voice (TTS speaker) selection.
 
     Reuses upstream vLLM websocket/session lifecycle and customizes
     generation output handling to emit audio deltas and tool-call events.
 
-    Tool-calling protocol (mirrors OpenAI's Realtime API event shapes):
-      - client -> server: `session.update` gains an optional `tools` field
-        (list of OpenAI-style tool/function definitions).
-      - server -> client, once the model starts a tool call:
-        `response.output_item.added` (item.type="function_call", name, call_id)
-        `response.function_call_arguments.delta` (call_id, delta)
-        `response.function_call_arguments.done` (call_id, arguments)
-      - client -> server, once the tool has run:
-        `conversation.item.create` with
-        `item = {"type": "function_call_output", "call_id": ..., "output": "..."}`
-      - generation then continues automatically with the tool result appended,
-        streaming the model's actual spoken reply as normal.
+    Conversation sessions keep their history for the life of the socket. Each
+    user turn is one generate over the whole conversation, rendered through the
+    chat template; past user audio stays decoded in the session and carries a
+    session-scoped `multi_modal_uuids` entry, so the processor cache serves its
+    features and the prefix cache serves its KV. Item ids are the client's.
 
-    Audio for a tool-call turn is not forwarded to the client once the
-    `<tool_call>` tag has been parsed - the underlying 3-stage pipeline
-    (thinker->talker->code2wav) still synthesizes it (there is no clean
-    lower-level hook to skip talker/code2wav without changing the shared
-    orchestrator - see PR description), the bytes are just dropped. Any audio
-    that arrived before the tag was recognized has already been sent; in
-    practice the tag appears in the thinker's text well ahead of the
-    corresponding synthesized audio.
+    Conversation protocol (client -> server):
+      - `input_audio_buffer.commit` with `final: false` may carry `item_id` (the
+        user audio item) and `response_item_id` (the assistant reply item).
+      - `conversation.item.create` adds a `message` (user or assistant text, or
+        user `input_audio`) or a `function_call_output`, after
+        `previous_item_id` when given.
+      - `conversation.item.delete` removes an item; `conversation.item.truncate`
+        cuts an assistant item to the `audio_end_ms` the user heard. A truncate
+        naming the reply still being generated applies once that reply ends.
+      - `response.create` starts a turn without new audio, under its optional
+        `response_item_id`; `response.cancel`
+        stops the running one and keeps the text generated so far.
 
-    A chain of tool calls is bounded by MAX_TOOL_ROUNDS.
+    Each spoken reply item is announced by `response.output_item.added` with
+    its `id` before its first text or audio. Each conversation turn ends with
+    `response.done`, carrying the turn's usage
+    in the chat-completions shape over the whole context (summed over tool
+    rounds), the ids of the items it created, the ids in context, and the ids
+    compaction dropped and added. The prompt is joined from per-message token
+    ids, each tokenized once off the event loop. Before each generate the
+    session's compactor sees the prompt's cost per item against the cap,
+    `SPRAG_REALTIME_CONTEXT_TOKENS`; the default drops the oldest items, once
+    the cap is exceeded, down to `SPRAG_REALTIME_CONTEXT_RETENTION` of it.
 
-    Voice selection: `session.update` gains an optional `voice` (or
-    `speaker`) field, mirroring OpenAI's Realtime API. Previously there was
-    no way to select a voice at all - every session silently used whichever
-    key HF's `talker_config.speaker_id` lists first for the checkpoint.
+    Tool calling mirrors OpenAI's Realtime API: `session.update` carries
+    `tools`; the server streams `response.output_item.added`,
+    `response.function_call_arguments.delta` and `.done`; the client answers
+    each call with a `function_call_output` item, and the turn continues with
+    the results in the conversation. Audio for a tool-call round is synthesized
+    but not forwarded once the `<tool_call>` tag has been parsed. A chain of
+    tool calls is bounded by MAX_TOOL_ROUNDS. Once the model has requested a
+    tool, the turn blocks until a result arrives for every pending call; a
+    client that disconnects releases the wait, and malformed or unknown results
+    are reported back.
 
-    Instructions: `session.update` gains an optional `instructions` field
-    (system prompt), mirroring OpenAI's Realtime API. Previously there was
-    no way to set a system prompt at all for /v1/realtime.
-
-    Scope and limitations of the tool-calling path:
-
-    - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
-      full-duplex runtime under `experimental/fullduplex/` has no tool-calling
-      support and shares no code with this.
-    - **Requires `async_chunk` disabled.** `session.update` with `tools` is
-      rejected when the server runs in async-chunk mode; see
-      `_async_chunk_enabled` for why aggregating instead would not be enough.
-      Voice selection is unaffected and works in either mode.
-    - **Waits on client liveness.** Once the model has requested a tool, the turn
-      blocks until a `function_call_output` arrives for every pending call. There
-      is deliberately no deadline, because a slow tool is indistinguishable from
-      an absent one; a client that disconnects releases the wait, and malformed
-      or unknown results are reported back rather than silently dropped.
+    Transcription sessions keep no history: each turn is decoded on its own,
+    in segments when `SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S` is set.
     """
 
     # Upper bound on consecutive tool-call rounds within one user turn.
@@ -129,44 +222,31 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
         self._tools: list[dict[str, Any]] | None = None
-        # The current turn's prompt as handed to the engine BEFORE multimodal
-        # expansion: un-expanded `prompt_token_ids` (one `<|audio_pad|>`) plus the
-        # audio in `multi_modal_data`. Tool-call continuations rebuild from this
-        # rather than from the engine's post-expansion `output.prompt_token_ids`,
-        # because those contain the expanded audio placeholder run with no way to
-        # re-attach the audio - see _await_tool_results_and_continue.
-        self._turn_prompt: dict[str, Any] | None = None
         # parser-assigned index (per generation) -> the call being accumulated
         self._pending_tool_calls: dict[int, _PendingToolCall] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        # Consecutive tool-call rounds in this turn, bounded by MAX_TOOL_ROUNDS.
-        self._tool_rounds = 0
+        self._awaiting_tool_results = False
         self._speaker: str | None = None
         self._instructions: str | None = None
         self._transcription = False
+        self._conversation = Conversation()
+        self._next_user_item_id: str | None = None
+        self._next_response_item_id: str | None = None
+        self._cancel_requested = False
+        self._live_item_id: str | None = None
+        self._live_truncate_ms: int | None = None
+        self._compactor: Compactor = DropOldest(_context_limits()[1])
+        self._prompt_builder: ChatPromptBuilder | None = None
+        # Compaction already applied by a turn that failed before its response.done reported it.
+        self._unreported_dropped: list[str] = []
+        self._unreported_added: list[str] = []
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
         if event_type == "session.update":
             tools = event.get("tools")
             if tools is not None:
-                if self._async_chunk_enabled():
-                    # Refuse rather than half-work. Two independent things break
-                    # under async_chunk: the buffer yields one TokensPrompt per
-                    # segment, so a tool-call continuation would reattach only the
-                    # final segment's audio and lose the start of the utterance;
-                    # and the generation loop never sees one complete thinker turn
-                    # to scan for a <tool_call> block. Aggregating the audio would
-                    # fix only the first, leaving the feature looking supported
-                    # while still broken -- so the limitation is explicit instead.
-                    await self.send_error(
-                        "Tool calling on /v1/realtime requires async_chunk to be disabled "
-                        "(serve with --no-async-chunk); tools were not applied.",
-                        "tools_require_no_async_chunk",
-                    )
-                else:
-                    self._tools = tools
-            # Voice selection is independent of the async_chunk gate above.
+                self._tools = tools
             speaker = event.get("voice") or event.get("speaker")
             if speaker is not None:
                 self._speaker = speaker
@@ -186,70 +266,164 @@ class RealtimeConnection(VllmRealtimeConnection):
             await super().handle_event(event)
             if sets_type:
                 self._transcription = session_type == "transcription"
+        elif event_type == "input_audio_buffer.commit":
+            event = dict(event)
+            # The base's commit model knows only `final`; the conversation ids are ours.
+            user_item_id = event.pop("item_id", None)
+            response_item_id = event.pop("response_item_id", None)
+            if not event.get("final"):
+                self._next_user_item_id = await self._free_item_id(user_item_id)
+                self._next_response_item_id = await self._free_item_id(response_item_id, taken=self._next_user_item_id)
+            await super().handle_event(event)
         elif event_type == "conversation.item.create":
-            item = event.get("item") or {}
-            if item.get("type") == "function_call_output":
-                await self._enqueue_tool_result(item)
+            await self._create_item(event)
+        elif event_type == "conversation.item.delete":
+            item_id = event.get("item_id")
+            if not isinstance(item_id, str) or not self._conversation.delete(item_id):
+                await self.send_error(f"No conversation item {item_id!r}", "item_not_found")
+        elif event_type == "conversation.item.truncate":
+            item_id = event.get("item_id")
+            audio_end_ms = event.get("audio_end_ms")
+            if not isinstance(audio_end_ms, int) or isinstance(audio_end_ms, bool) or audio_end_ms < 0:
+                await self.send_error(
+                    "conversation.item.truncate requires a non-negative audio_end_ms", "invalid_value"
+                )
+            elif item_id is not None and item_id == self._live_item_id and self._conversation.get(item_id) is None:
+                held = self._live_truncate_ms
+                self._live_truncate_ms = audio_end_ms if held is None else min(held, audio_end_ms)
+            elif not isinstance(item_id, str) or not self._conversation.truncate(item_id, audio_end_ms):
+                await self.send_error(f"No assistant message item {item_id!r}", "item_not_found")
+        elif event_type == "response.create":
+            if self._transcription:
+                await self.send_error("response.create is not available on a transcription session", "invalid_event")
+            elif self.generation_task is not None and not self.generation_task.done():
+                await self.send_error("A response is already in progress", "response_in_progress")
             else:
-                await self.send_error(f"Unsupported conversation.item type: {item.get('type')!r}", "unsupported_item")
+                self._tool_rounds_reset()
+                self._next_user_item_id = None
+                self._next_response_item_id = await self._free_item_id(event.get("response_item_id"))
+                self.generation_task = asyncio.create_task(self._run_conversation_turn(None))
+        elif event_type == "response.cancel":
+            if self.generation_task is not None and not self.generation_task.done():
+                self._cancel_requested = True
         else:
             await super().handle_event(event)
 
-    def _async_chunk_enabled(self) -> bool:
-        """Whether the server runs in async-chunk mode.
+    async def _free_item_id(self, item_id: Any, taken: str | None = None) -> str | None:
+        """Return a client-chosen id for a new item, or None after reporting an id that is already in use."""
+        if not isinstance(item_id, str) or not item_id:
+            return None
+        if item_id == taken or self._conversation.get(item_id) is not None:
+            await self.send_error(f"Conversation item {item_id!r} already exists; using a new id", "item_conflict")
+            return None
+        return item_id
 
-        Read off ``model_config`` the same way ``serving_speech.py`` does
-        (``:3232``, ``:3569``).
-        """
-        return bool(getattr(self.serving.model_config, "async_chunk", False))
+    async def _create_item(self, event: dict) -> None:
+        """Add a client item to the conversation, or hand a tool result to the turn waiting for it."""
+        item = event.get("item") or {}
+        item_type = item.get("type")
+        if item_type == "function_call_output":
+            if not await self._valid_tool_result(item):
+                return
+            if self._awaiting_tool_results or self._answers_running_turn(item["call_id"]):
+                self._tool_result_queue.put_nowait(item)
+                return
+            new_item = ConversationItem(
+                item_id=_item_id(item),
+                kind="function_call_output",
+                role="tool",
+                text=item["output"],
+                call_id=item["call_id"],
+            )
+        elif item_type == "message":
+            new_item = await self._message_item(item)
+            if new_item is None:
+                return
+        else:
+            await self.send_error(f"Unsupported conversation.item type: {item_type!r}", "unsupported_item")
+            return
+        previous_item_id = event.get("previous_item_id")
+        try:
+            self._conversation.add(new_item, previous_item_id if isinstance(previous_item_id, str) else None)
+        except KeyError as missing:
+            await self.send_error(f"Conversation item {missing.args[0]!r} is unknown or taken", "item_conflict")
 
-    async def _enqueue_tool_result(self, item: dict) -> None:
-        """Validate a `function_call_output` before it can influence generation.
+    def _answers_running_turn(self, call_id: str) -> bool:
+        """Return whether ``call_id`` names a tool call of the round the running turn generated last."""
+        running = self.generation_task is not None and not self.generation_task.done()
+        return running and any(call.call_id == call_id for call in self._pending_tool_calls.values())
 
-        Without this, any dict carrying the right `type` was accepted: a missing
-        or non-string `call_id` never matched a pending call, and `output` was
-        coerced with `str()`. A client typo therefore left generation waiting
-        with nothing reported back. Shape errors are protocol errors, so they are
-        rejected here rather than discovered later.
+    async def _message_item(self, item: dict) -> ConversationItem | None:
+        """Build a user or assistant message item from its content parts, or report why it is invalid."""
+        role = item.get("role")
+        if role not in ("user", "assistant"):
+            await self.send_error(f"Unsupported message role: {role!r}", "unsupported_item")
+            return None
+        text = ""
+        audio: list[np.ndarray] = []
+        for part in item.get("content") or []:
+            part_type = part.get("type") if isinstance(part, dict) else None
+            if part_type in ("input_text", "text", "output_text") and isinstance(part.get("text"), str):
+                text += part["text"]
+            elif part_type == "input_audio" and role == "user" and isinstance(part.get("audio"), str):
+                try:
+                    pcm = base64.b64decode(part["audio"], validate=True)
+                except ValueError:
+                    await self.send_error("input_audio must be base64 PCM16", "invalid_audio")
+                    return None
+                audio.append(np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0)
+            else:
+                await self.send_error(f"Unsupported content part: {part_type!r}", "unsupported_item")
+                return None
+        return ConversationItem(
+            item_id=_item_id(item),
+            kind="message",
+            role=role,
+            text=text,
+            audio=np.concatenate(audio) if audio else None,
+            sampling_rate=self._sampling_rate(),
+        )
 
-        (Kept as explicit checks for now; supersede with pydantic tool-event
-        models when those land.)
-        """
+    async def _valid_tool_result(self, item: dict) -> bool:
+        """Report a malformed `function_call_output` to the client; return whether it is well formed."""
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
             await self.send_error(
                 "function_call_output requires a non-empty string 'call_id'",
                 "invalid_function_call_output",
             )
-            return
+            return False
         output = item.get("output")
         if not isinstance(output, str):
             await self.send_error(
                 f"function_call_output 'output' must be a string, got {type(output).__name__}",
                 "invalid_function_call_output",
             )
-            return
-        self._tool_result_queue.put_nowait(item)
+            return False
+        return True
+
+    def _tool_rounds_reset(self) -> None:
+        """Discard tool results left over from an earlier turn, which would otherwise answer this turn's calls."""
+        while not self._tool_result_queue.empty():
+            self._tool_result_queue.get_nowait()
+
+    def _sampling_rate(self) -> int:
+        """Return the model's audio input rate."""
+        return int(cached_processor_from_config(self.serving.model_config).feature_extractor.sampling_rate)
 
     async def start_generation(self):
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
 
-        # New user turn: reset the tool-round budget and discard any tool result
-        # left over from a previous turn, which would otherwise be consumed as if
-        # it answered one of this turn's calls.
-        self._tool_rounds = 0
-        while not self._tool_result_queue.empty():
-            self._tool_result_queue.get_nowait()
-
+        self._tool_rounds_reset()
         audio_stream = self.audio_stream_generator()
+        if not self._transcription:
+            self.generation_task = asyncio.create_task(self._run_conversation_turn(audio_stream))
+            return
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        transcription = self._transcription
-        streaming_input_gen = self._buffer_realtime_audio_with_tools(audio_stream, input_stream, transcription)
-        self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream, transcription)
-        )
+        streaming_input_gen = self._buffer_realtime_audio(audio_stream, input_stream)
+        self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
 
     async def _render_prompt(self, prompt: PromptType) -> StreamingInput:
         model_config = self.serving.model_config
@@ -267,15 +441,13 @@ class RealtimeConnection(VllmRealtimeConnection):
             engine_input["additional_information"] = additional_information
         return StreamingInput(prompt=engine_input)
 
-    async def _buffer_realtime_audio_with_tools(
+    async def _buffer_realtime_audio(
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
-        transcription: bool = False,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools`/`self._speaker`/`self._instructions` through
-        to the model's
+        threads `self._speaker`/`self._instructions` through to the model's
         `buffer_realtime_audio`. The base class's `transcribe_realtime` has a
         fixed (audio_stream, input_stream, model_config) call signature with
         no seam for extra per-connection state like these, so this
@@ -284,43 +456,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         buffer_realtime_audio = self.serving.model_cls.buffer_realtime_audio
         session_kwargs = _declared_kwargs(
             buffer_realtime_audio,
-            {
-                "tools": self._tools,
-                "speaker": self._speaker,
-                "instructions": self._instructions,
-                "transcription": transcription,
-            },
+            {"speaker": self._speaker, "instructions": self._instructions, "transcription": True},
         )
         stream_input_iter = buffer_realtime_audio(
             audio_stream, input_stream, self.serving.model_config, **session_kwargs
         )
         async for prompt in stream_input_iter:
-            # Remember the pre-expansion prompt so tool-call continuations can
-            # re-anchor on the user's audio (see self._turn_prompt).
-            if isinstance(prompt, dict):
-                self._turn_prompt = dict(prompt)
             yield await self._render_prompt(prompt)
-
-    async def _render_token_prompt(
-        self,
-        prompt_token_ids: list[int],
-        multi_modal_data: dict[str, Any] | None = None,
-    ) -> AsyncGenerator[StreamingInput, None]:
-        token_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        # Tool-call continuation: re-attach the turn's audio. Without it the
-        # `<|audio_pad|>` placeholder still sits in the token ids but has no
-        # encoder output behind it, so the thinker cannot see what the user asked
-        # and free-associates unrelated tool calls instead of answering.
-        if multi_modal_data:
-            token_prompt["multi_modal_data"] = multi_modal_data
-        # Keep the selected voice for the model's actual spoken reply too, not just
-        # the pre-tool-call turn. This path builds its own TokensPrompt rather than
-        # going through buffer_realtime_audio, so without this the continuation
-        # carries no `speaker` and silently falls back to the checkpoint default -
-        # the voice audibly changes halfway through a tool-calling turn.
-        if self._speaker:
-            token_prompt["additional_information"] = {"speaker": [self._speaker]}
-        yield await self._render_prompt(token_prompt)
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:
@@ -433,26 +575,17 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
-        transcription: bool = False,
     ):
+        """Decode one transcription turn, streaming text deltas and ending with `transcription.done`."""
         request_id = f"rt-{self.connection_id}-{uuid4()}"
-        sent_audio = False
-        audio_done_sent = False
         full_text = ""
         prompt_token_ids_len = 0
         completion_tokens_len = 0
-        self._realtime_audio_ref = None
-
-        request_prompt_token_ids: list[int] = []
-        assistant_token_ids: list[int] = []
-        tool_state = ToolCallStreamState()
-        self._pending_tool_calls = {}
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
-        sampling_params_list = list(self.engine.default_sampling_params_list)
         sampling_params_list = coerce_param_message_types(
-            sampling_params_list,
+            list(self.engine.default_sampling_params_list),
             is_streaming=True,
         )
 
@@ -464,75 +597,31 @@ class RealtimeConnection(VllmRealtimeConnection):
                 prompt=streaming_input_gen,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
-                output_modalities=["text"] if transcription else None,
+                output_modalities=["text"],
             )
 
             async for output in result_gen:
-                stage_id = getattr(output, "stage_id", None)
-                if stage_id == 0 and output.outputs:
+                if getattr(output, "stage_id", None) == 0 and output.outputs:
                     first_output = output.outputs[0]
                     new_token_ids = list(first_output.token_ids)
                     if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
-                        assistant_token_ids.extend(new_token_ids)
-
                     if output.prompt_token_ids:
-                        prompt_token_ids_len = max(
-                            prompt_token_ids_len,
-                            len(output.prompt_token_ids),
-                        )
-                        if not request_prompt_token_ids:
-                            request_prompt_token_ids = list(output.prompt_token_ids)
+                        prompt_token_ids_len = max(prompt_token_ids_len, len(output.prompt_token_ids))
 
                     delta_text = first_output.text or ""
-                    if transcription and segment_finished and delta_text:
+                    if segment_finished and delta_text:
                         delta_text = segment_separator(full_text, delta_text) + delta_text
                         segment_finished = False
                     if first_output.finish_reason is not None:
                         segment_finished = True
                     full_text += delta_text
                     completion_tokens_len += len(new_token_ids)
-
                     if delta_text:
-                        content_delta, tool_deltas = extract_deltas(full_text, tool_state)
-                        if content_delta:
-                            await self.send(TranscriptionDelta(delta=content_delta))
-                        if tool_deltas:
-                            await self._emit_tool_call_deltas(tool_deltas)
-
-                audio_chunks, sample_rate = self._extract_audio_chunks(output)
-                if audio_chunks and not tool_state.has_tool_calls():
-                    for chunk in audio_chunks:
-                        sent_audio = True
-                        await self.send_json(
-                            {
-                                "type": "response.output_audio.delta",
-                                "audio": self._pcm16_b64(chunk),
-                                "format": "pcm16",
-                                "sample_rate_hz": sample_rate,
-                            }
-                        )
-                # else: a tool-call turn - the pipeline still synthesizes audio for the
-                # raw <tool_call> text (no cheap hook to skip talker/code2wav for just
-                # this turn), we just don't forward it to the client.
+                        await self.send(TranscriptionDelta(delta=delta_text))
 
                 if not self._is_connected:
                     break
-
-            if tool_state.has_tool_calls():
-                for call in self._pending_tool_calls.values():
-                    await self.send_json(
-                        {
-                            "type": "response.function_call_arguments.done",
-                            "call_id": call.call_id,
-                            "arguments": call.arguments,
-                        }
-                    )
-                if self._is_connected:
-                    await self._await_tool_results_and_continue(
-                        request_prompt_token_ids, assistant_token_ids, transcription
-                    )
-                return
 
             usage = UsageInfo(
                 prompt_tokens=prompt_token_ids_len,
@@ -540,10 +629,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                 total_tokens=prompt_token_ids_len + completion_tokens_len,
             )
             await self.send(TranscriptionDone(text=full_text, usage=usage))
-
-            if sent_audio:
-                await self.send_json({"type": "response.output_audio.done", "has_audio": True})
-                audio_done_sent = True
         except Exception as e:
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
@@ -558,8 +643,116 @@ class RealtimeConnection(VllmRealtimeConnection):
                     await result_gen.aclose()
                 except Exception:
                     logger.exception("Failed to close realtime result generator")
-            # Always send terminal event so clients don't hang forever.
-            if self._is_connected and not audio_done_sent and not tool_state.has_tool_calls():
+            if self._is_connected:
+                try:
+                    await self.send_json({"type": "response.output_audio.done", "has_audio": False})
+                except Exception:
+                    logger.exception("Failed to send response.output_audio.done")
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+
+    async def _run_conversation_turn(self, audio_stream: AsyncGenerator[np.ndarray, None] | None) -> None:
+        """Run one conversation turn: add the user's audio, generate over the whole conversation, and record the reply.
+
+        A turn without `audio_stream` (`response.create`) generates over the conversation as it stands.
+        """
+        user_item_id, self._next_user_item_id = self._next_user_item_id or _new_item_id(), None
+        response_id, self._next_response_item_id = self._next_response_item_id or _new_item_id(), None
+        self._cancel_requested = False
+        usage = _TurnUsage()
+        created: list[str] = []
+        spoken = ""
+        sent_audio = False
+        status = "completed"
+        try:
+            if audio_stream is not None:
+                chunks = [chunk async for chunk in audio_stream]
+                if chunks:
+                    self._conversation.add(
+                        ConversationItem(
+                            item_id=user_item_id,
+                            kind="message",
+                            role="user",
+                            audio=np.concatenate(chunks),
+                            sampling_rate=self._sampling_rate(),
+                        )
+                    )
+                    created.append(user_item_id)
+            for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+                chat_prompt, round_dropped, round_added = await self._prepare_prompt()
+                self._unreported_dropped += round_dropped
+                self._unreported_added += round_added
+                message_item_id = response_id if tool_round == 0 else _new_item_id()
+                self._live_item_id, self._live_truncate_ms = message_item_id, None
+                result = await self._generate_round(usage, message_item_id, chat_prompt)
+                sent_audio |= result.sent_audio
+                spoken += result.spoken
+                created += self._record_round(result, message_item_id, response_id)
+                self._live_item_id = None
+                if result.cancelled:
+                    status = "cancelled"
+                    break
+                if not result.tool_calls:
+                    break
+                for call in result.tool_calls:
+                    await self.send_json(
+                        {
+                            "type": "response.function_call_arguments.done",
+                            "call_id": call.call_id,
+                            "arguments": call.arguments,
+                        }
+                    )
+                if tool_round == self.MAX_TOOL_ROUNDS:
+                    # A model that keeps re-emitting tool calls instead of answering
+                    # would otherwise recurse without bound.
+                    logger.warning("tool-call chain exceeded %d rounds; abandoning turn", self.MAX_TOOL_ROUNDS)
+                    await self.send_error(
+                        f"Tool-call chain exceeded {self.MAX_TOOL_ROUNDS} rounds without a final response",
+                        "tool_call_loop",
+                    )
+                    status = "failed"
+                    break
+                results = await self._await_tool_results(result.tool_calls)
+                if not self._is_connected:
+                    return
+                if results is None:
+                    status = "cancelled"
+                    break
+                for call, output_item in results:
+                    item_id = await self._free_item_id(output_item.get("id")) or _new_item_id()
+                    self._conversation.add(
+                        ConversationItem(
+                            item_id=item_id,
+                            kind="function_call_output",
+                            role="tool",
+                            text=output_item["output"],
+                            call_id=call.call_id,
+                        )
+                    )
+                    created.append(item_id)
+
+            dropped, self._unreported_dropped = self._unreported_dropped, []
+            added, self._unreported_added = self._unreported_added, []
+            await self.send(TranscriptionDone(text=spoken, usage=usage.info()))
+            await self.send_json(
+                {
+                    "type": "response.done",
+                    "response_id": response_id,
+                    "status": status,
+                    "item_ids": created,
+                    "context_item_ids": [item.item_id for item in self._conversation.items],
+                    "dropped_item_ids": dropped,
+                    "added_item_ids": added,
+                    "usage": usage.as_dict(),
+                }
+            )
+        except Exception as e:
+            logger.exception("Error in generation: %s", e)
+            await self.send_error(str(e), "processing_error")
+        finally:
+            self._live_item_id = None
+            # Always send the terminal event so clients don't hang forever.
+            if self._is_connected:
                 try:
                     await self.send_json({"type": "response.output_audio.done", "has_audio": sent_audio})
                 except Exception:
@@ -567,143 +760,269 @@ class RealtimeConnection(VllmRealtimeConnection):
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
 
-    @staticmethod
-    def _close_assistant_turn(tokenizer, assistant_token_ids: list[int]) -> list[int]:
-        """Terminate the model's tool-call turn with `<|im_end|>\\n` before a
-        tool-result turn is appended.
-
-        The tool-result suffix opens with `<|im_start|>user`, but the raw generated
-        token ids stop at the tool call without the closing `<|im_end|>` that the
-        chat template would emit. Splicing them directly yields
-        `</tool_call><|im_start|>user`, leaving the assistant turn open - a
-        malformed conversation the thinker responds to by re-emitting the same tool
-        call instead of answering, looping until something bounds it. The reference
-        HF path answers the identical prompt because `apply_chat_template` closes
-        the turn. Idempotent: only the missing pieces are added.
-        """
-        ids = list(assistant_token_ids)
-        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
-        if im_end_id in (None, getattr(tokenizer, "unk_token_id", None)):
-            return ids  # unexpected tokenizer; leave the splice untouched
-        if im_end_id not in ids[-2:]:
-            ids.append(im_end_id)
-        if newline_ids and ids[-len(newline_ids) :] != newline_ids:
-            ids.extend(newline_ids)
-        return ids
-
-    async def _await_tool_results_and_continue(
-        self,
-        prior_prompt_token_ids: list[int],
-        assistant_token_ids: list[int],
-        transcription: bool = False,
-    ) -> None:
-        """Block until the client has submitted a `function_call_output` for
-        every pending tool call from the turn that just finished, then splice
-        the results onto the raw token sequence (prior prompt + the model's
-        own generated tool-call tokens + a freshly-rendered tool-result turn)
-        and continue generation - which streams the model's actual spoken
-        reply as a normal `_run_generation` call, recursing again if the
-        model chains into another tool call (bounded by MAX_TOOL_ROUNDS)."""
-        self._tool_rounds += 1
-        if self._tool_rounds > self.MAX_TOOL_ROUNDS:
-            # A model that keeps re-emitting tool calls instead of answering
-            # would otherwise recurse without bound. Observed during bring-up
-            # when the spliced prompt was malformed (see _close_assistant_turn).
-            logger.warning("tool-call chain exceeded %d rounds; abandoning turn", self.MAX_TOOL_ROUNDS)
-            if self._is_connected:
-                await self.send_error(
-                    f"Tool-call chain exceeded {self.MAX_TOOL_ROUNDS} rounds without a final response",
-                    "tool_call_loop",
-                )
-            return
-
-        pending = dict(self._pending_tool_calls)
-        call_id_to_index = {call.call_id: idx for idx, call in pending.items()}
-        results_by_index: dict[int, str] = {}
-
-        while len(results_by_index) < len(pending) and self._is_connected:
-            # Bounded wait so a client that disappears mid-tool-call cannot park
-            # this task forever; a slow-but-live client is unaffected.
-            try:
-                item = await asyncio.wait_for(self._tool_result_queue.get(), timeout=_TOOL_RESULT_POLL_S)
-            except TimeoutError:
-                continue
-            call_id = item.get("call_id")
-            idx = call_id_to_index.get(call_id)
-            if idx is None:
-                # Tell the client: silently dropping this would leave the turn
-                # waiting for a result that is never going to match. Keep waiting
-                # afterwards, since the correct result may still arrive.
-                logger.warning("received function_call_output for unknown call_id=%s", call_id)
-                await self.send_error(
-                    f"No pending tool call with call_id={call_id!r}; expected one of {sorted(call_id_to_index)}",
-                    "unknown_tool_call_id",
-                )
-                continue
-            # `output` is validated as a string at ingress (_enqueue_tool_result).
-            results_by_index[idx] = item["output"]
-
-        if not self._is_connected:
-            return
-
+    def _render_chat(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, add_generation_prompt: bool
+    ) -> str:
+        """Render chat messages and tools through the checkpoint's own chat template."""
         model_config = self.serving.model_config
-        tokenizer = cached_tokenizer_from_config(model_config)
-        # Pass the processor's chat_template explicitly - see the matching
-        # comment in Qwen3OmniMoeForConditionalGeneration.buffer_realtime_audio
-        # for why relying on safe_apply_chat_template's own auto-resolution
-        # is unsafe for this checkpoint.
-        processor = cached_processor_from_config(model_config)
-        # One `role="tool"` message PER result, in call order. The chat template
-        # emits one <tool_response> block per tool message and groups consecutive
-        # tool messages under a single <|im_start|>user turn, so passing separate
-        # messages is what lets the model associate each result with its call.
-        # Joining the results instead produces a single <tool_response> holding
-        # both outputs, which breaks parallel calls.
-        #
-        # `sorted()` on the parser-assigned index is call order: extract_deltas
-        # appends `tool_call_starts` in the order <tool_call> appears in the
-        # generated text, so this is stable regardless of the order in which the
-        # client returns the results.
-        #
-        # No `tools=` here: this continues a conversation whose token history
-        # already carries the tools system preamble; it is not a fresh turn.
-        tool_messages: list[dict[str, str]] = [
-            {"role": "tool", "content": results_by_index[i]} for i in sorted(results_by_index)
-        ]
-        suffix_text = safe_apply_chat_template(
+        # Pass the processor's chat_template explicitly: with `tools` set,
+        # safe_apply_chat_template's own resolution skips the processor, where
+        # this checkpoint's template lives, and falls back to a generic template.
+        return safe_apply_chat_template(
             model_config,
-            tokenizer,
-            tool_messages,
-            chat_template=processor.chat_template,
-            add_generation_prompt=True,
+            cached_tokenizer_from_config(model_config),
+            messages,
+            tools=tools,
+            chat_template=cached_processor_from_config(model_config).chat_template,
+            add_generation_prompt=add_generation_prompt,
             tokenize=False,
         )
-        # Splice onto the turn's PRE-expansion prompt, not the engine's
-        # post-expansion `output.prompt_token_ids`. The latter carries the expanded
-        # `<|audio_pad|>` run, and re-submitting it as a bare TokensPrompt drops the
-        # audio itself: the thinker then sees placeholder tokens with no encoder
-        # output, loses the user's question entirely, and answers by inventing
-        # further tool calls (unrelated cities/items) instead of replying. Falling
-        # back to `prior_prompt_token_ids` only matters for a continuation that never
-        # went through buffer_realtime_audio (no audio to lose in that case).
-        base_prompt = self._turn_prompt or {}
-        base_token_ids = list(base_prompt.get("prompt_token_ids") or prior_prompt_token_ids)
-        multi_modal_data = base_prompt.get("multi_modal_data")
-        continuation_token_ids = (
-            base_token_ids + self._close_assistant_turn(tokenizer, assistant_token_ids) + tokenizer.encode(suffix_text)
-        )
 
-        # Advance the base so a chained tool call next round splices onto this
-        # turn's full history while the audio stays attached exactly once, at the
-        # front, still un-expanded.
-        if self._turn_prompt is not None:
-            self._turn_prompt = {**base_prompt, "prompt_token_ids": continuation_token_ids}
+    async def _encode_texts(self, texts: list[str]) -> list[list[int]]:
+        """Tokenize template text in a worker thread, without adding special tokens."""
+        tokenizer = cached_tokenizer_from_config(self.serving.model_config)
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is None:
+            return await asyncio.to_thread(lambda: [tokenizer.encode(t, add_special_tokens=False) for t in texts])
+        # encode holds the GIL throughout, stalling the event loop even from a thread; the batch call releases it.
+        encodings = await asyncio.to_thread(backend.encode_batch_fast, texts, add_special_tokens=False)
+        return [encoding.ids for encoding in encodings]
 
-        input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        await self._run_generation(
-            self._render_token_prompt(continuation_token_ids, multi_modal_data), input_stream, transcription
+    def _audio_placeholder(self) -> str:
+        """Return the prompt text that stands for one audio item."""
+        return self.serving.model_cls.realtime_audio_placeholder()
+
+    async def _prepare_prompt(self) -> tuple[ChatPrompt, list[str], list[str]]:
+        """Compact the conversation against the context cap and return its prompt.
+
+        A client edit that lands while the prompt is built or compacted restarts the preparation, up to
+        `_PREPARE_ATTEMPTS` times; after that the round generates without compacting.
+
+        Returns:
+            The prompt, then the ids of the items compaction dropped and the ids of those it added.
+
+        Raises:
+            ValueError: The compactor returned an item id twice.
+        """
+        if self._prompt_builder is None:
+            tokenizer = cached_tokenizer_from_config(self.serving.model_config)
+            self._prompt_builder = ChatPromptBuilder(
+                self._render_chat, self._encode_texts, self._audio_placeholder(), tokenizer.all_special_ids
+            )
+        for _ in range(_PREPARE_ATTEMPTS):
+            state = self._conversation_state()
+            prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+            budget = ContextBudget(_context_limits()[0], prompt.overhead_tokens, prompt.item_tokens)
+            before = list(self._conversation.items)
+            after = await self._compactor.compact(before, budget)
+            if self._conversation_state() != state:
+                continue
+            after_ids = [item.item_id for item in after]
+            if len(set(after_ids)) != len(after_ids):
+                raise ValueError("compaction returned an item id twice")
+            if [item.instance_id for item in after] == [item.instance_id for item in before]:
+                return prompt, [], []
+            before_ids = {item.item_id for item in before}
+            kept_ids = set(after_ids)
+            dropped = [item.item_id for item in before if item.item_id not in kept_ids]
+            added = [item_id for item_id in after_ids if item_id not in before_ids]
+            self._conversation.items = after
+            prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+            return prompt, dropped, added
+        logger.warning("conversation edited during every prompt build; generating without compaction")
+        return prompt, [], []
+
+    def _conversation_state(self) -> list[tuple[str, int]]:
+        """Return the conversation's item instances and revisions, which change with every client edit."""
+        return [(item.instance_id, item.revision) for item in self._conversation.items]
+
+    async def _generate_round(self, usage: _TurnUsage, message_item_id: str, chat_prompt: ChatPrompt) -> _Round:
+        """Generate one reply over the current conversation, streaming its text, audio and tool-call events.
+
+        Args:
+            message_item_id: The id the round's spoken reply is announced and recorded under.
+            chat_prompt: The conversation's prompt, built after compaction.
+        """
+        prompt = TokensPrompt(prompt_token_ids=chat_prompt.token_ids)
+        if chat_prompt.audio:
+            prompt["multi_modal_data"] = {"audio": chat_prompt.audio}
+            # Session-scoped: another session's identical id must never stand in for this audio.
+            prompt["multi_modal_uuids"] = {
+                "audio": [f"{self.connection_id}:{key}" for key in chat_prompt.audio_instance_ids]
+            }
+        if self._speaker:
+            prompt["additional_information"] = {"speaker": [self._speaker]}
+        streaming_input = await self._render_prompt(prompt)
+        engine_input = streaming_input.prompt
+        placeholders = (engine_input.get("mm_placeholders") or {}).get("audio") or []
+        for item_id, placeholder in zip(chat_prompt.audio_item_ids, placeholders):
+            item = self._conversation.get(item_id)
+            if item is not None:
+                item.audio_tokens = placeholder.length
+
+        async def single_input():
+            yield streaming_input
+
+        result = _Round()
+        announced = False
+
+        async def announce() -> None:
+            nonlocal announced
+            if not announced:
+                announced = True
+                await self.send_json(
+                    {
+                        "type": "response.output_item.added",
+                        "item": {"type": "message", "role": "assistant", "id": message_item_id},
+                    }
+                )
+
+        self._realtime_audio_ref = None
+        self._pending_tool_calls = {}
+        tool_state = ToolCallStreamState()
+        full_text = ""
+        generated: list[int] = []
+        prompt_tokens = completion_tokens = 0
+        cached_tokens: int | None = None
+        sampling_params_list = coerce_param_message_types(
+            list(self.engine.default_sampling_params_list),
+            is_streaming=True,
         )
+        result_gen = self.engine.generate(
+            prompt=single_input(),
+            request_id=f"rt-{self.connection_id}-{uuid4()}",
+            sampling_params_list=sampling_params_list,
+        )
+        try:
+            async for output in result_gen:
+                if self._cancel_requested:
+                    result.cancelled = True
+                    break
+                if getattr(output, "stage_id", None) == 0 and output.outputs:
+                    first_output = output.outputs[0]
+                    completion_tokens += len(first_output.token_ids)
+                    generated += first_output.token_ids
+                    if output.prompt_token_ids:
+                        prompt_tokens = max(prompt_tokens, len(output.prompt_token_ids))
+                    if getattr(output, "num_cached_tokens", None) is not None:
+                        cached_tokens = max(cached_tokens or 0, output.num_cached_tokens)
+                    delta_text = first_output.text or ""
+                    if delta_text:
+                        full_text += delta_text
+                        content_delta, tool_deltas = extract_deltas(full_text, tool_state)
+                        if content_delta:
+                            await announce()
+                            result.spoken += content_delta
+                            await self.send(TranscriptionDelta(delta=content_delta))
+                        if tool_deltas:
+                            await self._emit_tool_call_deltas(tool_deltas)
+
+                audio_chunks, sample_rate = self._extract_audio_chunks(output)
+                if audio_chunks and not tool_state.has_tool_calls():
+                    await announce()
+                    for chunk in audio_chunks:
+                        result.sent_audio = True
+                        result.audio_seconds += len(chunk) / sample_rate
+                        await self.send_json(
+                            {
+                                "type": "response.output_audio.delta",
+                                "audio": self._pcm16_b64(chunk),
+                                "format": "pcm16",
+                                "sample_rate_hz": sample_rate,
+                            }
+                        )
+                # else: a tool-call round - the pipeline still synthesizes audio for the
+                # raw <tool_call> text (no cheap hook to skip talker/code2wav for just
+                # this round), we just don't forward it to the client.
+
+                if not self._is_connected:
+                    break
+        finally:
+            # Closing aborts the engine request now; a cancelled or disconnected
+            # round must not keep cycling through the stages (issue #4271).
+            try:
+                await result_gen.aclose()
+            except Exception:
+                logger.exception("Failed to close realtime result generator")
+        usage.add(prompt_tokens, completion_tokens, cached_tokens, _get_mm_token_counts(engine_input))
+        if tool_state.has_tool_calls():
+            result.tool_calls = [self._pending_tool_calls[i] for i in sorted(self._pending_tool_calls)]
+        elif not result.cancelled and full_text.strip() == result.spoken.strip():
+            result.token_ids = generated
+        return result
+
+    def _record_round(self, result: _Round, message_item_id: str, response_id: str) -> list[str]:
+        """Add a round's spoken reply and tool calls to the conversation; return the new item ids."""
+        created: list[str] = []
+        if result.spoken.strip():
+            self._conversation.add(
+                ConversationItem(
+                    item_id=message_item_id,
+                    kind="message",
+                    role="assistant",
+                    text=result.spoken.strip(),
+                    response_id=response_id,
+                    audio_out_seconds=result.audio_seconds,
+                    audio_complete=not result.cancelled,
+                    token_ids=result.token_ids,
+                )
+            )
+            if self._live_truncate_ms is not None:
+                self._conversation.truncate(message_item_id, self._live_truncate_ms)
+            created.append(message_item_id)
+        for call in result.tool_calls:
+            item_id = _new_item_id()
+            self._conversation.add(
+                ConversationItem(
+                    item_id=item_id,
+                    kind="function_call",
+                    role="assistant",
+                    call_id=call.call_id,
+                    name=call.name,
+                    arguments=call.arguments,
+                    response_id=response_id,
+                )
+            )
+            created.append(item_id)
+        return created
+
+    async def _await_tool_results(
+        self, calls: list[_PendingToolCall]
+    ) -> list[tuple[_PendingToolCall, dict[str, Any]]] | None:
+        """Block until the client has submitted a `function_call_output` for every call, in call order.
+
+        Returns:
+            Each call with the first output item submitted for it; None when the turn was cancelled or the client
+            disconnected first.
+        """
+        call_ids = {call.call_id for call in calls}
+        results: dict[str, dict[str, Any]] = {}
+        self._awaiting_tool_results = True
+        try:
+            while len(results) < len(call_ids) and self._is_connected and not self._cancel_requested:
+                # Bounded wait so a client that disappears mid-tool-call cannot park
+                # this task forever; a slow-but-live client is unaffected.
+                try:
+                    item = await asyncio.wait_for(self._tool_result_queue.get(), timeout=_TOOL_RESULT_POLL_S)
+                except TimeoutError:
+                    continue
+                call_id = item.get("call_id")
+                if call_id not in call_ids:
+                    # Tell the client: silently dropping this would leave the turn
+                    # waiting for a result that is never going to match. Keep waiting
+                    # afterwards, since the correct result may still arrive.
+                    logger.warning("received function_call_output for unknown call_id=%s", call_id)
+                    await self.send_error(
+                        f"No pending tool call with call_id={call_id!r}; expected one of {sorted(call_ids)}",
+                        "unknown_tool_call_id",
+                    )
+                    continue
+                results.setdefault(call_id, item)
+        finally:
+            self._awaiting_tool_results = False
+        if len(results) < len(call_ids):
+            return None
+        return [(call, results[call.call_id]) for call in calls]
 
     async def send_json(self, payload: dict):
         try:
