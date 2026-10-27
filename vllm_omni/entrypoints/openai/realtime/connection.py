@@ -61,6 +61,7 @@ from vllm_omni.entrypoints.openai.realtime.session import (
 )
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
+from vllm_omni.utils.speakers import validate_requested_speaker
 
 logger = init_logger(__name__)
 
@@ -97,6 +98,7 @@ class _ResolvedResponse:
     tools: list[Any] | None
     tool_choice: Any
     metadata: Any
+    voice: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -617,6 +619,12 @@ class OpenAIFullDuplexConnection:
         if tools and tool_choice != "none" and self._tool_call_parser_name is None:
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
 
+        voice = self._requested_voice(s.config.audio)
+        if response_cfg is not None:
+            voice = self._requested_voice(getattr(response_cfg, "audio", None)) or voice
+        supported_speakers = getattr(self.chat_handler, "_get_supported_speakers", lambda: set())()
+        voice = validate_requested_speaker(voice, supported_speakers)
+
         resolved_input = self._resolve_response_input(response_input) if response_input is not None else None
         return _ResolvedResponse(
             input=resolved_input,
@@ -626,7 +634,16 @@ class OpenAIFullDuplexConnection:
             tools=tools,
             tool_choice=tool_choice,
             metadata=metadata,
+            voice=voice,
         )
+
+    @staticmethod
+    def _requested_voice(audio: Any) -> str | None:
+        """Return the voice an ``audio`` config names for output, by name or by custom voice id."""
+        voice = getattr(getattr(audio, "output", None), "voice", None)
+        if voice is None or isinstance(voice, str):
+            return voice
+        return getattr(voice, "id", None)
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
         s = self.session
@@ -775,6 +792,7 @@ class OpenAIFullDuplexConnection:
                 tools=response.tools,
                 instructions=response.instructions,
                 items=preflight_items,
+                voice=response.voice,
             )
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -1807,6 +1825,7 @@ class OpenAIFullDuplexConnection:
         instructions: str | None = None,
         items: list[types.ConversationItem] | None = None,
         skip_mm_cache: bool = False,
+        voice: str | None = None,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
         chat_handler = self.chat_handler
@@ -1874,6 +1893,8 @@ class OpenAIFullDuplexConnection:
                     messages.append({"role": "system", "content": text})
 
         request = ChatCompletionRequest(model=self.model_name, messages=messages)
+        if voice is not None:
+            request.voice = voice
         _, (engine_input,) = await chat_handler._preprocess_chat(
             request,
             messages,

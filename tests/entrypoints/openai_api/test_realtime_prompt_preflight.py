@@ -976,3 +976,46 @@ def test_usage_splits_input_tokens_by_modality() -> None:
         "input_token_details": {"text_tokens": 20, "audio_tokens": 90, "image_tokens": 10, "cached_tokens": 64},
         "output_token_details": {"text_tokens": 7},
     }
+
+
+def _session_with_voice(connection: OpenAIFullDuplexConnection, voice: str) -> None:
+    connection.session.config.audio.output.voice = voice
+
+
+def test_voice_resolves_from_the_session_and_a_response_overrides_it() -> None:
+    connection, _ = _make_connection()
+    connection.chat_handler._get_supported_speakers = lambda: {"ethan", "chelsie"}
+    _session_with_voice(connection, "Chelsie")
+
+    assert connection._resolve_response(None).voice == "chelsie"
+    override = types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "ethan"}}})
+    assert connection._resolve_response(override).voice == "ethan"
+
+
+def test_an_unsupported_voice_is_refused() -> None:
+    connection, _ = _make_connection()
+    connection.chat_handler._get_supported_speakers = lambda: {"ethan"}
+    _session_with_voice(connection, "nobody")
+
+    with pytest.raises(ValueError, match="Invalid speaker"):
+        connection._resolve_response(None)
+
+
+@pytest.mark.asyncio
+async def test_the_voice_reaches_the_chat_request() -> None:
+    connection, _ = _make_connection()
+    requests: list[Any] = []
+    preprocess = connection.chat_handler._preprocess_chat
+
+    async def recording_preprocess(request: Any, messages: list[dict[str, Any]], **kwargs: Any):
+        requests.append(request)
+        return await preprocess(request, messages, **kwargs)
+
+    connection.chat_handler._preprocess_chat = recording_preprocess
+    connection.session.insert_item(_message_item("hello"))
+
+    await connection._build_full_prompt(voice="ethan")
+    await connection._build_full_prompt()
+
+    assert requests[0].voice == "ethan"
+    assert getattr(requests[1], "voice", None) is None
