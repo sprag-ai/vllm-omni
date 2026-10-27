@@ -7,7 +7,7 @@ on:
     branches:
       - "release/**"
 
-# No id-token: the publisher's Workload Identity binding trusts any release/** ref, and this run carries the base ref.
+# No id-token: the publisher's Workload Identity binding trusts any release/** ref, and this run carries the default branch ref.
 permissions:
   contents: read
 
