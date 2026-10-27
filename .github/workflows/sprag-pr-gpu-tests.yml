@@ -43,6 +43,9 @@ jobs:
           uv pip install pytest==9.1.1 pytest-asyncio==1.4.0 pytest-mock==3.15.1 pytest-xdist==3.8.0 \
             pytest-subtests==0.15.0 pytest-shard==0.1.2
 
+      # GKE mounts the node's nvidia-smi under /usr/local/nvidia/bin, which the runner image leaves off PATH.
+      - run: echo /usr/local/nvidia/bin >> "${GITHUB_PATH}"
+
       - run: nvidia-smi
 
       # The core set for the areas sprag patches (scheduling, metrics and the OpenAI entrypoints), plus every test
