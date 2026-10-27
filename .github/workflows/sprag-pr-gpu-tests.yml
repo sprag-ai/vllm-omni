@@ -45,8 +45,19 @@ jobs:
 
       - run: nvidia-smi
 
+      # The core set for the areas sprag patches (scheduling, metrics and the OpenAI entrypoints), plus every test
+      # file the change adds or edits. Marked cpu, but many resolve the CUDA platform and need a driver.
+      - name: Unit tests
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          OMP_NUM_THREADS: "1"
+        run: |
+          mapfile -t changed < <(git diff --name-only --diff-filter=AM "${BASE_SHA}" HEAD -- 'tests/**/test_*.py')
+          uv run --no-sync python -m pytest -q -n auto -m "core_model and cpu" \
+            tests/core/sched tests/metrics tests/entrypoints/openai_api "${changed[@]}"
+
       # The single-L4 core set for the areas sprag patches, plus every test file the change adds or edits.
-      - name: Test
+      - name: GPU tests
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           VLLM_WORKER_MULTIPROC_METHOD: spawn
