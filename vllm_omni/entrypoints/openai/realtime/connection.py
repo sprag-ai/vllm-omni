@@ -28,7 +28,6 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
-from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -59,6 +58,7 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
+from vllm_omni.entrypoints.openai.realtime.transcription import TranscriptionTurns, merge_transcription_config
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 from vllm_omni.utils.speakers import validate_requested_speaker
@@ -122,6 +122,7 @@ class OpenAIFullDuplexConnection:
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
         self._turn_detector: ServerTurnDetector | None = None
+        self._transcription: TranscriptionTurns | None = None
         self._speech_item_id: str | None = None
 
         self.session = AudioFullDuplexSessionState()
@@ -165,6 +166,8 @@ class OpenAIFullDuplexConnection:
     async def _cleanup(self):
         self._connected = False
         await self._cancel_active_response()
+        if self._transcription is not None:
+            await self._transcription.close()
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
 
     # ------------------------------------------------------------------ #
@@ -217,6 +220,16 @@ class OpenAIFullDuplexConnection:
 
     async def _handle_session_update(self, event: types.SessionUpdateEvent):
         s = self.session
+        if isinstance(event.session, types.RealtimeTranscriptionSessionCreateRequest):
+            await self._handle_transcription_session_update(event)
+            return
+        if self._transcription is not None:
+            await self._send_error(
+                "The session type cannot change from transcription to realtime",
+                "invalid_request_error",
+                event_id=event.event_id,
+            )
+            return
         candidate_config = merge_session_config(s.config, event.session)
         try:
             candidate_config = self._sanitize_session_config(candidate_config, s.config)
@@ -229,6 +242,49 @@ class OpenAIFullDuplexConnection:
             await self._send_error(str(exc), "unsupported_turn_detection", event_id=event.event_id)
             return
 
+        self._apply_turn_detection(turn_detection_config)
+        s.config = candidate_config
+        await self._send_session_updated()
+
+    async def _handle_transcription_session_update(self, event: types.SessionUpdateEvent):
+        s = self.session
+        if self._transcription is None and (s.items or s.active_response is not None):
+            await self._send_error(
+                "The session type cannot change to transcription once the conversation has items",
+                "invalid_request_error",
+                event_id=event.event_id,
+            )
+            return
+        current = self._transcription.config if self._transcription is not None else None
+        config = merge_transcription_config(current, event.session)
+        audio_input = config.audio.input if config.audio is not None else None
+        if audio_input is not None and not self._is_pcm16_24khz_format(audio_input.format):
+            await self._send_error(
+                "Only 24 kHz PCM16 input audio is supported", "unsupported_audio_format", event_id=event.event_id
+            )
+            return
+        try:
+            turn_detection_config = self._build_turn_detection_config(config, transcription=True)
+        except ValueError as exc:
+            await self._send_error(str(exc), "unsupported_turn_detection", event_id=event.event_id)
+            return
+
+        self._apply_turn_detection(turn_detection_config)
+        if self._transcription is None:
+            self._transcription = TranscriptionTurns(self, config)
+        else:
+            self._transcription.config = config
+        session_obj = config.model_dump(exclude_none=True)
+        session_obj.update(object="realtime.transcription_session", id=s.session_id, expires_at=int(s.expires_at))
+        await self._send_event(
+            types.SessionUpdatedEvent(
+                event_id=_gen_id("evt"),
+                type="session.updated",
+                session=session_obj,  # type: ignore[arg-type]
+            )
+        )
+
+    def _apply_turn_detection(self, turn_detection_config: TurnDetectionConfig | None) -> None:
         turn_detector = self._turn_detector
         if turn_detection_config is None:
             # Keep buffered audio available for manual commit or clear, but
@@ -239,10 +295,7 @@ class OpenAIFullDuplexConnection:
             turn_detector = turn_detection_config.build_detector(self._vad_backend_provider)
         elif turn_detector.config != turn_detection_config:
             turn_detector.reconfigure(turn_detection_config)
-
-        s.config = candidate_config
         self._turn_detector = turn_detector
-        await self._send_session_updated()
 
     def _sanitize_session_config(
         self,
@@ -282,13 +335,26 @@ class OpenAIFullDuplexConnection:
 
         return sanitized
 
-    def _build_turn_detection_config(self, config: types.RealtimeSessionCreateRequest) -> TurnDetectionConfig | None:
+    def _build_turn_detection_config(self, config: Any, *, transcription: bool = False) -> TurnDetectionConfig | None:
         audio_input = config.audio.input if config.audio is not None else None
         turn_detection = audio_input.turn_detection if audio_input is not None else None
         if turn_detection is None:
             return None
-        if not isinstance(turn_detection, ServerVad):
+        if getattr(turn_detection, "type", None) != "server_vad":
             raise ValueError("Only server_vad turn detection is supported")
+        if transcription:
+            # A transcription session transcribes each turn and never responds.
+            return TurnDetectionConfig(
+                threshold=0.5 if turn_detection.threshold is None else float(turn_detection.threshold),
+                prefix_padding_ms=(
+                    300 if turn_detection.prefix_padding_ms is None else int(turn_detection.prefix_padding_ms)
+                ),
+                silence_duration_ms=(
+                    500 if turn_detection.silence_duration_ms is None else int(turn_detection.silence_duration_ms)
+                ),
+                create_response=False,
+                interrupt_response=False,
+            )
 
         detector_config = TurnDetectionConfig(
             threshold=0.5 if turn_detection.threshold is None else float(turn_detection.threshold),
@@ -521,6 +587,11 @@ class OpenAIFullDuplexConnection:
             if len(s.input_audio_buffer) == 0:
                 return None
             audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
+            if self._transcription is not None:
+                audio_seconds = len(s.input_audio_buffer) / (BYTES_PER_SAMPLE_PCM16 * SAMPLE_RATE_HZ)
+                s.input_audio_buffer.clear()
+                await self._transcription.commit(audio, audio_seconds, item_id)
+                return None
             item = types.RealtimeConversationItemUserMessage(
                 type="message",
                 role="user",
@@ -733,6 +804,13 @@ class OpenAIFullDuplexConnection:
 
     async def _handle_response_create(self, event: types.ResponseCreateEvent, *, replace_active: bool = False):
         s = self.session
+        if self._transcription is not None:
+            await self._send_error(
+                "response.create is not available on a transcription session",
+                "invalid_request_error",
+                event_id=event.event_id,
+            )
+            return
         if s.active_response is not None and not replace_active:
             # Only one response may write to the default conversation at a time.
             await self._send_error(
