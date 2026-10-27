@@ -166,6 +166,33 @@ def test_a_reply_keeps_the_ids_the_model_generated() -> None:
     assert "<|im_start|>assistant\n\n\nSure.<|im_end|>\n<|im_start|>user\nBye" in _decode(prompt.token_ids)
 
 
+def test_trailing_end_tokens_are_stripped_from_generated_ids() -> None:
+    generated = [ord(c) for c in "Sure."] + [7, 8]
+    conversation = Conversation([_user("u1", "Hi"), _reply("a1", "Sure.", token_ids=generated), _user("u2", "Bye")])
+
+    prompt = _build(ChatPromptBuilder(qwen_like, _Encoder(), AUDIO, end_token_ids={7, 8}), conversation)
+
+    assert _decode(prompt.token_ids) == _full(qwen_like, conversation)
+
+
+def test_a_truncate_while_the_build_awaits_never_caches_the_old_text() -> None:
+    reply = _reply("a1", "The train leaves at six.")
+    reply.audio_out_seconds = 2.0
+    conversation = Conversation([_user("u1", "When?"), reply, _user("u2", "Sorry?")])
+    encoder = _Encoder()
+    first_encode = encoder.__call__
+
+    async def encode_then_truncate(texts):
+        if conversation.get("a1").revision == 0:
+            conversation.truncate("a1", 1000)
+        return await first_encode(texts)
+
+    builder = ChatPromptBuilder(qwen_like, encode_then_truncate, AUDIO)
+    _build(builder, conversation)
+
+    assert _decode(_build(builder, conversation).token_ids) == _full(qwen_like, conversation)
+
+
 def test_a_template_that_numbers_messages_gets_a_full_render() -> None:
     conversation = Conversation([_user("u1", "Hi"), _reply("a1", "Hello."), _user("u2", "Bye")])
 
@@ -210,6 +237,7 @@ def test_qwen3_omni_prompts_join_exactly() -> None:
     async def encode(texts):
         return [tokenizer.encode(text, add_special_tokens=False) for text in texts]
 
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
     rng = random.Random(0)
     snippets = [
         "Hello.",
@@ -234,14 +262,19 @@ def test_qwen3_omni_prompts_join_exactly() -> None:
             items.append(_user_audio(f"u{turn}", text()) if rng.random() < 0.5 else _user(f"u{turn}", text()))
             if rng.random() < 0.3:
                 items += [_call(f"c{turn}", f"r{turn}"), _output(f"o{turn}", text()), _output(f"p{turn}", text())]
-            items.append(_reply(f"a{turn}", text()))
+            reply = text()
+            # A reply opening with whitespace is generated apart from the generation prompt's newline, unlike a render.
+            canonical = reply[:1] not in (" ", "\n") and rng.random() < 0.5
+            generated = tokenizer.encode(reply, add_special_tokens=False) + [im_end] if canonical else None
+            items.append(_reply(f"a{turn}", reply, token_ids=generated))
         if rng.random() < 0.5:
             items.pop()
         conversation = Conversation(items)
         instructions = text() if n % 3 else None
         tools = TOOLS if n % 2 else None
 
-        prompt = asyncio.run(ChatPromptBuilder(render, encode, AUDIO).build(conversation, instructions, tools))
+        builder = ChatPromptBuilder(render, encode, AUDIO, tokenizer.all_special_ids)
+        prompt = asyncio.run(builder.build(conversation, instructions, tools))
 
         full = tokenizer.encode(_full(render, conversation, instructions, tools), add_special_tokens=False)
         assert prompt.token_ids == full, n

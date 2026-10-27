@@ -64,6 +64,8 @@ class _FakeEngine:
 
     def generate(self, prompt, **kwargs):
         outputs = self.rounds.pop(0)
+        if isinstance(outputs, Exception):
+            raise outputs
 
         async def stream():
             async for streaming_input in prompt:
@@ -122,6 +124,8 @@ def conn(mocker) -> RealtimeConnection:
     mocker.patch.object(conn, "_encode_texts", side_effect=_encode_texts)
     mocker.patch.object(conn, "_sampling_rate", return_value=16_000)
     conn._compactor = DropOldest(0.7)
+    conn._unreported_dropped = []
+    conn._unreported_added = []
     conn._prompt_builder = ChatPromptBuilder(conn._render_chat, conn._encode_texts, "<audio>")
 
     async def render(prompt):
@@ -221,6 +225,63 @@ class TestHistory:
         assert done["dropped_item_ids"] == ["u1", "r1"]
         assert done["context_item_ids"] == ["u2", "r2"]
 
+    def test_a_completed_reply_keeps_its_generated_ids(self, conn) -> None:
+        conn.engine = _FakeEngine([[_text("Hello", tokens=2), _text(" there.", tokens=1)]])
+
+        _turn(conn, user="u1", response="r1")
+
+        assert conn._conversation.get("r1").token_ids == [1, 1, 1]
+
+    def test_drops_from_a_failed_turn_are_reported_by_the_next_one(self, conn, monkeypatch) -> None:
+        monkeypatch.setenv("SPRAG_REALTIME_CONTEXT_TOKENS", "100")
+        conn.engine = _FakeEngine([[_text("Hi.")], RuntimeError("engine down"), [_text("Back.")]])
+        _turn(conn, seconds=5, user="u1", response="r1")
+
+        failed = list(_turn(conn, seconds=5, user="u2", response="r2"))
+        sent = _turn(conn, seconds=None, response="r3")
+
+        assert not [e for e in failed if isinstance(e, dict) and e["type"] == "response.done"]
+        assert _event(sent, "response.done")["dropped_item_ids"] == ["u1", "r1"]
+
+    def test_an_edit_during_compaction_restarts_it(self, conn) -> None:
+        conn._conversation.add(ConversationItem("t1", "message", "user", text="Forget this."))
+        conn._conversation.add(ConversationItem("t2", "message", "user", text="Hi."))
+        calls = []
+
+        class EditingCompactor:
+            async def compact(self, items, budget):
+                calls.append([item.item_id for item in items])
+                if len(calls) == 1:
+                    conn._conversation.delete("t1")
+                return list(items)
+
+        conn._compactor = EditingCompactor()
+        conn.engine = _FakeEngine([[_text("Hello.")]])
+
+        sent = _turn(conn, seconds=None, response="r1")
+
+        assert calls == [["t1", "t2"], ["t2"]]
+        assert _event(sent, "response.done")["context_item_ids"] == ["t2", "r1"]
+        assert "Forget this." not in _prompt_text(conn.engine.prompts[0])
+
+    def test_items_a_compactor_adds_are_reported(self, conn) -> None:
+        conn._conversation.add(ConversationItem("t1", "message", "user", text="Hi."))
+
+        class Summarizer:
+            async def compact(self, items, budget):
+                summary = ConversationItem("s1", "message", "user", text="Earlier: none.")
+                return [summary, *items] if items[0].item_id != "s1" else list(items)
+
+        conn._compactor = Summarizer()
+        conn.engine = _FakeEngine([[_text("Hello.")]])
+
+        sent = _turn(conn, seconds=None, response="r1")
+
+        done = _event(sent, "response.done")
+        assert (done["added_item_ids"], done["dropped_item_ids"]) == (["s1"], [])
+        assert done["context_item_ids"] == ["s1", "t1", "r1"]
+        assert "Earlier: none." in _prompt_text(conn.engine.prompts[0])
+
 
 class TestCancel:
     def test_cancel_stops_the_turn_and_keeps_the_text_generated_so_far(self, conn) -> None:
@@ -232,6 +293,7 @@ class TestCancel:
         sent = _turn(conn, user="u1", response="r1")
 
         assert conn._conversation.get("r1").text == "The train"
+        assert conn._conversation.get("r1").token_ids is None
         assert _event(sent, "response.done")["status"] == "cancelled"
         assert sent[-1]["type"] == "response.output_audio.done"
 

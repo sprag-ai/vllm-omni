@@ -50,6 +50,9 @@ _DEFAULT_CONTEXT_TOKENS = 16_384
 _DEFAULT_CONTEXT_RETENTION = 0.7
 """Share of the cap a conversation is cut back to once it exceeds it."""
 
+_PREPARE_ATTEMPTS = 3
+"""Builds of a round's prompt to try while client edits keep landing during the build or compaction."""
+
 
 def _declared_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return the entries of ``kwargs`` that ``fn`` declares, or all of them when it takes ``**kwargs``.
@@ -234,6 +237,9 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._live_truncate_ms: int | None = None
         self._compactor: Compactor = DropOldest(_context_limits()[1])
         self._prompt_builder: ChatPromptBuilder | None = None
+        # Compaction already applied by a turn that failed before its response.done reported it.
+        self._unreported_dropped: list[str] = []
+        self._unreported_added: list[str] = []
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -650,8 +656,6 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._cancel_requested = False
         usage = _TurnUsage()
         created: list[str] = []
-        dropped: list[str] = []
-        added: list[str] = []
         spoken = ""
         sent_audio = False
         status = "completed"
@@ -671,8 +675,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                     created.append(user_item_id)
             for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                 chat_prompt, round_dropped, round_added = await self._prepare_prompt()
-                dropped += round_dropped
-                added += round_added
+                self._unreported_dropped += round_dropped
+                self._unreported_added += round_added
                 message_item_id = response_id if tool_round == 0 else _new_item_id()
                 self._live_item_id, self._live_truncate_ms = message_item_id, None
                 result = await self._generate_round(usage, message_item_id, chat_prompt)
@@ -718,6 +722,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                     created.append(item_id)
 
+            dropped, self._unreported_dropped = self._unreported_dropped, []
+            added, self._unreported_added = self._unreported_added, []
             await self.send(TranscriptionDone(text=spoken, usage=usage.info()))
             await self.send_json(
                 {
@@ -780,6 +786,9 @@ class RealtimeConnection(VllmRealtimeConnection):
     async def _prepare_prompt(self) -> tuple[ChatPrompt, list[str], list[str]]:
         """Compact the conversation against the context cap and return its prompt.
 
+        A client edit that lands while the prompt is built or compacted restarts the preparation, up to
+        `_PREPARE_ATTEMPTS` times; after that the round generates without compacting.
+
         Returns:
             The prompt, then the ids of the items compaction dropped and the ids of those it added.
 
@@ -787,23 +796,36 @@ class RealtimeConnection(VllmRealtimeConnection):
             ValueError: The compactor returned an item id twice.
         """
         if self._prompt_builder is None:
-            self._prompt_builder = ChatPromptBuilder(self._render_chat, self._encode_texts, self._audio_placeholder())
-        prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
-        budget = ContextBudget(_context_limits()[0], prompt.overhead_tokens, prompt.item_tokens)
-        before = self._conversation.items
-        after = await self._compactor.compact(list(before), budget)
-        after_ids = [item.item_id for item in after]
-        if len(set(after_ids)) != len(after_ids):
-            raise ValueError("compaction returned an item id twice")
-        if [item.instance_id for item in after] == [item.instance_id for item in before]:
-            return prompt, [], []
-        before_ids = {item.item_id for item in before}
-        kept_ids = set(after_ids)
-        dropped = [item.item_id for item in before if item.item_id not in kept_ids]
-        added = [item_id for item_id in after_ids if item_id not in before_ids]
-        self._conversation.items = after
-        prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
-        return prompt, dropped, added
+            tokenizer = cached_tokenizer_from_config(self.serving.model_config)
+            self._prompt_builder = ChatPromptBuilder(
+                self._render_chat, self._encode_texts, self._audio_placeholder(), tokenizer.all_special_ids
+            )
+        for _ in range(_PREPARE_ATTEMPTS):
+            state = self._conversation_state()
+            prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+            budget = ContextBudget(_context_limits()[0], prompt.overhead_tokens, prompt.item_tokens)
+            before = list(self._conversation.items)
+            after = await self._compactor.compact(before, budget)
+            if self._conversation_state() != state:
+                continue
+            after_ids = [item.item_id for item in after]
+            if len(set(after_ids)) != len(after_ids):
+                raise ValueError("compaction returned an item id twice")
+            if [item.instance_id for item in after] == [item.instance_id for item in before]:
+                return prompt, [], []
+            before_ids = {item.item_id for item in before}
+            kept_ids = set(after_ids)
+            dropped = [item.item_id for item in before if item.item_id not in kept_ids]
+            added = [item_id for item_id in after_ids if item_id not in before_ids]
+            self._conversation.items = after
+            prompt = await self._prompt_builder.build(self._conversation, self._instructions, self._tools)
+            return prompt, dropped, added
+        logger.warning("conversation edited during every prompt build; generating without compaction")
+        return prompt, [], []
+
+    def _conversation_state(self) -> list[tuple[str, int]]:
+        """Return the conversation's item instances and revisions, which change with every client edit."""
+        return [(item.instance_id, item.revision) for item in self._conversation.items]
 
     async def _generate_round(self, usage: _TurnUsage, message_item_id: str, chat_prompt: ChatPrompt) -> _Round:
         """Generate one reply over the current conversation, streaming its text, audio and tool-call events.

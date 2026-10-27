@@ -50,6 +50,8 @@ def tool_call_conn() -> RealtimeConnection:
     conn._live_item_id = None
     conn._live_truncate_ms = None
     conn._conversation = Conversation()
+    conn._unreported_dropped = []
+    conn._unreported_added = []
     conn.serving = _FakeServing()
     # handle_event's session.update branch now also assigns these.
     conn._speaker = None

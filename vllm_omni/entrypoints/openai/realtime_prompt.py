@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,19 @@ _BEFORE = {"role": "user", "content": "x"}
 _AFTER = {"role": "user", "content": "y"}
 
 _CHECK_TOOL_CALL = {"type": "function", "function": {"name": "lookup", "arguments": {"query": "Austin weather"}}}
+
+
+UnitKey = tuple[tuple[str, int], ...]
+"""Which item instances a unit holds, at which revisions."""
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """A rendered unit with its cache key and generated ids, read together when the conversation was rendered."""
+
+    rendered: RenderedUnit
+    key: UnitKey
+    generated: list[int] | None
 
 
 class _NotJoinableError(Exception):
@@ -66,13 +80,25 @@ class ChatPromptBuilder:
     at a time.
     """
 
-    def __init__(self, render: RenderChat, encode: EncodeTexts, audio_placeholder: str) -> None:
+    def __init__(
+        self,
+        render: RenderChat,
+        encode: EncodeTexts,
+        audio_placeholder: str,
+        end_token_ids: Collection[int] = (),
+    ) -> None:
+        """Create a builder.
+
+        Args:
+            end_token_ids: Ids that end a generation; stripped from the end of a reply's generated ids.
+        """
         self._render = render
         self._encode = encode
         self._placeholder = audio_placeholder
+        self._end_token_ids = frozenset(end_token_ids)
         self._frames: dict[str, _Frame] = {}
-        self._pieces: dict[tuple[tuple[str, int], ...], list[int]] = {}
-        self._full_counts: dict[tuple[tuple[str, int], ...], int] = {}
+        self._pieces: dict[UnitKey, list[int]] = {}
+        self._full_counts: dict[UnitKey, int] = {}
         self._before: str | None = None
         self._after: str | None = None
 
@@ -81,29 +107,29 @@ class ChatPromptBuilder:
     ) -> ChatPrompt:
         """Return the prompt that generates the next assistant reply over ``conversation``."""
         rendered = conversation.render(self._placeholder, instructions)
+        # Items can be edited while this awaits; keys and ids must describe the text just rendered.
+        units = [_Unit(unit, _unit_key(unit), _generated_ids(unit, self._end_token_ids)) for unit in rendered.units]
         frame = await self._frame(rendered.system, tools)
         if frame.joinable:
             try:
-                return await self._joined(rendered, frame)
+                return await self._joined(rendered, units, frame)
             except _NotJoinableError:
                 logger.warning_once("chat template renders a realtime message by its context; using full renders")
-        return await self._full(rendered, tools)
+        return await self._full(rendered, units, tools)
 
-    async def _joined(self, rendered: RenderedConversation, frame: _Frame) -> ChatPrompt:
+    async def _joined(self, rendered: RenderedConversation, units: list[_Unit], frame: _Frame) -> ChatPrompt:
         """Join the frame and the cached pieces, tokenizing only the pieces not seen before."""
-        units = rendered.units
-        tail = units[-1] if units and units[-1].messages[0]["role"] == "assistant" else None
+        tail = units[-1].rendered if units and units[-1].rendered.messages[0]["role"] == "assistant" else None
         body = units[:-1] if tail is not None else units
-        keys = [_unit_key(unit) for unit in body]
-        texts: dict[tuple[tuple[str, int], ...], str] = {}
-        for unit, key in zip(body, keys):
-            if key in self._pieces or key in texts:
+        keys = [unit.key for unit in body]
+        texts: dict[UnitKey, str] = {}
+        for unit in body:
+            if unit.key in self._pieces or unit.key in texts:
                 continue
-            generated = _generated_ids(unit, frame)
-            if generated is not None:
-                self._pieces[key] = frame.generation + generated + (frame.close or [])
+            if unit.generated is not None and frame.close is not None:
+                self._pieces[unit.key] = frame.generation + _without_end(unit.generated, frame.close) + frame.close
             else:
-                texts[key] = self._between(unit.messages)
+                texts[unit.key] = self._between(unit.rendered.messages)
         tail_text = self._lead(tail.messages, generation=True) if tail is not None else None
         new_texts = list(texts.values()) + ([tail_text] if tail_text is not None else [])
         encoded = await self._encode(new_texts) if new_texts else []
@@ -113,25 +139,26 @@ class ChatPromptBuilder:
 
         token_ids = list(frame.header)
         item_tokens: dict[str, int] = {}
-        for unit, key in zip(body, keys):
-            token_ids += self._pieces[key]
-            _count(item_tokens, unit, len(self._pieces[key]))
+        for unit in body:
+            token_ids += self._pieces[unit.key]
+            _count(item_tokens, unit.rendered, len(self._pieces[unit.key]))
         token_ids += tail_ids
         if tail is not None:
             _count(item_tokens, tail, len(tail_ids) - len(frame.generation))
         return _prompt(rendered, token_ids, len(frame.header) + len(frame.generation), item_tokens)
 
-    async def _full(self, rendered: RenderedConversation, tools: list[dict[str, Any]] | None) -> ChatPrompt:
+    async def _full(
+        self, rendered: RenderedConversation, units: list[_Unit], tools: list[dict[str, Any]] | None
+    ) -> ChatPrompt:
         """Tokenize the whole rendered conversation, counting each message on its own for the compactor."""
-        keys = [_unit_key(unit) for unit in rendered.units]
-        texts = {key: self._alone(unit) for unit, key in zip(rendered.units, keys) if key not in self._full_counts}
-        full_text = self._render(rendered.messages, tools, True) if rendered.messages else ""
+        texts = {unit.key: self._alone(unit.rendered) for unit in units if unit.key not in self._full_counts}
+        full_text = await asyncio.to_thread(self._render, rendered.messages, tools, True) if rendered.messages else ""
         encoded = await self._encode([full_text, *texts.values()])
         self._full_counts.update((key, len(ids)) for key, ids in zip(texts, encoded[1:]))
-        self._full_counts = {key: self._full_counts[key] for key in keys}
+        self._full_counts = {unit.key: self._full_counts[unit.key] for unit in units}
         item_tokens: dict[str, int] = {}
-        for unit, key in zip(rendered.units, keys):
-            _count(item_tokens, unit, self._full_counts[key])
+        for unit in units:
+            _count(item_tokens, unit.rendered, self._full_counts[unit.key])
         overhead = max(len(encoded[0]) - sum(self._full_counts.values()), 0)
         return _prompt(rendered, encoded[0], overhead, item_tokens)
 
@@ -211,11 +238,13 @@ class ChatPromptBuilder:
         return whole[len(before) :]
 
     def _alone(self, unit: RenderedUnit) -> str:
-        """Return a unit's text after a user message, or rendered on its own when the template will not lead it."""
-        try:
-            return self._lead(unit.messages)
-        except _NotJoinableError:
-            return self._render(unit.messages, None, False)
+        """Return a unit's text between user messages, or as near to it as the template allows."""
+        for piece in (self._between, self._lead):
+            try:
+                return piece(unit.messages)
+            except _NotJoinableError:
+                pass
+        return self._render(unit.messages, None, False)
 
     def _sentinels(self) -> tuple[str, str]:
         """Return the rendered text of the user message before a piece, and of the one after it."""
@@ -228,21 +257,24 @@ class ChatPromptBuilder:
         return self._before, self._after
 
 
-def _unit_key(unit: RenderedUnit) -> tuple[tuple[str, int], ...]:
-    """Return the cache key of a unit's piece: which item instances it holds, at which revisions."""
+def _unit_key(unit: RenderedUnit) -> UnitKey:
+    """Return the cache key of a unit's piece."""
     return tuple((item.instance_id, item.revision) for item in unit.items)
 
 
-def _generated_ids(unit: RenderedUnit, frame: _Frame) -> list[int] | None:
-    """Return a reply's generated ids without their end token, or None when the unit must be rendered."""
-    if frame.close is None or len(unit.items) != 1:
+def _generated_ids(unit: RenderedUnit, end_token_ids: frozenset[int]) -> list[int] | None:
+    """Return a reply's generated ids without trailing end tokens, or None when the unit must be rendered."""
+    if len(unit.items) != 1 or unit.items[0].kind != "message" or unit.items[0].token_ids is None:
         return None
-    ids = unit.items[0].token_ids
-    if ids is None or unit.items[0].kind != "message":
-        return None
-    if ids and frame.close and ids[-1] == frame.close[0]:
-        ids = ids[:-1]
-    return list(ids)
+    ids = list(unit.items[0].token_ids)
+    while ids and ids[-1] in end_token_ids:
+        ids.pop()
+    return ids
+
+
+def _without_end(ids: list[int], close: list[int]) -> list[int]:
+    """Return ``ids`` without a final token that opens ``close``, which the close supplies again."""
+    return ids[:-1] if ids and close and ids[-1] == close[0] else ids
 
 
 def _count(item_tokens: dict[str, int], unit: RenderedUnit, piece_tokens: int) -> None:
