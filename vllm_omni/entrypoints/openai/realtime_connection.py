@@ -275,7 +275,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "conversation.item.truncate requires a non-negative audio_end_ms", "invalid_value"
                 )
             elif item_id is not None and item_id == self._live_item_id and self._conversation.get(item_id) is None:
-                self._live_truncate_ms = audio_end_ms
+                held = self._live_truncate_ms
+                self._live_truncate_ms = audio_end_ms if held is None else min(held, audio_end_ms)
             elif not isinstance(item_id, str) or not self._conversation.truncate(item_id, audio_end_ms):
                 await self.send_error(f"No assistant message item {item_id!r}", "item_not_found")
         elif event_type == "response.create":

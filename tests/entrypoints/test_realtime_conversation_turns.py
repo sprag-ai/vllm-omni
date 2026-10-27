@@ -247,6 +247,20 @@ class TestCancel:
         assert reply.audio_out_seconds == 1.0
         assert _event(conn.sent, "response.done")["status"] == "cancelled"
 
+    def test_a_later_truncate_during_the_reply_never_restores_text(self, conn) -> None:
+        async def two_truncates(output):
+            if output.stage_id == 2:
+                for ms in (1000, 3000):
+                    await conn.handle_event({"type": "conversation.item.truncate", "item_id": "r1", "audio_end_ms": ms})
+
+        conn.engine = _FakeEngine(
+            [[_text("The train to Chicago leaves at six."), _audio(4.0)]], on_output=two_truncates
+        )
+
+        _turn(conn, user="u1", response="r1")
+
+        assert conn._conversation.get("r1").audio_out_seconds == 1.0
+
     def test_the_reply_item_is_announced_before_its_text_and_audio(self, conn) -> None:
         conn.engine = _FakeEngine([[_text("Hi."), _audio(0.5)]])
 

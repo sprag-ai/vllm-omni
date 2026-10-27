@@ -19,6 +19,9 @@ AUDIO_TOKENS_PER_SECOND = 13.1
 SPEAKING_CHARS_PER_SECOND = 11.4
 """Reply characters voiced per second of audio, the median over Qwen3-Omni replies; used until a session has its own."""
 
+_MIN_RATE_SAMPLE_CHARS = 20
+"""Shortest reply a session's speaking rate is measured on; a word or two over padded audio reads far too slow."""
+
 ItemKind = Literal["message", "function_call", "function_call_output"]
 Role = Literal["user", "assistant", "tool"]
 
@@ -110,7 +113,7 @@ class Conversation:
             and item.role == "assistant"
             and item.audio_complete
             and item.audio_out_seconds >= 1.0
-            and item.text
+            and len(item.text) >= _MIN_RATE_SAMPLE_CHARS
         )
         return rates[len(rates) // 2] if rates else SPEAKING_CHARS_PER_SECOND
 

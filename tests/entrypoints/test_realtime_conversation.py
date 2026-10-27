@@ -7,7 +7,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.realtime_conversation import Conversation, ConversationItem
+from vllm_omni.entrypoints.openai.realtime_conversation import (
+    SPEAKING_CHARS_PER_SECOND,
+    Conversation,
+    ConversationItem,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -143,6 +147,14 @@ class TestTruncate:
         conversation.truncate("a1", 600)
 
         assert item.text == "abcde fghij"
+
+    def test_a_short_reply_does_not_set_the_speaking_rate(self) -> None:
+        ok = _assistant("a0", "OK.", audio_out=1.26)
+        item = _assistant("a1", "The train to Chicago leaves at six and arrives at nine.", audio_out=4.0)
+        item.audio_complete = False
+        conversation = Conversation([ok, item])
+
+        assert conversation.speaking_rate() == SPEAKING_CHARS_PER_SECOND
 
     def test_a_cancelled_reply_with_no_audio_sent_is_emptied(self) -> None:
         item = _assistant("a1", "Hello there.")
