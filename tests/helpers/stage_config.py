@@ -658,8 +658,11 @@ def _materialize_ci_overlay(model_type: str) -> Path:
     if base:
         overlay["base_config"] = str(_DEPLOY_DIR / base)
 
-    with open(out, "w", encoding="utf-8") as f:
+    # xdist workers materialize the same overlay concurrently; a reader must never see a truncated file.
+    tmp = out.with_suffix(f".{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(overlay, f, sort_keys=False)
+    os.replace(tmp, out)
     return out
 
 

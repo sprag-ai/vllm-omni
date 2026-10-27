@@ -29,6 +29,24 @@ class ResponseUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    input_audio_tokens: int = 0
+    input_image_tokens: int = 0
+    cached_tokens: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the usage in the Realtime ``response.done`` shape."""
+        return {
+            "total_tokens": self.total_tokens,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "input_token_details": {
+                "text_tokens": max(0, self.input_tokens - self.input_audio_tokens - self.input_image_tokens),
+                "audio_tokens": self.input_audio_tokens,
+                "image_tokens": self.input_image_tokens,
+                "cached_tokens": self.cached_tokens,
+            },
+            "output_token_details": {"text_tokens": self.output_tokens},
+        }
 
 
 @dataclass(slots=True)
@@ -103,6 +121,13 @@ class AudioFullDuplexSessionState:
     item_token_ids: dict[str, list[int]] = field(default_factory=dict)
     item_in_progress: dict[str, bool] = field(default_factory=dict)
     pending_truncations_ms: dict[str, types.ConversationItemTruncateEvent] = field(default_factory=dict)
+    # Serialized JSON size of each item in ``items`` and their sum, kept so the
+    # history cap is checked without re-serializing the whole history.
+    item_sizes: dict[str, int] = field(default_factory=dict)
+    items_size: int = 0
+    # Each user audio part as rendered into prompts, keyed by (item id, part
+    # index), with the client audio string it was converted from.
+    item_prompt_audio: dict[tuple[str, int], tuple[str, str]] = field(default_factory=dict)
 
     input_audio_buffer: bytearray = field(default_factory=bytearray)
     active_response: ActiveResponse | None = None
@@ -123,17 +148,15 @@ class AudioFullDuplexSessionState:
             return item.model_dump(mode="json", exclude_none=True)
         return item
 
-    def _history_size(self, items: list[types.ConversationItem] | None = None) -> int:
-        history = self.items if items is None else items
-        serialized = json.dumps(
-            [self._jsonable_item(item) for item in history],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+    @classmethod
+    def _item_size(cls, item: types.ConversationItem) -> int:
+        serialized = json.dumps(cls._jsonable_item(item), ensure_ascii=False, separators=(",", ":"))
         return len(serialized.encode("utf-8"))
 
-    def _ensure_history_capacity(self, items: list[types.ConversationItem]) -> None:
-        if self._history_size(items) > MAX_HISTORY_BYTES:
+    def _ensure_history_capacity(self, size_change: int, count_change: int) -> None:
+        count = len(self.items) + count_change
+        size = 2 + max(0, count - 1) + self.items_size + size_change
+        if size > MAX_HISTORY_BYTES:
             raise HistoryLimitError(f"Conversation history exceeds the {MAX_HISTORY_BYTES} byte limit")
 
     def _model_context_start_index(self) -> int:
@@ -174,10 +197,11 @@ class AudioFullDuplexSessionState:
                 raise ValueError(f"previous_item_id '{previous_item_id}' not found")
             pos = idx + 1
 
-        candidate = [*self.items]
-        candidate.insert(pos, item)
-        self._ensure_history_capacity(candidate)
+        size = self._item_size(item)
+        self._ensure_history_capacity(size, 1)
         self.items.insert(pos, item)
+        self.item_sizes[item.id] = size
+        self.items_size += size
         # A past-the-end cursor only advances for an item appended after it.
         # Inserting before the end leaves the cursor past every included item.
         if self.model_context_cursor_at_end and pos == len(self.items) - 1:
@@ -197,10 +221,12 @@ class AudioFullDuplexSessionState:
             item.object = "realtime.item"
         if item.status is None:
             item.status = "completed"
-        candidate = [*self.items]
-        candidate[idx] = item
-        self._ensure_history_capacity(candidate)
+        size = self._item_size(item)
+        previous_size = self.item_sizes.get(item.id, 0)
+        self._ensure_history_capacity(size - previous_size, 0)
         self.items[idx] = item
+        self.item_sizes[item.id] = size
+        self.items_size += size - previous_size
         return idx
 
     def _clear_item_metadata(self, item_id: str) -> None:
@@ -208,6 +234,8 @@ class AudioFullDuplexSessionState:
         self.item_token_ids.pop(item_id, None)
         self.item_in_progress.pop(item_id, None)
         self.pending_truncations_ms.pop(item_id, None)
+        for key in [key for key in self.item_prompt_audio if key[0] == item_id]:
+            del self.item_prompt_audio[key]
 
     def remove_item(self, item_id: str) -> types.ConversationItem | None:
         idx = self.find_item_index(item_id)
@@ -215,6 +243,7 @@ class AudioFullDuplexSessionState:
             return None
         cursor_index = self._model_context_start_index()
         item = self.items.pop(idx)
+        self.items_size -= self.item_sizes.pop(item.id, 0)
         if idx == cursor_index and not self.model_context_cursor_at_end:
             if idx < len(self.items):
                 self.model_context_first_item_id = self.items[idx].id

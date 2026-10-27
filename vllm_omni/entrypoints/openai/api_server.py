@@ -19,7 +19,7 @@ import signal
 import socket
 import time
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
@@ -73,13 +73,8 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.transcription.serving import (
-    OpenAIServingTranscription,
-)
-from vllm.entrypoints.speech_to_text.translation.serving import (
-    OpenAIServingTranslation,
-)
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.outputs import RequestOutput
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
@@ -180,6 +175,10 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
+from vllm_omni.entrypoints.openai.serving_speech_to_text import (
+    OmniOpenAIServingTranscription,
+    OmniOpenAIServingTranslation,
+)
 from vllm_omni.entrypoints.openai.serving_video import (
     LatentEditInput,
     OmniOpenAIServingVideo,
@@ -204,6 +203,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _unpack_video_generation_result,
     video_response_from_request,
 )
+from vllm_omni.entrypoints.openai.websocket_sessions import WebSocketSessionGauge
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
@@ -480,11 +480,14 @@ async def omni_run_server_worker(
             )
 
         class _TimestampMiddleware:
-            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time
+            and counts open WebSocket sessions.
 
             Wraps the fully-built Starlette app as an outer ASGI layer so no
             Starlette internals (user_middleware, middleware_stack, etc.) are
-            touched. Websocket and lifespan scopes pass through unchanged.
+            touched: upstream's app has already built its middleware stack, so
+            add_middleware raises. WebSocket scopes pass through unchanged apart
+            from being counted; lifespan scopes pass through unchanged.
             """
 
             def __init__(self, inner: ASGIApp) -> None:
@@ -494,6 +497,9 @@ async def omni_run_server_worker(
                 return getattr(self._inner, name)
 
             async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] == "websocket":
+                    await WebSocketSessionGauge(self._inner)(scope, receive, send)
+                    return
                 if scope["type"] == "http":
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
@@ -863,6 +869,29 @@ def _init_chat_services(
     state.online_renderer.warmup()
 
 
+class _TextOnlyEngineClient:
+    """Engine-client view that pins generation to text output.
+
+    OMNI: upstream speech-to-text serving calls ``generate()`` through vLLM's
+    ``EngineClient`` protocol, which has no ``output_modalities`` parameter.
+    ``AsyncOmni.generate`` defaults ``output_modalities`` to every stage's
+    output type, so an unpinned transcription request on a thinker+talker
+    pipeline would also synthesize audio of its own transcript. Handing the
+    speech-to-text handlers this view keeps them unmodified while routing
+    their requests through comprehension stages only.
+    """
+
+    def __init__(self, engine_client: EngineClient) -> None:
+        self._engine_client = engine_client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine_client, name)
+
+    def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[RequestOutput, None]:
+        kwargs.setdefault("output_modalities", ["text"])
+        return self._engine_client.generate(*args, **kwargs)
+
+
 async def omni_init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -1175,9 +1204,11 @@ async def omni_init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
+
+    stt_engine_client = _TextOnlyEngineClient(engine_client)
     state.openai_serving_transcription = (
-        OpenAIServingTranscription(
-            engine_client,
+        OmniOpenAIServingTranscription(
+            stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
@@ -1186,8 +1217,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_translation = (
-        OpenAIServingTranslation(
-            engine_client,
+        OmniOpenAIServingTranslation(
+            stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,

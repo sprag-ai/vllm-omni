@@ -4,9 +4,11 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import dataclasses
+import os
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,11 +28,15 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsRealtime,
+    SupportsTranscription,
     supports_encoder_cudagraph,
 )
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeThinkerForConditionalGeneration as VllmQwen3OmniMoeThinker,
 )
 from vllm.model_executor.models.utils import (
     WeightsMapper,
@@ -82,6 +88,24 @@ def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
     return next(iter(speaker_token_ids))
 
 
+_DEFAULT_AUDIO_CHUNK_S = 90
+"""Window in seconds that minimised corpus WER over 135 AMI SDM meetings (42.50%)."""
+
+_SPLIT_SEARCH_SAMPLES = 1600
+"""Upstream default: samples searched for the quietest cut point, ~100ms at 16kHz."""
+
+
+def _audio_chunk_seconds() -> int:
+    """Window in seconds, from ``SPRAG_AUDIO_CHUNK_S``; zero or negative disables chunking."""
+    raw = os.environ.get("SPRAG_AUDIO_CHUNK_S")
+    if raw is None:
+        return _DEFAULT_AUDIO_CHUNK_S
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_AUDIO_CHUNK_S
+
+
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
 
@@ -103,6 +127,9 @@ TALKER_CODEC_EOS_TOKEN_ID = 4198  # End of speech
 TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
+
+if TYPE_CHECKING:
+    from vllm.config import SpeechToTextConfig, SpeechToTextParams
 
 logger = init_logger(__name__)
 
@@ -146,6 +173,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsMRoPE,
     SupportsRealtime,
     SupportsQuant,
+    SupportsTranscription,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -183,6 +211,42 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_active = False
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
+
+    # Speech-to-text serving resolves this composite class from the checkpoint
+    # architecture; transcription itself runs on the thinker stage, so the
+    # classmethods delegate to vLLM's thinker implementation.
+    supported_languages = VllmQwen3OmniMoeThinker.supported_languages
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> "SpeechToTextConfig":
+        """Enable chunking of long audio into ``max_audio_clip_s`` windows.
+
+        Upstream leaves ``min_energy_split_window_size`` None, which makes ``allow_audio_chunking``
+        False, so a long clip is transcribed as one generation. The model terminates early on those:
+        measured over 135 AMI SDM meetings it returned a median of 69 words against a 5761 word
+        reference, for a corpus WER of 100.35%.
+
+        Window size is the tunable part; sweeping it over that corpus (corpus WER, lower better)::
+
+            30s   48.41%      240s   51.50%
+            60s   43.03%      480s   51.31%
+            90s   42.50%      600s   55.28%
+            120s  53.75%      none  100.35%
+
+        90s is the measured optimum and the default. ``SPRAG_AUDIO_CHUNK_S`` overrides it; zero or a
+        negative value restores upstream's unchunked behaviour (upstream's splitter never terminates on a
+        zero window). The optimum comes from one corpus in one acoustic condition, which is why it stays
+        configurable rather than hardcoded.
+        """
+        base = VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
+        chunk_s = _audio_chunk_seconds()
+        if chunk_s <= 0:
+            return base
+        return dataclasses.replace(base, max_audio_clip_s=chunk_s, min_energy_split_window_size=_SPLIT_SEARCH_SAMPLES)
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
+        return VllmQwen3OmniMoeThinker.get_generation_prompt(stt_params)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

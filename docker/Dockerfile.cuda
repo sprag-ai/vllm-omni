@@ -14,6 +14,8 @@ RUN apt-get update && \
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
+# setup.py pins the package version to this when set; the build context carries no git tags.
+ARG VLLM_OMNI_VERSION_OVERRIDE
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
 
