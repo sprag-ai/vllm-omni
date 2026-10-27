@@ -10,10 +10,12 @@ import json
 import warnings
 import wave
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pybase64 as base64
+import soundfile
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types import realtime as types
 from openai.types.chat import (
@@ -447,7 +449,8 @@ class OpenAIFullDuplexConnection:
                     type="response.create",
                     event_id=None,
                     response=None,
-                )
+                ),
+                replace_active=True,
             )
 
     @staticmethod
@@ -464,15 +467,46 @@ class OpenAIFullDuplexConnection:
             raise ValueError("PCM audio data must contain complete 16-bit samples")
         return decoded
 
-    @staticmethod
-    def _pcm16_wav_b64(audio: bytes) -> str:
+    @cached_property
+    def _model_audio_resampler(self) -> Any:
+        """The resampler the model's multimodal parser applies to audio; None if it applies none."""
+        try:
+            parser = self.chat_handler.renderer.get_mm_processor().info.get_data_parser()
+        except Exception:
+            logger.debug("[realtime] model exposes no audio data parser", exc_info=True)
+            return None
+        resampler = getattr(parser, "audio_resampler", None)
+        return resampler if getattr(resampler, "target_sr", None) else None
+
+    def _model_rate_wav_b64(self, audio: str) -> str:
+        """Return base64 PCM16 at the session rate as a base64 PCM16 WAV at the model's audio rate."""
+        pcm = self._decode_pcm16(audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
+        resampler = self._model_audio_resampler
+        if resampler is None or int(round(resampler.target_sr)) == SAMPLE_RATE_HZ:
+            with io.BytesIO() as buffer:
+                with wave.open(buffer, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(BYTES_PER_SAMPLE_PCM16)
+                    wav.setframerate(SAMPLE_RATE_HZ)
+                    wav.writeframes(pcm)
+                return base64.b64encode(buffer.getvalue()).decode("ascii")
+        waveform = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        waveform = resampler.resample(waveform, orig_sr=SAMPLE_RATE_HZ)
         with io.BytesIO() as buffer:
-            with wave.open(buffer, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(BYTES_PER_SAMPLE_PCM16)
-                wav.setframerate(SAMPLE_RATE_HZ)
-                wav.writeframes(audio)
+            soundfile.write(buffer, waveform, int(round(resampler.target_sr)), format="WAV", subtype="PCM_16")
             return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    async def _prompt_audio(self, item_id: str | None, part_index: int, audio: str) -> str:
+        """Return an audio part ready for prompt rendering, converting each history clip only once."""
+        if item_id is None:
+            return await asyncio.to_thread(self._model_rate_wav_b64, audio)
+        cache = self.session.item_prompt_audio
+        cached = cache.get((item_id, part_index))
+        if cached is not None and cached[0] is audio:
+            return cached[1]
+        converted = await asyncio.to_thread(self._model_rate_wav_b64, audio)
+        cache[(item_id, part_index)] = (audio, converted)
+        return converted
 
     async def _commit_audio_buffer(
         self,
@@ -680,8 +714,17 @@ class OpenAIFullDuplexConnection:
             return None
         return items
 
-    async def _handle_response_create(self, event: types.ResponseCreateEvent):
+    async def _handle_response_create(self, event: types.ResponseCreateEvent, *, replace_active: bool = False):
         s = self.session
+        if s.active_response is not None and not replace_active:
+            # Only one response may write to the default conversation at a time.
+            await self._send_error(
+                f"Conversation already has an active response in progress: {s.active_response.response_id}. "
+                "Wait until the response is finished before creating a new one.",
+                "conversation_already_has_active_response",
+                event_id=event.event_id,
+            )
+            return
         response_cfg = event.response
 
         if response_cfg is not None and self._uses_mcp(response_cfg):
@@ -948,6 +991,9 @@ class OpenAIFullDuplexConnection:
         cancelled = False
         limit_reached = False
         usage = ResponseUsage()
+        placeholders = engine_input.get("mm_placeholders") or {}
+        usage.input_audio_tokens = sum(placeholder.length for placeholder in placeholders.get("audio", ()))
+        usage.input_image_tokens = sum(placeholder.length for placeholder in placeholders.get("image", ()))
         total_audio_samples = 0
         audio_resampler: StreamingAudioResampler | None = None
 
@@ -1124,6 +1170,9 @@ class OpenAIFullDuplexConnection:
 
                     if output.prompt_token_ids:
                         usage.input_tokens = max(usage.input_tokens, len(output.prompt_token_ids))
+                    cached = getattr(output, "num_cached_tokens", None)
+                    if isinstance(cached, int):
+                        usage.cached_tokens = max(usage.cached_tokens, cached)
 
                     if tool_parser is not None:
                         # Additive branch: when no tools are configured for
@@ -1405,11 +1454,7 @@ class OpenAIFullDuplexConnection:
             status,
             status_details=status_details,
             output=output_items,
-            usage={
-                "total_tokens": usage.total_tokens,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-            },
+            usage=usage.as_dict(),
         )
 
         if not self._mark_terminal_response(response_id):
@@ -1799,14 +1844,13 @@ class OpenAIFullDuplexConnection:
             role = getattr(item, "role", None)
             if role == "user":
                 content: list[ChatCompletionContentPartParam] = []
-                for part in item.content:
+                for part_index, part in enumerate(item.content):
                     if part.type == "input_audio" and part.audio:
-                        audio_bytes = self._decode_pcm16(part.audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
                         content.append(
                             ChatCompletionContentPartInputAudioParam(
                                 type="input_audio",
                                 input_audio=InputAudio(
-                                    data=self._pcm16_wav_b64(audio_bytes),
+                                    data=await self._prompt_audio(item.id, part_index, part.audio),
                                     format="wav",
                                 ),
                             )

@@ -99,7 +99,7 @@ class _UnavailableTurnDetector(ServerTurnDetector):
 class _ResponseRecordingConnection(OpenAIFullDuplexConnection):
     response_creates: list[types.ResponseCreateEvent]
 
-    async def _handle_response_create(self, event: types.ResponseCreateEvent) -> None:
+    async def _handle_response_create(self, event: types.ResponseCreateEvent, *, replace_active: bool = False) -> None:
         self.response_creates.append(event)
 
 

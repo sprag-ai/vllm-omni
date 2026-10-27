@@ -172,6 +172,8 @@ def _prompt_texts(conversation: list[dict[str, Any]]) -> list[str]:
 
 async def _create_response(
     connection: OpenAIFullDuplexConnection,
+    *,
+    replace_active: bool = False,
 ) -> list[dict[str, Any]]:
     submitted: list[dict[str, Any]] = []
 
@@ -180,7 +182,9 @@ async def _create_response(
         connection.session.active_response = None
 
     connection._run_response = run_response
-    await connection._handle_response_create(SimpleNamespace(event_id="evt_create", response=None))
+    await connection._handle_response_create(
+        SimpleNamespace(event_id="evt_create", response=None), replace_active=replace_active
+    )
     if connection._response_task is not None:
         await connection._response_task
     return submitted
@@ -650,7 +654,7 @@ async def test_realtime_truncation_survives_history_mutations() -> None:
     renderer.message_counts.clear()
     renderer.skip_mm_cache.clear()
 
-    submitted = await _create_response(connection)
+    submitted = await _create_response(connection, replace_active=True)
 
     assert aborted_requests == ["req_active"]
     assert cancellation_cleanup == ["active"]
@@ -817,12 +821,32 @@ async def test_rejected_response_create_does_not_cancel_active_response() -> Non
     active_response = SimpleNamespace(response_id="active", request_id="active-request")
     connection.session.active_response = active_response
 
-    await connection._handle_response_create(SimpleNamespace(event_id="evt_create", response=None))
+    await connection._handle_response_create(SimpleNamespace(event_id="evt_create", response=None), replace_active=True)
 
     assert connection.session.active_response is active_response
     assert not connection._response_cancel_event.is_set()
     assert len(websocket.messages) == 1
     assert "exceeds the model's input token limit" in websocket.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_client_response_create_while_active_is_refused() -> None:
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    connection.session.insert_item(_message_item("item_0"))
+    active_response = SimpleNamespace(response_id="resp_active", request_id="rt-resp_active")
+    connection.session.active_response = active_response
+
+    await connection._handle_response_create(SimpleNamespace(event_id="evt_create", response=None))
+
+    (event,) = _websocket_events(websocket)
+    assert event["type"] == "error"
+    assert event["error"]["code"] == "conversation_already_has_active_response"
+    assert event["error"]["event_id"] == "evt_create"
+    assert "resp_active" in event["error"]["message"]
+    assert connection.session.active_response is active_response
+    assert not connection._response_cancel_event.is_set()
+    assert renderer.message_counts == []
 
 
 @pytest.mark.asyncio
@@ -848,3 +872,107 @@ async def test_cancel_without_matching_active_response_uses_openai_error_code(ac
         assert connection.session.active_response is None
     else:
         assert connection.session.active_response.response_id == active_response_id
+
+
+def _serialized_history_size(session: AudioFullDuplexSessionState) -> int:
+    return len(
+        json.dumps(
+            [item.model_dump(mode="json", exclude_none=True) for item in session.items],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def test_history_size_tracks_inserts_replacements_and_removals() -> None:
+    session = AudioFullDuplexSessionState()
+    session.insert_item(_message_item("first", "héllo"))
+    session.insert_item(_audio_item("audio", b"\x01\x00" * 100))
+    session.insert_item(_assistant_item("reply", "a reply"))
+    assert 2 + len(session.items) - 1 + session.items_size == _serialized_history_size(session)
+
+    session.replace_item(_assistant_item("reply", "a much longer reply than before"))
+    assert 2 + len(session.items) - 1 + session.items_size == _serialized_history_size(session)
+
+    session.remove_item("audio")
+    assert 2 + len(session.items) - 1 + session.items_size == _serialized_history_size(session)
+    assert set(session.item_sizes) == {"first", "reply"}
+
+
+def test_history_cap_refuses_an_insert_past_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.entrypoints.openai.realtime import session as session_module
+
+    session = AudioFullDuplexSessionState()
+    session.insert_item(_message_item("first"))
+    monkeypatch.setattr(session_module, "MAX_HISTORY_BYTES", _serialized_history_size(session) + 10)
+
+    with pytest.raises(session_module.HistoryLimitError):
+        session.insert_item(_message_item("second", "x" * 100))
+    assert [item.id for item in session.items] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_audio_is_converted_once_per_clip() -> None:
+    connection, _ = _make_connection()
+    connection.session.insert_item(_audio_item("audio", b"\x01\x00" * 8))
+    conversions: list[str] = []
+    convert = connection._model_rate_wav_b64
+
+    def counting_convert(audio: str) -> str:
+        conversions.append(audio)
+        return convert(audio)
+
+    connection._model_rate_wav_b64 = counting_convert
+
+    await connection._build_full_prompt()
+    await connection._build_full_prompt()
+
+    assert len(conversions) == 1
+    connection.session.remove_item("audio")
+    assert connection.session.item_prompt_audio == {}
+
+
+@pytest.mark.asyncio
+async def test_prompt_audio_is_resampled_to_the_model_rate() -> None:
+    connection, renderer = _make_connection()
+
+    class _HalfRate:
+        target_sr = SAMPLE_RATE_HZ // 2
+
+        def resample(self, audio: np.ndarray, *, orig_sr: float) -> np.ndarray:
+            assert orig_sr == SAMPLE_RATE_HZ
+            return audio[::2]
+
+    connection.__dict__["_model_audio_resampler"] = _HalfRate()
+    samples = np.array([0, 1000, 2000, 3000, -1000, -2000], dtype="<i2")
+    connection.session.insert_item(_audio_item("audio", samples.tobytes()))
+
+    await connection._build_full_prompt()
+
+    audio_content = renderer.conversations[-1][0]["content"][0]["input_audio"]
+    with wave.open(io.BytesIO(base64.b64decode(audio_content["data"]))) as wav:
+        assert wav.getframerate() == SAMPLE_RATE_HZ // 2
+        assert wav.getsampwidth() == 2
+        decoded = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+    np.testing.assert_allclose(decoded, samples[::2], atol=1)
+
+
+def test_usage_splits_input_tokens_by_modality() -> None:
+    from vllm_omni.entrypoints.openai.realtime.session import ResponseUsage
+
+    usage = ResponseUsage(
+        input_tokens=120,
+        output_tokens=7,
+        total_tokens=127,
+        input_audio_tokens=90,
+        input_image_tokens=10,
+        cached_tokens=64,
+    )
+
+    assert usage.as_dict() == {
+        "total_tokens": 127,
+        "input_tokens": 120,
+        "output_tokens": 7,
+        "input_token_details": {"text_tokens": 20, "audio_tokens": 90, "image_tokens": 10, "cached_tokens": 64},
+        "output_token_details": {"text_tokens": 7},
+    }
