@@ -933,6 +933,16 @@ async def test_prompt_audio_is_converted_once_per_clip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_audio_outside_the_history_is_not_cached() -> None:
+    connection, renderer = _make_connection()
+
+    await connection._build_full_prompt(items=[_audio_item("inline", b"\x01\x00" * 8)])
+
+    assert renderer.conversations[-1][0]["content"][0]["type"] == "input_audio"
+    assert connection.session.item_prompt_audio == {}
+
+
+@pytest.mark.asyncio
 async def test_prompt_audio_is_resampled_to_the_model_rate() -> None:
     connection, renderer = _make_connection()
 

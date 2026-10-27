@@ -566,7 +566,7 @@ class OpenAIFullDuplexConnection:
 
     async def _prompt_audio(self, item_id: str | None, part_index: int, audio: str) -> str:
         """Return an audio part ready for prompt rendering, converting each history clip only once."""
-        if item_id is None:
+        if item_id is None or item_id not in self.session.item_sizes:
             return await asyncio.to_thread(self._model_rate_wav_b64, audio)
         cache = self.session.item_prompt_audio
         cached = cache.get((item_id, part_index))
@@ -1086,7 +1086,7 @@ class OpenAIFullDuplexConnection:
         full_token_ids: list[int] = []
         cancelled = False
         limit_reached = False
-        usage = ResponseUsage()
+        usage = ResponseUsage(input_tokens=len(engine_input.get("prompt_token_ids") or ()))
         placeholders = engine_input.get("mm_placeholders") or {}
         usage.input_audio_tokens = sum(placeholder.length for placeholder in placeholders.get("audio", ()))
         usage.input_image_tokens = sum(placeholder.length for placeholder in placeholders.get("image", ()))

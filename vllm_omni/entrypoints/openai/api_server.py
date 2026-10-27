@@ -423,7 +423,6 @@ async def omni_run_server_worker(
             )
             app.include_router(weight_transfer_api.router)
 
-
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
         _register_omni_exception_handlers(app)
