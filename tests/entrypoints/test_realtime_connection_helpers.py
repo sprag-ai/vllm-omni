@@ -50,6 +50,7 @@ def tool_call_conn() -> RealtimeConnection:
     conn._live_item_id = None
     conn._live_truncate_ms = None
     conn._conversation = Conversation()
+    conn.generation_task = None
     conn._unreported_dropped = []
     conn._unreported_added = []
     conn.serving = _FakeServing()
@@ -175,6 +176,16 @@ class TestRealtimeConnectionToolCallEventRouting:
 
     def test_function_call_output_goes_to_the_turn_waiting_for_it(self, tool_call_conn) -> None:
         tool_call_conn._awaiting_tool_results = True
+        item = {"type": "function_call_output", "call_id": "call_1", "output": "sunny and 72"}
+
+        asyncio.run(tool_call_conn.handle_event({"type": "conversation.item.create", "item": item}))
+
+        assert tool_call_conn._tool_result_queue.get_nowait() == item
+        assert tool_call_conn._conversation.items == []
+
+    def test_a_result_for_the_running_turns_call_is_queued_before_its_wait(self, tool_call_conn, mocker) -> None:
+        tool_call_conn.generation_task = mocker.Mock(done=lambda: False)
+        tool_call_conn._pending_tool_calls = {0: _PendingToolCall(call_id="call_1", name="get_weather")}
         item = {"type": "function_call_output", "call_id": "call_1", "output": "sunny and 72"}
 
         asyncio.run(tool_call_conn.handle_event({"type": "conversation.item.create", "item": item}))
@@ -311,7 +322,7 @@ class TestToolChainIsBounded:
             conn,
             "_await_tool_results",
             new_callable=mocker.AsyncMock,
-            side_effect=lambda calls: [(call, "ok") for call in calls],
+            side_effect=lambda calls: [(call, {"output": "ok"}) for call in calls],
         )
         send_error = mocker.patch.object(conn, "send_error", new_callable=mocker.AsyncMock)
         mocker.patch.object(conn, "send", new_callable=mocker.AsyncMock)
@@ -361,7 +372,7 @@ class TestParallelToolResultsKeepCallOrder:
         conn._is_connected = True
         calls = [_PendingToolCall(call_id=c, name="get_weather") for c in call_ids]
         results = asyncio.run(asyncio.wait_for(conn._await_tool_results(calls), timeout=5))
-        return [output for _, output in results]
+        return [item["output"] for _, item in results]
 
     def test_two_results_come_back_in_call_order(self, tool_call_conn) -> None:
         tool_call_conn._tool_result_queue.put_nowait({"call_id": "call_a", "output": "sunny 72"})

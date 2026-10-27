@@ -384,7 +384,7 @@ class TestToolRounds:
             await conn.handle_event(
                 {
                     "type": "conversation.item.create",
-                    "item": {"type": "function_call_output", "call_id": call_id, "output": "sunny"},
+                    "item": {"type": "function_call_output", "id": "out1", "call_id": call_id, "output": "sunny"},
                 }
             )
 
@@ -406,11 +406,32 @@ class TestToolRounds:
             ("function_call_output", "tool"),
             ("message", "assistant"),
         ]
+        assert conn._conversation.items[2].item_id == "out1"
         assert "<tool>sunny" in _prompt_text(conn.engine.prompts[-1])
         done = _event(conn.sent, "response.done")
         assert done["usage"]["prompt_tokens"] == 230
         assert done["usage"]["prompt_tokens_details"]["cached_tokens"] == 100
         assert done["usage"]["prompt_tokens_details"]["multimodal_tokens"] == {"audio": 2 * AUDIO_TOKENS}
+
+    def test_a_result_sent_while_the_call_is_still_streaming_answers_it(self, conn) -> None:
+        call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Austin"}}\n</tool_call>'
+
+        async def answer_once_parsed(output):
+            calls = list(conn._pending_tool_calls.values())
+            if calls and not conn._tool_result_queue.qsize() and conn._conversation.get("out1") is None:
+                item = {"type": "function_call_output", "id": "out1", "call_id": calls[0].call_id, "output": "sunny"}
+                await conn.handle_event({"type": "conversation.item.create", "item": item})
+
+        conn.engine = _FakeEngine([[_text(call), _text("")], [_text("Sunny.")]], on_output=answer_once_parsed)
+
+        async def run():
+            conn.generation_task = asyncio.current_task()
+            await asyncio.wait_for(conn._run_conversation_turn(None), timeout=5)
+
+        asyncio.run(run())
+
+        assert _event(conn.sent, "response.done")["status"] == "completed"
+        assert [(i.item_id, i.kind) for i in conn._conversation.items][1] == ("out1", "function_call_output")
 
 
 class TestItemEvents:

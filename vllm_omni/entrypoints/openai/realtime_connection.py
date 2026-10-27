@@ -325,7 +325,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         if item_type == "function_call_output":
             if not await self._valid_tool_result(item):
                 return
-            if self._awaiting_tool_results:
+            if self._awaiting_tool_results or self._answers_running_turn(item["call_id"]):
                 self._tool_result_queue.put_nowait(item)
                 return
             new_item = ConversationItem(
@@ -347,6 +347,11 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._conversation.add(new_item, previous_item_id if isinstance(previous_item_id, str) else None)
         except KeyError as missing:
             await self.send_error(f"Conversation item {missing.args[0]!r} is unknown or taken", "item_conflict")
+
+    def _answers_running_turn(self, call_id: str) -> bool:
+        """Return whether ``call_id`` names a tool call of the round the running turn generated last."""
+        running = self.generation_task is not None and not self.generation_task.done()
+        return running and any(call.call_id == call_id for call in self._pending_tool_calls.values())
 
     async def _message_item(self, item: dict) -> ConversationItem | None:
         """Build a user or assistant message item from its content parts, or report why it is invalid."""
@@ -713,11 +718,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if results is None:
                     status = "cancelled"
                     break
-                for call, output in results:
-                    item_id = _new_item_id()
+                for call, output_item in results:
+                    item_id = await self._free_item_id(output_item.get("id")) or _new_item_id()
                     self._conversation.add(
                         ConversationItem(
-                            item_id=item_id, kind="function_call_output", role="tool", text=output, call_id=call.call_id
+                            item_id=item_id,
+                            kind="function_call_output",
+                            role="tool",
+                            text=output_item["output"],
+                            call_id=call.call_id,
                         )
                     )
                     created.append(item_id)
@@ -977,14 +986,17 @@ class RealtimeConnection(VllmRealtimeConnection):
             created.append(item_id)
         return created
 
-    async def _await_tool_results(self, calls: list[_PendingToolCall]) -> list[tuple[_PendingToolCall, str]] | None:
+    async def _await_tool_results(
+        self, calls: list[_PendingToolCall]
+    ) -> list[tuple[_PendingToolCall, dict[str, Any]]] | None:
         """Block until the client has submitted a `function_call_output` for every call, in call order.
 
         Returns:
-            None when the turn was cancelled or the client disconnected first.
+            Each call with the first output item submitted for it; None when the turn was cancelled or the client
+            disconnected first.
         """
         call_ids = {call.call_id for call in calls}
-        results: dict[str, str] = {}
+        results: dict[str, dict[str, Any]] = {}
         self._awaiting_tool_results = True
         try:
             while len(results) < len(call_ids) and self._is_connected and not self._cancel_requested:
@@ -1005,7 +1017,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                         "unknown_tool_call_id",
                     )
                     continue
-                results[call_id] = item["output"]
+                results.setdefault(call_id, item)
         finally:
             self._awaiting_tool_results = False
         if len(results) < len(call_ids):

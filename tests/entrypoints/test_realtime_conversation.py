@@ -139,6 +139,13 @@ class TestTruncate:
 
         assert (item.token_ids, item.revision) == (None, 1)
 
+    def test_text_without_spaces_keeps_the_estimated_character_cut(self) -> None:
+        item = _assistant("a1", "去北京的火车将在下午六点出发。", audio_out=4.0)
+
+        Conversation([item]).truncate("a1", 2000)
+
+        assert item.text == "去北京的火车将"
+
     def test_playing_past_the_end_keeps_the_whole_reply(self) -> None:
         item = _assistant("a1", "Hello there.", audio_out=1.0)
 

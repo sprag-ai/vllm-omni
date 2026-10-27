@@ -154,7 +154,8 @@ class Conversation:
             cut = int(len(item.text) * played / item.audio_out_seconds)
         else:
             cut = min(int(played * self.speaking_rate()), len(item.text))
-        if 0 < cut < len(item.text) and not item.text[cut].isspace():
+        # Text without word separators, such as Chinese or Japanese, keeps the estimated character cut.
+        if 0 < cut < len(item.text) and not item.text[cut].isspace() and " " in item.text:
             cut = max(item.text.rfind(" ", 0, cut), 0)
         text = item.text[:cut].rstrip()
         if text != item.text:
