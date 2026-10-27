@@ -124,6 +124,34 @@ class TestTruncate:
 
         assert item.text == ""
 
+    def test_a_cancelled_reply_is_cut_at_the_speaking_rate(self) -> None:
+        item = _assistant("a1", "The train to Chicago leaves at six and arrives at nine.", audio_out=4.0)
+        item.audio_complete = False
+
+        Conversation([item]).truncate("a1", 1000)
+
+        assert item.text == "The train"
+        assert (item.audio_out_seconds, item.audio_complete) == (1.0, True)
+
+    def test_the_speaking_rate_is_measured_on_the_conversations_complete_replies(self) -> None:
+        heard = _assistant("a0", "x" * 20, audio_out=1.0)
+        item = _assistant("a1", "abcde fghij klmno pqrst", audio_out=2.0)
+        item.audio_complete = False
+        conversation = Conversation([heard, item])
+
+        assert conversation.speaking_rate() == 20.0
+        conversation.truncate("a1", 600)
+
+        assert item.text == "abcde fghij"
+
+    def test_a_cancelled_reply_with_no_audio_sent_is_emptied(self) -> None:
+        item = _assistant("a1", "Hello there.")
+        item.audio_complete = False
+
+        Conversation([item]).truncate("a1", 500)
+
+        assert item.text == ""
+
     def test_only_assistant_messages_truncate(self) -> None:
         assert Conversation([_user_audio("u1")]).truncate("u1", 100) is False
         assert Conversation([]).truncate("a1", 100) is False

@@ -47,6 +47,8 @@ def tool_call_conn() -> RealtimeConnection:
     conn._pending_tool_calls = {}
     conn._awaiting_tool_results = False
     conn._cancel_requested = False
+    conn._live_item_id = None
+    conn._live_truncate_ms = None
     conn._conversation = Conversation()
     conn.serving = _FakeServing()
     # handle_event's session.update branch now also assigns these.

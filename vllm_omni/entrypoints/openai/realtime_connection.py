@@ -175,11 +175,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         user `input_audio`) or a `function_call_output`, after
         `previous_item_id` when given.
       - `conversation.item.delete` removes an item; `conversation.item.truncate`
-        cuts an assistant item to the `audio_end_ms` the user heard.
+        cuts an assistant item to the `audio_end_ms` the user heard. A truncate
+        naming the reply still being generated applies once that reply ends.
       - `response.create` starts a turn without new audio; `response.cancel`
         stops the running one and keeps the text generated so far.
 
-    Each conversation turn ends with `response.done`, carrying the turn's usage
+    Each spoken reply item is announced by `response.output_item.added` with
+    its `id` before its first text or audio. Each conversation turn ends with
+    `response.done`, carrying the turn's usage
     in the chat-completions shape over the whole context (summed over tool
     rounds), the ids of the items it created, the ids in context, and the ids
     the context cap dropped. The cap is `SPRAG_REALTIME_CONTEXT_TOKENS`; once it
@@ -220,6 +223,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._next_user_item_id: str | None = None
         self._next_response_item_id: str | None = None
         self._cancel_requested = False
+        self._live_item_id: str | None = None
+        self._live_truncate_ms: int | None = None
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -268,6 +273,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 await self.send_error(
                     "conversation.item.truncate requires a non-negative audio_end_ms", "invalid_value"
                 )
+            elif item_id is not None and item_id == self._live_item_id and self._conversation.get(item_id) is None:
+                self._live_truncate_ms = audio_end_ms
             elif not isinstance(item_id, str) or not self._conversation.truncate(item_id, audio_end_ms):
                 await self.send_error(f"No assistant message item {item_id!r}", "item_not_found")
         elif event_type == "response.create":
@@ -651,10 +658,13 @@ class RealtimeConnection(VllmRealtimeConnection):
                     created.append(user_item_id)
             for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                 dropped += self._fit_context()
-                result = await self._generate_round(usage)
+                message_item_id = response_id if tool_round == 0 else _new_item_id()
+                self._live_item_id, self._live_truncate_ms = message_item_id, None
+                result = await self._generate_round(usage, message_item_id)
                 sent_audio |= result.sent_audio
                 spoken += result.spoken
-                created += self._record_round(result, response_id if tool_round == 0 else _new_item_id(), response_id)
+                created += self._record_round(result, message_item_id, response_id)
+                self._live_item_id = None
                 if result.cancelled:
                     status = "cancelled"
                     break
@@ -709,6 +719,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
         finally:
+            self._live_item_id = None
             # Always send the terminal event so clients don't hang forever.
             if self._is_connected:
                 try:
@@ -753,8 +764,12 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         return self._conversation.fit(max_tokens, retention, count_tokens)
 
-    async def _generate_round(self, usage: _TurnUsage) -> _Round:
-        """Generate one reply over the current conversation, streaming its text, audio and tool-call events."""
+    async def _generate_round(self, usage: _TurnUsage, message_item_id: str) -> _Round:
+        """Generate one reply over the current conversation, streaming its text, audio and tool-call events.
+
+        Args:
+            message_item_id: The id the round's spoken reply is announced and recorded under.
+        """
         rendered = self._conversation.render(self._audio_placeholder(), self._instructions)
         tokenizer = cached_tokenizer_from_config(self.serving.model_config)
         prompt = TokensPrompt(prompt_token_ids=tokenizer.encode(self._chat_text(rendered.messages)))
@@ -776,6 +791,19 @@ class RealtimeConnection(VllmRealtimeConnection):
             yield streaming_input
 
         result = _Round()
+        announced = False
+
+        async def announce() -> None:
+            nonlocal announced
+            if not announced:
+                announced = True
+                await self.send_json(
+                    {
+                        "type": "response.output_item.added",
+                        "item": {"type": "message", "role": "assistant", "id": message_item_id},
+                    }
+                )
+
         self._realtime_audio_ref = None
         self._pending_tool_calls = {}
         tool_state = ToolCallStreamState()
@@ -808,6 +836,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                         full_text += delta_text
                         content_delta, tool_deltas = extract_deltas(full_text, tool_state)
                         if content_delta:
+                            await announce()
                             result.spoken += content_delta
                             await self.send(TranscriptionDelta(delta=content_delta))
                         if tool_deltas:
@@ -815,6 +844,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
                 if audio_chunks and not tool_state.has_tool_calls():
+                    await announce()
                     for chunk in audio_chunks:
                         result.sent_audio = True
                         result.audio_seconds += len(chunk) / sample_rate
@@ -856,8 +886,11 @@ class RealtimeConnection(VllmRealtimeConnection):
                     text=result.spoken.strip(),
                     response_id=response_id,
                     audio_out_seconds=result.audio_seconds,
+                    audio_complete=not result.cancelled,
                 )
             )
+            if self._live_truncate_ms is not None:
+                self._conversation.truncate(message_item_id, self._live_truncate_ms)
             created.append(message_item_id)
         for call in result.tool_calls:
             item_id = _new_item_id()

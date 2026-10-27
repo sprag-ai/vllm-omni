@@ -70,7 +70,9 @@ class _FakeEngine:
             for output in outputs:
                 yield output
                 if self.on_output is not None:
-                    self.on_output(output)
+                    outcome = self.on_output(output)
+                    if asyncio.iscoroutine(outcome):
+                        await outcome
 
         return stream()
 
@@ -95,6 +97,8 @@ def conn(mocker) -> RealtimeConnection:
     conn._next_user_item_id = None
     conn._next_response_item_id = None
     conn._cancel_requested = False
+    conn._live_item_id = None
+    conn._live_truncate_ms = None
     conn._realtime_audio_ref = None
     mocker.patch.object(conn, "_chat_text", side_effect=lambda messages: json.dumps(messages))
     mocker.patch.object(conn, "_sampling_rate", return_value=16_000)
@@ -214,6 +218,43 @@ class TestCancel:
         assert conn._conversation.get("r1").text == "The train"
         assert _event(sent, "response.done")["status"] == "cancelled"
         assert sent[-1]["type"] == "response.output_audio.done"
+
+    def test_a_truncate_during_the_reply_applies_once_the_reply_ends(self, conn) -> None:
+        async def barge_in_after_audio(output):
+            if output.stage_id == 2:
+                await conn.handle_event({"type": "response.cancel"})
+                await conn.handle_event({"type": "conversation.item.truncate", "item_id": "r1", "audio_end_ms": 1000})
+
+        conn.engine = _FakeEngine(
+            [[_text("The train to Chicago leaves at six."), _audio(2.0), _text(" More.")]],
+            on_output=barge_in_after_audio,
+        )
+
+        async def run():
+            async def stream():
+                yield np.zeros(16_000, dtype=np.float32)
+
+            conn._next_user_item_id, conn._next_response_item_id = "u1", "r1"
+            conn.generation_task = asyncio.current_task()
+            await conn._run_conversation_turn(stream())
+
+        conn.sent.clear()
+        asyncio.run(run())
+
+        conn.send_error.assert_not_awaited()
+        reply = conn._conversation.get("r1")
+        assert reply.text == "The train"
+        assert reply.audio_out_seconds == 1.0
+        assert _event(conn.sent, "response.done")["status"] == "cancelled"
+
+    def test_the_reply_item_is_announced_before_its_text_and_audio(self, conn) -> None:
+        conn.engine = _FakeEngine([[_text("Hi."), _audio(0.5)]])
+
+        sent = _turn(conn, user="u1", response="r1")
+
+        announced = _event(sent, "response.output_item.added")
+        assert announced["item"] == {"type": "message", "role": "assistant", "id": "r1"}
+        assert sent.index(announced) == 0
 
 
 class TestToolRounds:
