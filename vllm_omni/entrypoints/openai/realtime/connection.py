@@ -113,6 +113,7 @@ class OpenAIFullDuplexConnection:
         tool_call_parser: str | None = None,
         enable_auto_tool_choice: bool = False,
         vad_backend_provider: SileroVADBackendProvider | None = None,
+        max_pending_turns: int = 4,
     ):
         self.ws = websocket
         self.engine = engine
@@ -121,6 +122,7 @@ class OpenAIFullDuplexConnection:
         self._tokenizer = chat_handler.renderer.get_tokenizer()
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
+        self._max_pending_turns = max_pending_turns
         self._turn_detector: ServerTurnDetector | None = None
         self._transcription: TranscriptionTurns | None = None
         self._speech_item_id: str | None = None
@@ -585,6 +587,14 @@ class OpenAIFullDuplexConnection:
         try:
             s = self.session
             if len(s.input_audio_buffer) == 0:
+                return None
+            if self._transcription is not None and self._transcription.pending >= self._max_pending_turns:
+                # The buffer keeps the turn's audio, so a later commit still transcribes it.
+                await self._send_error(
+                    "Too many committed turns are waiting for transcription",
+                    "input_backpressure",
+                    event_id=event_id,
+                )
                 return None
             audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
             if self._transcription is not None:

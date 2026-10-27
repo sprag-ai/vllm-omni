@@ -43,6 +43,11 @@ class TranscriptionTurns:
         self._request_ids: set[str] = set()
 
     @property
+    def pending(self) -> int:
+        """The committed turns not yet transcribed, the one in the engine included."""
+        return len(self._tasks)
+
+    @property
     def prompt(self) -> str:
         """The instructions each turn is transcribed under."""
         audio_input = self.config.audio.input if self.config.audio is not None else None

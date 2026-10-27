@@ -191,3 +191,47 @@ async def test_a_transcription_session_cannot_switch_back_to_realtime() -> None:
 def test_the_transcript_token_limit_grows_with_audio_duration() -> None:
     assert transcript_token_limit(0.0) == 128
     assert transcript_token_limit(6.97) == 128 + 8 * 7
+
+
+@pytest.mark.asyncio
+async def test_a_commit_past_the_pending_turn_limit_is_refused_and_keeps_its_audio() -> None:
+    release = asyncio.Event()
+
+    async def generate(**_kwargs: Any):
+        await release.wait()
+        yield SimpleNamespace(final_output_type="text", outputs=[SimpleNamespace(text="text", token_ids=[0])])
+
+    engine = _transcribing_engine([], [])
+    engine.generate = generate
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    connection._max_pending_turns = 2
+    await _start_transcription(connection)
+
+    await _commit(connection, 1.0)
+    await _commit(connection, 1.0)
+    await _commit(connection, 1.0)
+
+    refusal = _websocket_events(websocket)[-1]
+    assert refusal["type"] == "error"
+    assert refusal["error"]["code"] == "input_backpressure"
+    assert refusal["error"]["event_id"] == "evt_commit"
+    assert len(connection.session.input_audio_buffer) == 2 * SAMPLE_RATE_HZ
+
+    release.set()
+    await _settle(connection)
+    completed = [
+        event
+        for event in _websocket_events(websocket)
+        if event["type"] == "conversation.item.input_audio_transcription.completed"
+    ]
+    assert len(completed) == 2
+
+
+def test_the_realtime_handler_takes_the_pending_turn_limit_from_the_deploy_config() -> None:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.entrypoints.duplex.openai import OpenAIRealtimeHandler
+
+    engine = SimpleNamespace(duplex_session_config=DuplexSessionRuntimeConfig(max_pending_turns_per_session=7))
+
+    assert OpenAIRealtimeHandler.from_engine_client(engine)._max_pending_turns == 7
