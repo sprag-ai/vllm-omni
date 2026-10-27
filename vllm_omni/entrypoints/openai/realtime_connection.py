@@ -177,7 +177,8 @@ class RealtimeConnection(VllmRealtimeConnection):
       - `conversation.item.delete` removes an item; `conversation.item.truncate`
         cuts an assistant item to the `audio_end_ms` the user heard. A truncate
         naming the reply still being generated applies once that reply ends.
-      - `response.create` starts a turn without new audio; `response.cancel`
+      - `response.create` starts a turn without new audio, under its optional
+        `response_item_id`; `response.cancel`
         stops the running one and keeps the text generated so far.
 
     Each spoken reply item is announced by `response.output_item.added` with
@@ -284,6 +285,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 await self.send_error("A response is already in progress", "response_in_progress")
             else:
                 self._tool_rounds_reset()
+                self._next_user_item_id = None
+                self._next_response_item_id = await self._free_item_id(event.get("response_item_id"))
                 self.generation_task = asyncio.create_task(self._run_conversation_turn(None))
         elif event_type == "response.cancel":
             if self.generation_task is not None and not self.generation_task.done():

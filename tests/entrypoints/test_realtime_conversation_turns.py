@@ -457,6 +457,17 @@ class TestItemEvents:
 
         run.assert_called_once_with(None)
 
+    def test_response_create_names_the_reply_item(self, conn, mocker) -> None:
+        mocker.patch.object(conn, "_run_conversation_turn", return_value=asyncio.sleep(0))
+
+        async def start():
+            await conn.handle_event({"type": "response.create", "response_item_id": "r9"})
+            await conn.generation_task
+
+        asyncio.run(start())
+
+        assert conn._next_response_item_id == "r9"
+
     def test_response_cancel_flags_a_running_turn(self, conn) -> None:
         async def run():
             conn.generation_task = asyncio.create_task(asyncio.sleep(1))
