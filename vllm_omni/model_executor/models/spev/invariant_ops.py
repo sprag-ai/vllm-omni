@@ -17,32 +17,45 @@ def supports_invariant(value):
 
 @triton.jit
 def _ieee_matmul_kernel(
-    a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    rows,
+    columns,
+    depth,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        ks = k * BLOCK_K + offs_k
+    offs_m = pid_m * block_m + tl.arange(0, block_m)
+    offs_n = pid_n * block_n + tl.arange(0, block_n)
+    offs_k = tl.arange(0, block_k)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.float32)
+    for step in range(0, tl.cdiv(depth, block_k)):
+        ks = step * block_k + offs_k
         a = tl.load(
             a_ptr + offs_m[:, None] * stride_am + ks[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & (ks[None, :] < K),
+            mask=(offs_m[:, None] < rows) & (ks[None, :] < depth),
             other=0.0,
         )
         b = tl.load(
             b_ptr + ks[:, None] * stride_bk + offs_n[None, :] * stride_bn,
-            mask=(ks[:, None] < K) & (offs_n[None, :] < N),
+            mask=(ks[:, None] < depth) & (offs_n[None, :] < columns),
             other=0.0,
         )
         accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
         accumulator,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+        mask=(offs_m[:, None] < rows) & (offs_n[None, :] < columns),
     )
 
 
@@ -52,8 +65,21 @@ def _ieee_matmul(a, b):
     c = torch.empty((m, n), device=a.device, dtype=torch.float32)
     grid = (triton.cdiv(m, 32), triton.cdiv(n, 32))
     _ieee_matmul_kernel[grid](
-        a, b, c, m, n, k, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
-        BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        block_m=32,
+        block_n=32,
+        block_k=32,
     )
     return c
 

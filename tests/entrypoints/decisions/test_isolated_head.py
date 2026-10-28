@@ -83,7 +83,7 @@ def test_attention_batch_and_question_isolation():
     assert not torch.equal(changed[6:], alone[6:])
 
 
-def test_batched_pooler_calls_head_once_and_preserves_request_order():
+def test_batched_pooler_scores_each_request_alone_and_preserves_request_order():
     torch.manual_seed(78)
     head = IsolatedDecisionHead(8, 8, 2, 16, 2).eval()
     embedding = nn.Embedding(32, 8)
@@ -92,13 +92,13 @@ def test_batched_pooler_calls_head_once_and_preserves_request_order():
     count = []
     handle = head.register_forward_hook(lambda *args: count.append(1))
     joint = pooler(torch.cat([first, second]), metadata([layout(), layout()]))
-    assert len(count) == 1
+    assert len(count) == 2
     handle.remove()
     alone = pooler(first, metadata([layout()]))
     reversed_batch = pooler(torch.cat([second, first]), metadata([layout(), layout()]))
-    torch.testing.assert_close(joint[0], alone[0], atol=1e-6, rtol=0)
-    torch.testing.assert_close(joint[0], reversed_batch[1], atol=1e-6, rtol=0)
-    torch.testing.assert_close(joint[1], reversed_batch[0], atol=1e-6, rtol=0)
+    assert torch.equal(joint[0], alone[0])
+    assert torch.equal(joint[0], reversed_batch[1])
+    assert torch.equal(joint[1], reversed_batch[0])
 
 
 def test_layout_rebases_multimodal_expansion_and_requires_metadata():
