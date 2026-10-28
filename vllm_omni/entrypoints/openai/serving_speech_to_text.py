@@ -109,7 +109,7 @@ def _with_prompt_usage(event: str, counts: _PromptCounts, details: PromptTokenUs
     usage["total_tokens"] = usage.get("total_tokens", 0) + uncounted
     if details is not None:
         usage["prompt_tokens_details"] = details.model_dump(exclude_none=True)
-    return f"{_SSE_PREFIX}{json.dumps(chunk, separators=(',', ':'))}\n\n"
+    return f"{_SSE_PREFIX}{json.dumps(chunk, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 class _StreamedPromptUsage:

@@ -10,7 +10,12 @@ import numpy as np
 import pytest
 import requests
 import soundfile as sf
+import torch
 from vllm.assets.audio import AudioAsset
+from vllm.config import SpeechToTextConfig
+from vllm.model_executor.models.qwen3_asr import _get_feat_extract_output_lengths
+from vllm.multimodal.audio import split_audio
+from vllm.multimodal.media.audio import load_audio
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -18,8 +23,14 @@ from tests.helpers.runtime import OmniServerParams
 pytestmark = [pytest.mark.slow]
 
 MODEL = "Qwen/Qwen3-ASR-1.7B"
-CLIP_S = 600
-"""Longest clip ``Qwen3ASRLongFormGeneration`` transcribes in one generation; longer audio is chunked."""
+ASR_CONFIG = SpeechToTextConfig(max_audio_clip_s=600, sample_rate=16_000)
+"""The clip length and sample rate ``Qwen3ASRLongFormGeneration`` transcribes at; longer audio is chunked."""
+
+HOP_LENGTH = 160
+"""Audio samples per mel frame in Qwen3-ASR's feature extractor."""
+
+AUDIO_TOKENS_PER_SECOND = 13
+"""Qwen3-ASR audio tokens per second of audio: 13 per 100 mel frames."""
 
 SERVER = OmniServerParams(model=MODEL, server_args=["--enable-prompt-tokens-details", "--max-model-len", "32768"])
 
@@ -31,6 +42,23 @@ def speech(copies: int) -> tuple[bytes, float]:
     buffer = io.BytesIO()
     sf.write(buffer, tiled, rate, format="WAV", subtype="PCM_16")
     return buffer.getvalue(), len(tiled) / rate
+
+
+def expected_audio_tokens(audio: bytes) -> list[int]:
+    """Return the audio tokens of each chunk the server splits ``audio`` into, decoded and split as upstream does."""
+    with io.BytesIO(audio) as buffer:
+        samples, rate = load_audio(buffer, sr=ASR_CONFIG.sample_rate, mono=True)
+    chunks = [samples]
+    if len(samples) / rate > ASR_CONFIG.max_audio_clip_s:
+        chunks = split_audio(
+            audio_data=samples,
+            sample_rate=int(rate),
+            max_clip_duration_s=ASR_CONFIG.max_audio_clip_s,
+            overlap_duration_s=ASR_CONFIG.overlap_chunk_second,
+            min_energy_window_size=ASR_CONFIG.min_energy_split_window_size,
+        )
+    frames = torch.tensor([len(chunk) // HOP_LENGTH for chunk in chunks])
+    return _get_feat_extract_output_lengths(frames).tolist()
 
 
 def transcribe(server, audio: bytes, *, stream: bool) -> dict:
@@ -62,33 +90,37 @@ def text_tokens(usage: dict) -> int:
     return usage["prompt_tokens"] - audio_tokens(usage)
 
 
+def assert_usage(server, audio: bytes, chunk_text_tokens: int | None = None) -> dict:
+    """Stream ``audio`` and check its usage against the expected per-chunk counts; return the usage."""
+    expected = expected_audio_tokens(audio)
+    usage = transcribe(server, audio, stream=True)
+    assert audio_tokens(usage) == sum(expected)
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    if chunk_text_tokens is not None:
+        assert text_tokens(usage) == len(expected) * chunk_text_tokens
+    seconds = transcribe(server, audio, stream=False)["seconds"]
+    assert math.ceil(audio_tokens(usage) / AUDIO_TOKENS_PER_SECOND) == seconds
+    return usage
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(SERVER, id="qwen3-asr")], indirect=True)
-def test_unchunked_audio_tokens_scale_with_duration(omni_server):
-    one_audio, one_s = speech(1)
+def test_unchunked_audio_tokens_match_each_clip(omni_server):
+    one_audio, _ = speech(1)
     two_audio, two_s = speech(2)
-    assert two_s < CLIP_S
-    one = transcribe(omni_server, one_audio, stream=True)
-    two = transcribe(omni_server, two_audio, stream=True)
-
-    assert 0 < audio_tokens(one) < one["prompt_tokens"]
-    assert text_tokens(two) == text_tokens(one)
-    assert audio_tokens(two) / two_s == pytest.approx(audio_tokens(one) / one_s, rel=0.02)
-    assert one["total_tokens"] == one["prompt_tokens"] + one["completion_tokens"]
-    assert transcribe(omni_server, one_audio, stream=False)["seconds"] == math.ceil(one_s)
+    assert two_s < ASR_CONFIG.max_audio_clip_s
+    one = assert_usage(omni_server, one_audio)
+    assert 0 < text_tokens(one)
+    assert_usage(omni_server, two_audio, chunk_text_tokens=text_tokens(one))
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(SERVER, id="qwen3-asr")], indirect=True)
 def test_chunked_prompt_and_audio_tokens_cover_every_chunk(omni_server):
     one_audio, one_s = speech(1)
-    long_audio, long_s = speech(math.ceil((CLIP_S + 60) / one_s))
-    chunks = math.ceil(long_s / CLIP_S)
-    assert chunks == 2
-    one = transcribe(omni_server, one_audio, stream=True)
-    long = transcribe(omni_server, long_audio, stream=True)
-
-    assert text_tokens(long) == chunks * text_tokens(one)
-    assert audio_tokens(long) / long_s == pytest.approx(audio_tokens(one) / one_s, rel=0.02)
-    assert long["total_tokens"] == long["prompt_tokens"] + long["completion_tokens"]
-    assert transcribe(omni_server, long_audio, stream=False)["seconds"] == math.ceil(long_s)
+    long_audio, _ = speech(math.floor(ASR_CONFIG.max_audio_clip_s / one_s) + 1)
+    expected = expected_audio_tokens(long_audio)
+    assert len(expected) == 2
+    assert expected[-1] < 0.02 * sum(expected)
+    one = assert_usage(omni_server, one_audio)
+    assert_usage(omni_server, long_audio, chunk_text_tokens=text_tokens(one))
