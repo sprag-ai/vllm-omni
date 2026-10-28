@@ -32,7 +32,11 @@ HOP_LENGTH = 160
 AUDIO_TOKENS_PER_SECOND = 13
 """Qwen3-ASR audio tokens per second of audio: 13 per 100 mel frames."""
 
-SERVER = OmniServerParams(model=MODEL, server_args=["--enable-prompt-tokens-details", "--max-model-len", "32768"])
+SERVER = OmniServerParams(
+    model=MODEL,
+    server_args=["--enable-prompt-tokens-details", "--max-model-len", "32768"],
+    env_dict={"VLLM_MAX_AUDIO_DECODE_DURATION_S": "3600"},
+)
 
 
 def speech(copies: int) -> tuple[bytes, float]:
