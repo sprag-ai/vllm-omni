@@ -1212,6 +1212,7 @@ async def omni_init_app_state(
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         )
         if "transcription" in supported_tasks
         else None

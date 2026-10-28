@@ -6,11 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config import SpeechToTextConfig
+from vllm.multimodal.inputs import PlaceholderRange
 
 from vllm_omni.entrypoints.openai.serving_speech_to_text import (
     OmniOpenAIServingTranscription,
     _AudioDurationBound,
-    _StreamedDurationUsage,
+    _StreamedPromptTokenDetails,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -70,53 +71,72 @@ USAGE = (
 DONE = "data: [DONE]\n\n"
 
 
-class FakeStream:
-    """Stands in for upstream's stream generator: yields fixed events."""
+def engine_input(*lengths):
+    return {"mm_placeholders": {"audio": [PlaceholderRange(offset=3, length=length) for length in lengths]}}
 
-    def __init__(self, events):
+
+class FakeStreamServing:
+    """Stands in for upstream's speech-to-text serving: preprocesses fixed engine inputs, then streams or not."""
+
+    def __init__(self, engine_inputs, events=None):
+        self.engine_inputs = engine_inputs
         self.events = events
 
-    async def _speech_to_text_stream_generator(self, *, audio_duration_s, **kwargs):
-        for event in self.events:
-            yield event
+    async def _preprocess_speech_to_text(self, request, audio_data, request_id):
+        return self.engine_inputs, 5.12, [0.0]
+
+    async def _create_speech_to_text(self, *args, **kwargs):
+        await self._preprocess_speech_to_text(request=None, audio_data=b"", request_id="req-1")
+        if self.events is None:
+            return {"text": "Hi"}
+
+        async def stream():
+            for event in self.events:
+                yield event
+
+        return stream()
 
 
-class DurationStream(_StreamedDurationUsage, FakeStream):
+class DetailsServing(_StreamedPromptTokenDetails, FakeStreamServing):
     pass
 
 
-async def stream(events, duration):
-    serving = DurationStream(events)
-    return [event async for event in serving._speech_to_text_stream_generator(audio_duration_s=duration, request=None)]
+async def serve(engine_inputs, events=None, enabled=True):
+    serving = DetailsServing(engine_inputs, events, enable_prompt_tokens_details=enabled)
+    result = await serving._create_speech_to_text()
+    if events is None:
+        return result
+    return [event async for event in result]
 
 
-async def test_final_usage_chunk_reports_duration_rounded_up():
-    _, usage, _ = await stream([DELTA, USAGE, DONE], 5.12)
+async def test_final_usage_chunk_carries_audio_prompt_tokens():
+    _, usage, _ = await serve([engine_input(66)], [DELTA, USAGE, DONE])
     assert json.loads(usage.removeprefix("data: "))["usage"] == {
         "prompt_tokens": 125,
         "total_tokens": 145,
         "completion_tokens": 20,
-        "type": "duration",
-        "seconds": 6,
+        "prompt_tokens_details": {"multimodal_tokens": {"audio": 66}},
     }
 
 
-async def test_whole_second_duration_is_not_rounded_up():
-    _, usage, _ = await stream([DELTA, USAGE, DONE], 6.0)
-    assert json.loads(usage.removeprefix("data: "))["usage"]["seconds"] == 6
+async def test_audio_prompt_tokens_sum_every_chunk_and_placeholder():
+    _, usage, _ = await serve([engine_input(40, 26), engine_input(30)], [DELTA, USAGE, DONE])
+    details = json.loads(usage.removeprefix("data: "))["usage"]["prompt_tokens_details"]
+    assert details == {"multimodal_tokens": {"audio": 96}}
 
 
 async def test_other_events_pass_through_unchanged():
     error = 'data: {"error":{"message":"boom"}}\n\n'
-    assert await stream([DELTA, error, DONE], 5.12) == [DELTA, error, DONE]
+    assert await serve([engine_input(66)], [DELTA, error, DONE]) == [DELTA, error, DONE]
 
 
-async def test_stream_without_usage_chunk_is_unchanged():
-    assert await stream([DELTA, DONE], 5.12) == [DELTA, DONE]
+async def test_stream_is_unchanged_when_details_are_disabled():
+    assert await serve([engine_input(66)], [DELTA, USAGE, DONE], enabled=False) == [DELTA, USAGE, DONE]
 
 
-def test_transcription_serving_streams_through_the_duration_usage():
-    assert (
-        OmniOpenAIServingTranscription._speech_to_text_stream_generator
-        is _StreamedDurationUsage._speech_to_text_stream_generator
-    )
+async def test_non_streamed_result_is_unchanged():
+    assert await serve([engine_input(66)]) == {"text": "Hi"}
+
+
+def test_transcription_serving_streams_through_the_prompt_token_details():
+    assert OmniOpenAIServingTranscription._create_speech_to_text is _StreamedPromptTokenDetails._create_speech_to_text
