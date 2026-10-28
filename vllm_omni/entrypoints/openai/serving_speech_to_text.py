@@ -1,4 +1,6 @@
+import json
 import math
+from collections.abc import AsyncGenerator
 
 from vllm.config import SpeechToTextConfig
 from vllm.entrypoints.serve.engine.typing import SpeechToTextRequest
@@ -67,7 +69,42 @@ class _AudioDurationBound:
         return engine_inputs, duration, chunk_start_offsets
 
 
-class OmniOpenAIServingTranscription(_AudioDurationBound, OpenAIServingTranscription):
+_SSE_PREFIX = "data: "
+
+
+def _with_duration(event: str, seconds: int) -> str:
+    """Add the duration usage to the stream's final usage chunk; return any other event unchanged."""
+    if not event.startswith(_SSE_PREFIX):
+        return event
+    try:
+        chunk = json.loads(event[len(_SSE_PREFIX) :])
+    except json.JSONDecodeError:
+        return event
+    if not isinstance(chunk, dict) or chunk.get("choices") != [] or not isinstance(chunk.get("usage"), dict):
+        return event
+    chunk["usage"] |= {"type": "duration", "seconds": seconds}
+    return f"{_SSE_PREFIX}{json.dumps(chunk, separators=(',', ':'))}\n\n"
+
+
+class _StreamedDurationUsage:
+    """Reports the audio duration on a streamed transcription's final usage chunk.
+
+    The non-streamed response carries ``{"type": "duration", "seconds": ...}``, rounded up to whole
+    seconds; upstream's stream reports token counts alone. The final usage chunk gains the same two keys
+    beside its token counts, so a streamed and a non-streamed request for the same audio report the same
+    duration.
+    """
+
+    async def _speech_to_text_stream_generator(
+        self, *args, audio_duration_s: float, **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Stream as upstream does, adding the duration usage to the final usage chunk."""
+        seconds = int(math.ceil(audio_duration_s))
+        async for event in super()._speech_to_text_stream_generator(*args, audio_duration_s=audio_duration_s, **kwargs):
+            yield _with_duration(event, seconds)
+
+
+class OmniOpenAIServingTranscription(_StreamedDurationUsage, _AudioDurationBound, OpenAIServingTranscription):
     """``/v1/audio/transcriptions``, bounded by the duration of its audio."""
 
 
