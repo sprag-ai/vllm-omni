@@ -105,11 +105,22 @@ class _CapabilityTask:
             return False
 
 
+def _decodes_transcripts(architectures: str | list[str], model_config: ModelConfig) -> bool:
+    """Whether a stage generates transcripts: a SupportsTranscription model on a generating runner.
+
+    A pooling runner over an ASR-family architecture, such as the forced-aligner stage, emits pooled
+    logits and serves no transcription.
+    """
+    if model_config.runner_type == "pooling":
+        return False
+    return ModelRegistry.is_transcription_model(architectures, model_config)
+
+
 _MODEL_CAPABILITY_TASKS: tuple[_CapabilityTask, ...] = (
     # SupportsTranscription -> /v1/audio/transcriptions, /v1/audio/translations.
     _CapabilityTask(
         task="transcription",
-        probe=ModelRegistry.is_transcription_model,
+        probe=_decodes_transcripts,
         eligible=lambda client: getattr(client, "is_comprehension", False),
     ),
 )
