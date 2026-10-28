@@ -56,7 +56,8 @@ jobs:
           OMP_NUM_THREADS: "1"
         run: |
           mapfile -t changed < <(git diff --name-only --diff-filter=AM "${BASE_SHA}" HEAD -- 'tests/**/test_*.py')
-          uv run --no-sync python -m pytest -q -n auto -m "core_model and cpu" \
+          # -n auto counts the node's 48 CPUs, and 48 workers overrun the runner pod's 32Gi; it requests 8 CPUs.
+          uv run --no-sync python -m pytest -q -n 8 -m "core_model and cpu" \
             tests/core/sched tests/metrics tests/entrypoints/openai_api "${changed[@]}"
 
       # The single-L4 core set for the areas sprag patches, plus every test file the change adds or edits.
