@@ -15,6 +15,8 @@ from vllm_omni.metrics.utils import (
     count_tokens_from_outputs,
     count_video_frames,
     extract_diffusion_vae_decode_ms,
+    extract_mm_output,
+    iter_mm_outputs,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -170,3 +172,23 @@ def test_extract_vae_decode_ms_ignores_other_targets(durations: dict[str, float]
 def test_extract_vae_decode_ms_without_stage_durations() -> None:
     # Pipelines pass stage_durations=None when the profiler is off.
     assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None
+
+
+class _PoolingOutput:
+    """Stands in for vLLM's ``PoolingOutput``: a single object, neither iterable nor indexable."""
+
+    multimodal_output = None
+
+
+def test_iter_mm_outputs_skips_a_pooling_stage_output() -> None:
+    assert iter_mm_outputs(SimpleNamespace(outputs=_PoolingOutput())) == []
+
+
+def test_extract_mm_output_skips_a_pooling_stage_output() -> None:
+    assert extract_mm_output(SimpleNamespace(outputs=_PoolingOutput())) == {}
+
+
+def test_iter_mm_outputs_still_visits_completion_outputs() -> None:
+    audio = {"audio": [1]}
+    source = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=audio), SimpleNamespace()])
+    assert iter_mm_outputs(source) == [audio]

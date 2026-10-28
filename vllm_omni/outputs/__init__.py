@@ -339,7 +339,9 @@ class OmniRequestOutput(RequestOutput):
 
         Returns either a MultimodalPayload (Phase 3+) or a plain dict (legacy).
         """
-        for output in self.outputs:
+        # A pooling stage's outputs is a single PoolingOutput, which carries no multimodal payload.
+        completions = self.outputs if isinstance(self.outputs, (list, tuple)) else ()
+        for output in completions:
             if mm := getattr(output, "multimodal_output", None):
                 return mm
         return self._multimodal_output
