@@ -19,4 +19,7 @@ RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'imp
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+# Precompile runtime imports; aenum's Python 2 compatibility module is not used on Python 3.
+RUN python3 -m compileall -q -j 4 -x '/aenum/_py2\.py$' "$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+
 ENTRYPOINT []
