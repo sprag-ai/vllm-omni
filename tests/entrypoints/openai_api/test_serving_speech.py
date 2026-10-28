@@ -32,7 +32,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.outputs import CompletionOutput
+from vllm.outputs import CompletionOutput, PoolingOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -6596,3 +6596,19 @@ def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixtu
     used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
     used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
     unused.assert_not_called()
+
+
+def test_extract_audio_output_skips_a_pooling_stage_output():
+    res = SimpleNamespace(multimodal_output=None, outputs=PoolingOutput(data=torch.zeros(2, 2, dtype=torch.int32)))
+
+    assert OmniOpenAIServingSpeech._extract_audio_output(res) == (None, None)
+
+
+def test_extract_audio_output_reads_a_completion_multimodal_output():
+    audio = torch.ones(4)
+    completion = SimpleNamespace(multimodal_output={"audio": audio})
+    res = SimpleNamespace(multimodal_output=None, outputs=[completion])
+
+    mm, key = OmniOpenAIServingSpeech._extract_audio_output(res)
+
+    assert key == "audio" and mm["audio"] is audio

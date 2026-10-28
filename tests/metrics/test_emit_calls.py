@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
+import torch
+from vllm.outputs import PoolingOutput
 
 from vllm_omni.metrics import OmniPrometheusMetrics
 from vllm_omni.metrics import definitions as defs
@@ -321,6 +323,58 @@ class TestStageWorkloadMetricScope:
         else:
             obj.prom_metrics.set_peak_memory.assert_not_called()
         obj.mod_metrics.observe_image_ttfp.assert_called_once_with("1", "0", 0.25)
+
+
+class TestFinalizeFinishReason:
+    @pytest.mark.parametrize(
+        ("outputs", "expected"),
+        [
+            (PoolingOutput(data=torch.zeros(2, 2, dtype=torch.int32)), "stop"),
+            ([SimpleNamespace(finish_reason="length")], "length"),
+        ],
+    )
+    def test_request_succeeded_labels_the_finish_reason(self, mocker, outputs, expected) -> None:
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+        mocker.patch("vllm_omni.entrypoints.omni_base.OmniRequestOutput.from_stage_output")
+        obj = object.__new__(OmniBase)
+        obj._enable_ar_profiler = False
+        obj.request_states = {}
+        obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
+        obj.mod_metrics = mocker.Mock()
+        obj._publish_request_gauges = mocker.Mock()
+        obj.engine = SimpleNamespace(
+            get_stage_metadata=lambda _stage_id: SimpleNamespace(
+                stage_type="llm",
+                final_output=True,
+                final_output_type="text",
+            )
+        )
+        result = SimpleNamespace(
+            request_id="req-final",
+            stage_id=2,
+            replica_id=0,
+            stage_submit_ts=10.0,
+            metrics=None,
+            engine_outputs=SimpleNamespace(
+                stage_durations={},
+                peak_memory_mb=0.0,
+                finished=True,
+                final_output_type="text",
+                outputs=outputs,
+            ),
+        )
+        aggregator = mocker.Mock()
+        aggregator.stage_events = {}
+        aggregator.e2e_done = set()
+        aggregator.stage_first_ts = [None, None, None]
+        aggregator.stage_last_ts = [None, None, None]
+
+        obj._process_single_result(result, 2, aggregator, {}, 0.0, 2)
+
+        obj.prom_metrics.request_succeeded.assert_called_once()
+        assert obj.prom_metrics.request_succeeded.call_args.kwargs["finished_reason"] == expected
 
 
 class TestStageWaitingAggregation:

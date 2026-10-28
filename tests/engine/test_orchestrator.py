@@ -17,7 +17,7 @@ import janus
 import pytest
 import torch
 from vllm.lora.request import LoRARequest
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, PoolingOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -2397,6 +2397,27 @@ def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> N
     assert metrics.num_tokens_out == 2
     assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
     assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
+
+
+@pytest.mark.parametrize(("data", "expected"), [(torch.zeros(2, 3), True), (None, False)])
+def test_pooling_stage_output_is_non_empty_when_it_carries_data(data, expected) -> None:
+    stage = FakeStageClient(stage_type="llm", final_output=True, final_output_type="timestamps")
+    pool = StagePool(2, [stage], output_processor=FakeOutputProcessor())
+    output = SimpleNamespace(request_id="req-align", outputs=PoolingOutput(data=data))
+
+    pool.record_output_timestamps([output], output_ts=132.0)
+    metrics = pool.build_stage_metrics([output], submit_ts=130.0, request_timestamp=120.0, replica_id=0)
+
+    assert pool._has_non_empty_output(output) is expected
+    assert metrics.num_tokens_out == 0
+
+
+def test_pooling_stage_request_output_has_no_multimodal_output() -> None:
+    output = OmniRequestOutput.__new__(OmniRequestOutput)
+    output.outputs = PoolingOutput(data=torch.zeros(2, 3))
+    output._multimodal_output = {}
+
+    assert output.multimodal_output == {}
 
 
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:

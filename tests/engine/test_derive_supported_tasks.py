@@ -79,6 +79,35 @@ def test_transcription_absent_when_model_lacks_support(monkeypatch):
     assert "transcription" not in tasks
 
 
+def _runner_config(runner_type, architectures=("Qwen3ASRForcedAlignerForTokenClassification",)):
+    return types.SimpleNamespace(
+        model_config=types.SimpleNamespace(architectures=list(architectures), model="m", runner_type=runner_type)
+    )
+
+
+def test_pooling_stage_of_transcription_architecture_yields_no_transcription(monkeypatch):
+    monkeypatch.setattr(
+        omni_engine_base_module.ModelRegistry, "is_transcription_model", lambda _architectures, _model_config: True
+    )
+    tasks = _derive_capability_tasks(
+        [
+            _pool(final_output_type="audio"),
+            _pool(is_comprehension=True, final_output_type="timestamps", vllm_config=_runner_config("pooling")),
+        ]
+    )
+    assert "transcription" not in tasks
+
+
+def test_generating_stage_of_transcription_architecture_yields_transcription(monkeypatch):
+    monkeypatch.setattr(
+        omni_engine_base_module.ModelRegistry, "is_transcription_model", lambda _architectures, _model_config: True
+    )
+    tasks = _derive_capability_tasks(
+        [_pool(is_comprehension=True, vllm_config=_runner_config("generate", ("Qwen3ASRForConditionalGeneration",)))]
+    )
+    assert tasks == {"transcription"}
+
+
 def test_capability_table_drives_derivation(monkeypatch):
     monkeypatch.setattr(
         omni_engine_base_module,
