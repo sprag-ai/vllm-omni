@@ -14,6 +14,7 @@ from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
 from .branch_attention import REQUEST
 from .expert_operations import batched_linear, expert_forward
+from .invariant_ops import invariant_experts, invariant_linear, supports_invariant
 from .isolated_attention import LAYOUTS
 from .token_operations import BatchPackingCache, PackingCache, grouped_forward
 
@@ -67,6 +68,8 @@ class CheckpointLinear(nn.Module):
         self.bias = source.bias
 
     def forward(self, value):
+        if supports_invariant(value):
+            return invariant_linear(value, self.weight, self.bias), None
         return batch_projection(value, lambda x: batched_linear(x, self.weight, self.bias), batch_prefix=False), None
 
 
@@ -88,6 +91,8 @@ class CheckpointQKV(CheckpointLinear):
     def forward(self, value):
         if self._adapters is None:
             raise RuntimeError("SPEV adapters have not been loaded")
+        if supports_invariant(value):
+            return self._invariant_forward(value), None
 
         def operation(x):
             sizes = (self.query_size, self.kv_size, self.kv_size)
@@ -104,6 +109,17 @@ class CheckpointQKV(CheckpointLinear):
             return torch.cat(outputs, dim=-1)
 
         return batch_projection(value, operation), None
+
+    def _invariant_forward(self, value):
+        output = invariant_linear(value, self.weight, self.bias)
+        start = 0
+        for size, adapter in zip((self.query_size, self.kv_size, self.kv_size), self._adapters):
+            if adapter is not None:
+                a, b = adapter
+                residual = invariant_linear(invariant_linear(value.float(), a), b) * self.scale
+                output[..., start : start + size] += residual.to(output.dtype)
+            start += size
+        return output
 
 
 class CheckpointRotary(nn.Module):
@@ -169,13 +185,21 @@ class CheckpointExperts(nn.Module):
         return Qwen3OmniMoeThinkerTextExperts._apply_gate(self, value)
 
     def forward(self, value):
+        if supports_invariant(value) and value.dtype == torch.bfloat16:
+            logits = invariant_linear(value, self.weight)
+            weights, indices = self._route(logits)
+            return invariant_experts(value, self.gate_up_proj, self.down_proj, weights, indices)
         requests = LAYOUTS.get()
         if value.dtype == torch.float32 and requests:
             logits = torch.cat([nn.functional.linear(value[start:end], self.weight) for start, end, _, _ in requests])
         else:
             logits = canonical_projection(value, lambda part: nn.functional.linear(part, self.weight))
+        weights, indices = self._route(logits)
+        return expert_forward(self, value, indices, weights)
+
+    def _route(self, logits):
         probabilities = logits.softmax(-1, dtype=torch.float32)
         weights, indices = probabilities.topk(self.top_k, dim=-1)
         if self.norm_topk_prob:
             weights = weights / weights.sum(-1, keepdim=True)
-        return expert_forward(self, value, indices, weights.to(logits.dtype))
+        return weights.to(logits.dtype), indices
