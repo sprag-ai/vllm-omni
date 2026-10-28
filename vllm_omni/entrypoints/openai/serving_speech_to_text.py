@@ -2,6 +2,7 @@ import json
 import math
 from collections.abc import AsyncGenerator
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 from vllm.config import SpeechToTextConfig
 from vllm.entrypoints.openai.chat_completion.serving import _get_mm_token_counts, _make_prompt_tokens_details
@@ -74,12 +75,26 @@ class _AudioDurationBound:
 
 _SSE_PREFIX = "data: "
 
-_PROMPT_MM_TOKENS: ContextVar[dict[str, int] | None] = ContextVar("_prompt_mm_tokens", default=None)
-"""The current request's prompt tokens by modality, summed over its audio chunks while it is preprocessed."""
+
+@dataclass(slots=True)
+class _PromptCounts:
+    """The prompt tokens of one request's rendered audio chunks."""
+
+    by_modality: dict[str, int] = field(default_factory=dict)
+    by_chunk: list[int] = field(default_factory=list)
+
+    @property
+    def uncounted_prompt_tokens(self) -> int:
+        """Prompt tokens of every chunk before the last, which the stream's ``prompt_tokens`` leaves out."""
+        return sum(self.by_chunk[:-1])
 
 
-def _with_prompt_tokens_details(event: str, details: PromptTokenUsageInfo) -> str:
-    """Set ``prompt_tokens_details`` on the stream's final usage chunk; return any other event unchanged."""
+_PROMPT_COUNTS: ContextVar[_PromptCounts | None] = ContextVar("_prompt_counts", default=None)
+"""The current request's prompt counts, filled while it is preprocessed."""
+
+
+def _with_prompt_usage(event: str, counts: _PromptCounts, details: PromptTokenUsageInfo | None) -> str:
+    """Correct the stream's final usage chunk for every chunk and attach ``details``; return other events unchanged."""
     if not event.startswith(_SSE_PREFIX):
         return event
     try:
@@ -88,14 +103,20 @@ def _with_prompt_tokens_details(event: str, details: PromptTokenUsageInfo) -> st
         return event
     if not isinstance(chunk, dict) or chunk.get("choices") != [] or not isinstance(chunk.get("usage"), dict):
         return event
-    chunk["usage"]["prompt_tokens_details"] = details.model_dump(exclude_none=True)
+    usage = chunk["usage"]
+    uncounted = counts.uncounted_prompt_tokens
+    usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + uncounted
+    usage["total_tokens"] = usage.get("total_tokens", 0) + uncounted
+    if details is not None:
+        usage["prompt_tokens_details"] = details.model_dump(exclude_none=True)
     return f"{_SSE_PREFIX}{json.dumps(chunk, separators=(',', ':'))}\n\n"
 
 
-class _StreamedPromptTokenDetails:
-    """Reports a streamed request's prompt tokens by modality in ``prompt_tokens_details``, as chat does.
+class _StreamedPromptUsage:
+    """Reports a streamed request's prompt tokens over every audio chunk, by modality as chat does.
 
-    ``multimodal_tokens`` sums every audio chunk the request was split into.
+    Upstream's stream counts the last chunk's prompt alone; ``prompt_tokens`` and ``multimodal_tokens`` here
+    cover every chunk the request was split into.
     """
 
     def __init__(self, *args, enable_prompt_tokens_details: bool = False, **kwargs) -> None:
@@ -103,17 +124,19 @@ class _StreamedPromptTokenDetails:
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
 
     async def _create_speech_to_text(self, *args, **kwargs):
-        """Serve the request as upstream does, adding ``prompt_tokens_details`` to a stream's final usage chunk."""
-        counts: dict[str, int] = {}
-        token = _PROMPT_MM_TOKENS.set(counts)
+        """Serve the request as upstream does, correcting a stream's final usage chunk."""
+        counts = _PromptCounts()
+        token = _PROMPT_COUNTS.set(counts)
         try:
             result = await super()._create_speech_to_text(*args, **kwargs)
         finally:
-            _PROMPT_MM_TOKENS.reset(token)
-        details = _make_prompt_tokens_details(self.enable_prompt_tokens_details, None, None, counts)
-        if details is None or not isinstance(result, AsyncGenerator):
+            _PROMPT_COUNTS.reset(token)
+        if not isinstance(result, AsyncGenerator):
             return result
-        return self._stream_with_details(result, details)
+        details = _make_prompt_tokens_details(self.enable_prompt_tokens_details, None, None, counts.by_modality)
+        if details is None and not counts.uncounted_prompt_tokens:
+            return result
+        return self._stream_with_prompt_usage(result, counts, details)
 
     async def _preprocess_speech_to_text(
         self,
@@ -121,28 +144,29 @@ class _StreamedPromptTokenDetails:
         audio_data: bytes,
         request_id: str,
     ) -> tuple[list[EngineInput], float, list[float]]:
-        """Preprocess as upstream does, counting the rendered prompts' tokens by modality."""
+        """Preprocess as upstream does, counting each rendered chunk's prompt tokens."""
         engine_inputs, duration, chunk_start_offsets = await super()._preprocess_speech_to_text(
             request=request, audio_data=audio_data, request_id=request_id
         )
-        counts = _PROMPT_MM_TOKENS.get()
+        counts = _PROMPT_COUNTS.get()
         if counts is not None:
             for engine_input in engine_inputs:
+                counts.by_chunk.append(len(engine_input.get("prompt_token_ids") or ()))
                 for modality, tokens in _get_mm_token_counts(engine_input).items():
-                    counts[modality] = counts.get(modality, 0) + tokens
+                    counts.by_modality[modality] = counts.by_modality.get(modality, 0) + tokens
         return engine_inputs, duration, chunk_start_offsets
 
     @staticmethod
-    async def _stream_with_details(
-        stream: AsyncGenerator[str, None], details: PromptTokenUsageInfo
+    async def _stream_with_prompt_usage(
+        stream: AsyncGenerator[str, None], counts: _PromptCounts, details: PromptTokenUsageInfo | None
     ) -> AsyncGenerator[str, None]:
-        """Re-yield the stream with ``details`` on its final usage chunk."""
+        """Re-yield the stream with its final usage chunk corrected."""
         async for event in stream:
-            yield _with_prompt_tokens_details(event, details)
+            yield _with_prompt_usage(event, counts, details)
 
 
-class OmniOpenAIServingTranscription(_StreamedPromptTokenDetails, _AudioDurationBound, OpenAIServingTranscription):
-    """``/v1/audio/transcriptions``, bounded by the duration of its audio, its stream's prompt tokens by modality."""
+class OmniOpenAIServingTranscription(_StreamedPromptUsage, _AudioDurationBound, OpenAIServingTranscription):
+    """``/v1/audio/transcriptions``, bounded by its audio's duration, with a stream's prompt tokens by modality."""
 
 
 class OmniOpenAIServingTranslation(_AudioDurationBound, OpenAIServingTranslation):
