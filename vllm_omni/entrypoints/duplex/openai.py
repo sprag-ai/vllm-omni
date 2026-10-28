@@ -45,14 +45,18 @@ async def _reject_unavailable_realtime_websocket(websocket: WebSocket) -> None:
 class OpenAIRealtimeHandler:
     """App-scoped OpenAI Realtime handler with one shared VAD backend provider."""
 
-    def __init__(self, *, model_path: str | None = None) -> None:
+    def __init__(self, *, model_path: str | None = None, max_pending_turns: int = 4) -> None:
         self._vad_backend_provider = SileroVADBackendProvider(model_path=model_path)
+        self._max_pending_turns = max_pending_turns
 
     @classmethod
     def from_engine_client(cls, engine_client: Any) -> OpenAIRealtimeHandler:
         backend_engine = getattr(engine_client, "engine", engine_client)
         duplex_session_config = getattr(backend_engine, "duplex_session_config", None)
-        return cls(model_path=getattr(duplex_session_config, "server_vad_model_path", None))
+        return cls(
+            model_path=getattr(duplex_session_config, "server_vad_model_path", None),
+            max_pending_turns=getattr(duplex_session_config, "max_pending_turns_per_session", 4),
+        )
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         state = websocket.app.state
@@ -84,5 +88,6 @@ class OpenAIRealtimeHandler:
             tool_call_parser=getattr(state.args, "tool_call_parser", None),
             enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
             vad_backend_provider=self._vad_backend_provider,
+            max_pending_turns=self._max_pending_turns,
         )
         await connection.handle_connection()
