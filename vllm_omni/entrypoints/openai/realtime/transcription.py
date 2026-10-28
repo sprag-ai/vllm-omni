@@ -10,11 +10,14 @@ from typing import TYPE_CHECKING
 
 from openai.types import realtime as types
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsTranscription, supports_transcription
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.openai.realtime.session import _gen_id, _merge_config_models
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
     from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
 
 logger = init_logger(__name__)
@@ -31,6 +34,18 @@ def transcript_token_limit(audio_seconds: float) -> int:
     return TRANSCRIPT_TOKENS_BASE + TRANSCRIPT_TOKENS_PER_SECOND * math.ceil(audio_seconds)
 
 
+def transcription_model_cls(model_config: ModelConfig) -> type[SupportsTranscription] | None:
+    """Return the served model's class when it cleans its own transcripts, or None when it does not."""
+    from vllm.model_executor.model_loader import get_model_cls
+
+    try:
+        model_cls = get_model_cls(model_config)
+    except Exception:
+        logger.debug("[realtime] no model class resolved for transcript post-processing", exc_info=True)
+        return None
+    return model_cls if supports_transcription(model_cls) else None
+
+
 class TranscriptionTurns:
     """Transcribes a transcription session's committed audio turns one at a time, in commit order."""
 
@@ -41,6 +56,7 @@ class TranscriptionTurns:
         self._order = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self._request_ids: set[str] = set()
+        self._model_cls = transcription_model_cls(connection.engine.model_config)
 
     @property
     def pending(self) -> int:
@@ -130,6 +146,7 @@ class TranscriptionTurns:
 
         request_id = f"rt-tx-{item_id}-{_gen_id('req')}"
         self._request_ids.add(request_id)
+        cleaner = self._model_cls.get_streaming_post_processor_cls()() if self._model_cls is not None else None
         transcript = ""
         output_tokens = 0
         input_tokens = len(engine_input.get("prompt_token_ids") or ())
@@ -146,19 +163,14 @@ class TranscriptionTurns:
                     continue
                 piece = output.outputs[0].text or ""
                 output_tokens += len(output.outputs[0].token_ids)
-                if piece:
-                    transcript += piece
-                    await connection._send_event(
-                        types.ConversationItemInputAudioTranscriptionDeltaEvent(
-                            event_id=_gen_id("evt"),
-                            type="conversation.item.input_audio_transcription.delta",
-                            item_id=item_id,
-                            content_index=0,
-                            delta=piece,
-                        )
-                    )
+                transcript += piece
+                await self._send_delta(item_id, cleaner.process_delta(piece, False) if cleaner is not None else piece)
         finally:
             self._request_ids.discard(request_id)
+        if cleaner is not None:
+            await self._send_delta(item_id, cleaner.process_delta("", True))
+        if self._model_cls is not None:
+            transcript = self._model_cls.post_process_output(transcript)
 
         await connection._send_event(
             types.ConversationItemInputAudioTranscriptionCompletedEvent(
@@ -177,6 +189,19 @@ class TranscriptionTurns:
                         "text_tokens": max(0, input_tokens - audio_tokens),
                     },
                 },
+            )
+        )
+
+    async def _send_delta(self, item_id: str, delta: str) -> None:
+        if not delta:
+            return
+        await self._connection._send_event(
+            types.ConversationItemInputAudioTranscriptionDeltaEvent(
+                event_id=_gen_id("evt"),
+                type="conversation.item.input_audio_transcription.delta",
+                item_id=item_id,
+                content_index=0,
+                delta=delta,
             )
         )
 

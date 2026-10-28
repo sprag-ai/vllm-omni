@@ -16,6 +16,7 @@ from tests.entrypoints.openai_api.test_realtime_prompt_preflight import (
     _message_item,
     _websocket_events,
 )
+from vllm_omni.entrypoints.openai.realtime import transcription as transcription_module
 from vllm_omni.entrypoints.openai.realtime.connection import SAMPLE_RATE_HZ
 from vllm_omni.entrypoints.openai.realtime.transcription import (
     DEFAULT_TRANSCRIPTION_PROMPT,
@@ -103,6 +104,29 @@ async def test_a_committed_turn_streams_its_transcript_and_usage() -> None:
     assert renderer.conversations[-1][0] == {"role": "system", "content": "Transcribe this audio verbatim."}
     assert calls[0]["output_modalities"] == ["text"]
     assert calls[0]["sampling_params_list"][0].max_tokens == transcript_token_limit(2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_cleans_its_transcripts_streams_and_completes_only_the_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+
+    monkeypatch.setattr(
+        transcription_module, "transcription_model_cls", lambda _model_config: Qwen3ASRForConditionalGeneration
+    )
+    websocket = _FakeWebSocket()
+    engine = _transcribing_engine(["language English", "<asr_text>Hello", " world."], [])
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await _start_transcription(connection)
+
+    await _commit(connection, 1.0)
+    await _settle(connection)
+
+    events = _websocket_events(websocket)
+    deltas = [e["delta"] for e in events if e["type"] == "conversation.item.input_audio_transcription.delta"]
+    assert "".join(deltas) == "Hello world."
+    assert events[-1]["transcript"] == "Hello world."
 
 
 @pytest.mark.asyncio

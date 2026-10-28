@@ -1,0 +1,12 @@
+# Qwen3-ASR, transcription only.
+pipeline: qwen3_asr
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    # The V1 runner's EAGLE proposer requires an image token id that this audio-only model lacks.
+    model_runner: v2
+    devices: "0"
+    gpu_memory_utilization: 0.9
+    default_sampling_params:
+      temperature: 0.0
