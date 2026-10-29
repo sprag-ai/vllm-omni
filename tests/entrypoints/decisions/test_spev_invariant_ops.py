@@ -76,25 +76,44 @@ def branch_requests(trees):
     return requests, offset
 
 
-def test_varlen_branch_attention_matches_masked_plan_and_ignores_batch():
+def flash_attention_versions():
+    return [pytest.param(2, id="fa2"), pytest.param(3, id="fa3")]
+
+
+def require_flash_attention(version):
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    if not is_fa_version_supported(version):
+        pytest.skip(f"FlashAttention {version} is unavailable on this GPU")
+
+
+@pytest.mark.parametrize("version", flash_attention_versions())
+def test_varlen_branch_attention_matches_masked_plan_and_ignores_batch(version):
     from vllm_omni.model_executor.models.spev.branch_attention import BatchAttentionPlan, VarlenAttentionPlan
     from vllm_omni.model_executor.models.spev.candidate_tree import CandidateTree
 
+    require_flash_attention(version)
     torch.manual_seed(8)
     trees = [CandidateTree(301, (5, 33, 2)), CandidateTree(77, (40,)), CandidateTree(512, (3, 3, 9, 64))]
     requests, tokens = branch_requests(trees)
     query = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(tokens, 4, 128, device="cuda", dtype=torch.bfloat16)
     value = torch.randn(tokens, 4, 128, device="cuda", dtype=torch.bfloat16)
-    joint = VarlenAttentionPlan(requests, query.device).forward(query, key, value, 128**-0.5)
+    joint = VarlenAttentionPlan(requests, query.device, version).forward(query, key, value, 128**-0.5)
     reference = BatchAttentionPlan(requests, query.device).forward(query, key, value, 128**-0.5)
     torch.testing.assert_close(joint.float(), reference.float(), atol=2e-2, rtol=0)
     start, end = requests[1][:2]
     alone, _ = branch_requests(trees[1:2])
-    single = VarlenAttentionPlan(alone, query.device).forward(
+    single = VarlenAttentionPlan(alone, query.device, version).forward(
         query[start:end], key[start:end], value[start:end], 128**-0.5
     )
     assert torch.equal(single, joint[start:end])
+    reordered, _ = branch_requests([trees[2], trees[1]])
+    first = slice(*requests[2][:2])
+    swapped = VarlenAttentionPlan(reordered, query.device, version).forward(
+        *(torch.cat([source[first], source[start:end]]) for source in (query, key, value)), 128**-0.5
+    )
+    assert torch.equal(swapped[trees[2].length :], joint[start:end])
 
 
 def test_invariant_audio_convolution_matches_conv2d_and_ignores_batch():
@@ -109,14 +128,19 @@ def test_invariant_audio_convolution_matches_conv2d_and_ignores_batch():
     assert torch.equal(conv(chunks[2:3]), joint[2:3])
 
 
-def test_invariant_encoder_attention_ignores_other_sequences():
+@pytest.mark.parametrize("version", flash_attention_versions())
+@pytest.mark.parametrize("window", ["int", "tensor", "none"])
+def test_invariant_encoder_attention_ignores_other_sequences(version, window):
     from vllm_omni.model_executor.models.spev.audio import InvariantEncoderAttention
 
+    require_flash_attention(version)
     torch.manual_seed(10)
     attention = InvariantEncoderAttention(SimpleNamespace(scale=64**-0.5))
+    attention.version = version
     bounds = torch.tensor([0, 104, 208, 260], device="cuda", dtype=torch.int32)
+    longest = {"int": 104, "tensor": (bounds[1:] - bounds[:-1]).max(), "none": None}[window]
     query, key, value = (torch.randn(1, 260, 20, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
-    joint = attention(query, key, value, bounds, 104)
+    joint = attention(query, key, value, bounds, longest)
     alone = attention(
         query[:, 208:], key[:, 208:], value[:, 208:], torch.tensor([0, 52], device="cuda", dtype=torch.int32), 52
     )
@@ -124,13 +148,18 @@ def test_invariant_encoder_attention_ignores_other_sequences():
 
 
 @pytest.mark.parametrize("with_residual", [False, True])
-def test_rms_norm_kernel_matches_checkpoint_rounding_and_ignores_batch(with_residual):
+@pytest.mark.parametrize("shape", ["heads", "hidden"])
+def test_rms_norm_kernel_matches_checkpoint_rounding_and_ignores_batch(with_residual, shape):
     from vllm_omni.model_executor.models.spev.normalization import rms_norm
 
     torch.manual_seed(11)
-    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
-    packed = torch.randn(300, 32 * 128 + 512, device="cuda", dtype=torch.bfloat16)
-    value = packed[:, : 32 * 128].view(300, 32, 128)
+    if shape == "heads":
+        weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+        packed = torch.randn(300, 32 * 128 + 512, device="cuda", dtype=torch.bfloat16)
+        value = packed[:, : 32 * 128].view(300, 32, 128)
+    else:
+        weight = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        value = torch.randn(300, 2048, device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(value) if with_residual else None
     joint = rms_norm(value, weight, 1e-6, residual)
     combined = value + residual if with_residual else value
@@ -142,3 +171,57 @@ def test_rms_norm_kernel_matches_checkpoint_rounding_and_ignores_batch(with_resi
         assert torch.equal(carried, combined)
     torch.testing.assert_close(joint.float(), expected.float(), atol=2e-2, rtol=1e-2)
     assert torch.equal(alone, joint[5:6])
+
+
+@pytest.fixture(scope="module")
+def single_gpu_parallel_state():
+    import socket
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(1, 0, f"tcp://127.0.0.1:{port}", 0)
+        initialize_model_parallel(1, 1)
+        yield
+    cleanup_dist_env_and_memory()
+
+
+def test_audio_tower_encodes_each_recording_as_if_alone(single_gpu_parallel_state):
+    from transformers import Qwen3OmniMoeAudioEncoderConfig
+
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioEncoder,
+        _get_feat_extract_output_lengths,
+    )
+    from vllm_omni.model_executor.models.spev.audio import encode_audio, install_invariant_audio
+
+    torch.manual_seed(12)
+    config = Qwen3OmniMoeAudioEncoderConfig(
+        encoder_layers=2, d_model=256, encoder_attention_heads=4, encoder_ffn_dim=512, output_dim=256
+    )
+    tower = Qwen3OmniMoeAudioEncoder(config).to("cuda", torch.bfloat16).eval()
+    with torch.no_grad():
+        for parameter in tower.parameters():
+            parameter.normal_(0, 0.05)
+    lengths = torch.tensor([80, 300, 150, 80, 230], device="cuda")
+    after = _get_feat_extract_output_lengths(lengths)
+    features = torch.randn(config.num_mel_bins, int(lengths.sum()), device="cuda", dtype=torch.bfloat16)
+    recordings = features.split(lengths.tolist(), dim=-1)
+    with torch.inference_mode():
+        reference = [
+            tower._forward_same_padding(r, lengths[i : i + 1], after[i : i + 1]) for i, r in enumerate(recordings)
+        ]
+        install_invariant_audio(tower)
+        joint = encode_audio(tower, features, lengths, after)
+        alone = [encode_audio(tower, r, lengths[i : i + 1], after[i : i + 1])[0] for i, r in enumerate(recordings)]
+    for batched, single, expected in zip(joint, alone, reference):
+        assert torch.equal(batched, single)
+        assert (batched.float() - expected.float()).abs().max() <= 0.05 * expected.float().abs().max()

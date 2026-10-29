@@ -32,6 +32,10 @@ class InvariantConv2d(nn.Conv2d):
             source.kernel_size,
             source.stride,
             source.padding,
+            source.dilation,
+            source.groups,
+            source.bias is not None,
+            source.padding_mode,
             device="meta",
         )
         conv.weight = source.weight
@@ -44,21 +48,37 @@ class InvariantConv2d(nn.Conv2d):
         return super().forward(value)
 
 
+class LongestWindow:
+    """Host-side window length shared by every encoder layer of one tower call."""
+
+    def __init__(self):
+        self._bounds = None
+        self._longest = None
+
+    def __call__(self, cu_seqlens, max_seqlen):
+        if cu_seqlens is not self._bounds:
+            longest = max_seqlen if max_seqlen is not None else (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            self._longest = int(longest)
+            self._bounds = cu_seqlens
+        return self._longest
+
+
 class InvariantEncoderAttention(nn.Module):
-    def __init__(self, source):
+    def __init__(self, source, window=None):
         super().__init__()
         from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
         self.source = source
         self.scale = source.scale
-        self.version = get_flash_attn_version() or 2
+        self.version = get_flash_attn_version()
+        self.window = window or LongestWindow()
 
     def forward(self, query, key, value, cu_seqlens, max_seqlen):
-        if not query.is_cuda:
+        if not query.is_cuda or self.version is None:
             return self.source(query=query, key=key, value=value, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-        longest = int(max_seqlen)
+        longest = self.window(cu_seqlens, max_seqlen)
         return flash_attn_varlen_func(
             query[0],
             key[0],
@@ -79,10 +99,11 @@ def install_invariant_audio(tower):
         setattr(tower, name, InvariantConv2d.from_conv(getattr(tower, name)))
     for name in ("conv_out", "proj1", "proj2"):
         setattr(tower, name, InvariantLinear(getattr(tower, name)))
+    window = LongestWindow()
     for layer in tower.layers:
         layer.self_attn.qkv_proj = InvariantLinear(layer.self_attn.qkv_proj)
         layer.self_attn.out_proj = InvariantLinear(layer.self_attn.out_proj)
-        layer.self_attn.attn = InvariantEncoderAttention(layer.self_attn.attn)
+        layer.self_attn.attn = InvariantEncoderAttention(layer.self_attn.attn, window)
         layer.fc1 = InvariantLinear(layer.fc1)
         layer.fc2 = InvariantLinear(layer.fc2)
 

@@ -104,10 +104,8 @@ class RequestMaskCache:
 class VarlenAttentionPlan:
     """Shared-prefix branch attention as per-sequence FlashAttention calls whose rows ignore the rest of the batch."""
 
-    def __init__(self, requests, device):
-        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
-
-        self.version = get_flash_attn_version() or 2
+    def __init__(self, requests, device, version=2):
+        self.version = version
         request_bounds, prefix_bounds, request_branches, branch_bounds = [0], [0], [0], [0]
         prefix_tokens, branch_tokens = [], []
         for start, end, tree, _ in requests:
@@ -184,7 +182,11 @@ class VarlenAttentionPlan:
 def attention_plan(requests, device, dtype):
     """Build the fastest branch attention plan that supports the device and dtype."""
     if device.type == "cuda" and dtype in (torch.bfloat16, torch.float16):
-        return VarlenAttentionPlan(requests, device)
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+        version = get_flash_attn_version()
+        if version is not None:
+            return VarlenAttentionPlan(requests, device, version)
     return BatchAttentionPlan(requests, device)
 
 
