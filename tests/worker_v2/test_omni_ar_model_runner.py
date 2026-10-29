@@ -160,7 +160,10 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     input_batch.query_start_loc_np = np.array([0, 3])
     state = SimpleNamespace(input_batch=input_batch, hidden_states=torch.zeros(1, 2))
     state.finished_req_ids, state.ec_connector_output = {"finished"}, None
+    state.attn_metadata = state.slot_mappings_by_layer = state.aux_hidden_states = state.dp_sync_state = None
+    state.num_spec_tokens_to_schedule = 0
     runner.execute_model_state = state
+    runner.speculator, runner.num_speculative_steps = None, 0
     runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
@@ -980,3 +983,47 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+class _RecordingSpeculator:
+    supports_mm_inputs = False
+
+    def __init__(self, drafts: torch.Tensor) -> None:
+        self.drafts = drafts
+        self.calls: list[dict[str, Any]] = []
+        self.draft_token_confidence_probs = None
+
+    def propose(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return self.drafts.clone()
+
+
+@pytest.mark.parametrize(("scheduled", "expected"), [(3, [[7, 8, 9], [4, 5, 6]]), (1, [[7, -1, -1], [4, -1, -1]])])
+def test_the_drafter_gets_the_targets_aux_states_and_its_drafts_land_in_request_state(
+    monkeypatch, scheduled: int, expected: list[list[int]]
+) -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    speculator = _RecordingSpeculator(torch.tensor([[7, 8, 9], [4, 5, 6]]))
+    runner.speculator = speculator
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(temperature=SimpleNamespace(gpu="temp"), seeds=SimpleNamespace(gpu="seeds"))
+    )
+    runner.model = object()
+    runner._draft_workspace_lane = 0
+    runner.num_speculative_steps = 3
+    runner.adaptive_verification = None
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.zeros((4, 3), dtype=torch.long), last_sampled_tokens="last", next_prefill_tokens="next"
+    )
+    monkeypatch.setattr(omni_ar_model_runner, "get_drafter_hidden_states", lambda model, hidden: hidden * 2)
+    batch = SimpleNamespace(idx_mapping=torch.tensor([2, 0]))
+    hidden = torch.ones(2, 4)
+    aux = [torch.zeros(2, 4)]
+
+    runner._propose_draft_tokens(batch, "attn", "slots", hidden, aux, "sampled", "rejected", scheduled, "dp", None)
+
+    (call,) = speculator.calls
+    assert call["args"][3].equal(hidden * 2)
+    assert call["args"][4] is aux
+    assert call["kwargs"]["num_speculative_tokens"] == scheduled
+    assert runner.req_states.draft_tokens[[2, 0]].tolist() == expected
