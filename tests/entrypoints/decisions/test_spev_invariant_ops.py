@@ -194,24 +194,48 @@ def single_gpu_parallel_state():
     cleanup_dist_env_and_memory()
 
 
-def test_audio_tower_encodes_each_recording_as_if_alone(single_gpu_parallel_state):
+def audio_tower():
     from transformers import Qwen3OmniMoeAudioEncoderConfig
 
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeAudioEncoder,
-        _get_feat_extract_output_lengths,
-    )
-    from vllm_omni.model_executor.models.spev.audio import encode_audio, install_invariant_audio
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import Qwen3OmniMoeAudioEncoder
 
-    torch.manual_seed(12)
     config = Qwen3OmniMoeAudioEncoderConfig(
-        encoder_layers=2, d_model=256, encoder_attention_heads=4, encoder_ffn_dim=512, output_dim=256
+        encoder_layers=2, d_model=1280, encoder_attention_heads=20, encoder_ffn_dim=5120, output_dim=2048
     )
     tower = Qwen3OmniMoeAudioEncoder(config).to("cuda", torch.bfloat16).eval()
     with torch.no_grad():
         for parameter in tower.parameters():
             parameter.normal_(0, 0.05)
-    lengths = torch.tensor([80, 300, 150, 80, 230], device="cuda")
+    return tower, config
+
+
+def test_audio_tower_install_replaces_every_stock_kernel(single_gpu_parallel_state):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.model_executor.models.spev.audio import (
+        InvariantConv2d,
+        InvariantEncoderAttention,
+        install_invariant_audio,
+    )
+
+    tower, _ = audio_tower()
+    install_invariant_audio(tower)
+    assert not [name for name, module in tower.named_modules() if isinstance(module, (LinearBase, torch.nn.Linear))]
+    assert not [
+        name
+        for name, module in tower.named_modules()
+        if isinstance(module, torch.nn.Conv2d) and not isinstance(module, InvariantConv2d)
+    ]
+    assert all(isinstance(layer.self_attn.attn, InvariantEncoderAttention) for layer in tower.layers)
+
+
+def test_audio_tower_encodes_each_recording_as_if_alone(single_gpu_parallel_state):
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import _get_feat_extract_output_lengths
+    from vllm_omni.model_executor.models.spev.audio import encode_audio, install_invariant_audio
+
+    torch.manual_seed(12)
+    tower, config = audio_tower()
+    lengths = torch.tensor([80, 3000, 1500, 80, 2300, 437], device="cuda")
     after = _get_feat_extract_output_lengths(lengths)
     features = torch.randn(config.num_mel_bins, int(lengths.sum()), device="cuda", dtype=torch.bfloat16)
     recordings = features.split(lengths.tolist(), dim=-1)
