@@ -101,6 +101,95 @@ class RequestMaskCache:
         )
 
 
+class VarlenAttentionPlan:
+    """Shared-prefix branch attention as per-sequence FlashAttention calls whose rows ignore the rest of the batch."""
+
+    def __init__(self, requests, device, version=2):
+        self.version = version
+        request_bounds, prefix_bounds, request_branches, branch_bounds = [0], [0], [0], [0]
+        prefix_tokens, branch_tokens = [], []
+        for start, end, tree, _ in requests:
+            p = tree.prefix_length
+            request_bounds.append(end)
+            prefix_bounds.append(prefix_bounds[-1] + p)
+            prefix_tokens.append(torch.arange(start, start + p))
+            branch_tokens.append(torch.arange(start + p, end))
+            request_branches.append(request_branches[-1] + end - start - p)
+            for length in tree.branch_lengths:
+                branch_bounds.append(branch_bounds[-1] + length)
+        lengths = [b - a for a, b in zip(request_bounds, request_bounds[1:])]
+
+        def tensor(values):
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        self.requests = tensor(request_bounds)
+        self.prefix_bounds = tensor(prefix_bounds)
+        self.prefix_tokens = torch.cat(prefix_tokens).to(device)
+        self.request_branches = tensor(request_branches)
+        self.branch_bounds = tensor(branch_bounds)
+        self.branch_tokens = torch.cat(branch_tokens).to(device)
+        self.longest_request = max(lengths)
+        self.longest_prefix = max(b - a for a, b in zip(prefix_bounds, prefix_bounds[1:]))
+        self.most_branch_tokens = max(b - a for a, b in zip(request_branches, request_branches[1:]))
+        self.longest_branch = max(b - a for a, b in zip(branch_bounds, branch_bounds[1:]))
+
+    def forward(self, query, key, value, scaling):
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+        def attend(q, k, v, **kwargs):
+            return flash_attn_varlen_func(
+                q, k, v, softmax_scale=scaling, num_splits=1, fa_version=self.version, **kwargs
+            )
+
+        output = attend(
+            query,
+            key,
+            value,
+            max_seqlen_q=self.longest_request,
+            cu_seqlens_q=self.requests,
+            max_seqlen_k=self.longest_request,
+            cu_seqlens_k=self.requests,
+            causal=True,
+        )
+        branch_query = query.index_select(0, self.branch_tokens)
+        shared, shared_lse = attend(
+            branch_query,
+            key.index_select(0, self.prefix_tokens),
+            value.index_select(0, self.prefix_tokens),
+            max_seqlen_q=self.most_branch_tokens,
+            cu_seqlens_q=self.request_branches,
+            max_seqlen_k=self.longest_prefix,
+            cu_seqlens_k=self.prefix_bounds,
+            return_softmax_lse=True,
+        )
+        local, local_lse = attend(
+            branch_query,
+            key.index_select(0, self.branch_tokens),
+            value.index_select(0, self.branch_tokens),
+            max_seqlen_q=self.longest_branch,
+            cu_seqlens_q=self.branch_bounds,
+            max_seqlen_k=self.longest_branch,
+            cu_seqlens_k=self.branch_bounds,
+            causal=True,
+            return_softmax_lse=True,
+        )
+        total = torch.logaddexp(shared_lse, local_lse)
+        merged = shared.float() * (shared_lse - total).exp().t()[..., None]
+        merged += local.float() * (local_lse - total).exp().t()[..., None]
+        return output.index_copy_(0, self.branch_tokens, merged.to(output.dtype))
+
+
+def attention_plan(requests, device, dtype):
+    """Build the fastest branch attention plan that supports the device and dtype."""
+    if device.type == "cuda" and dtype in (torch.bfloat16, torch.float16):
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+        version = get_flash_attn_version()
+        if version is not None:
+            return VarlenAttentionPlan(requests, device, version)
+    return BatchAttentionPlan(requests, device)
+
+
 class BatchAttentionPlan:
     """Combine equally shaped attention blocks with independent batch masks."""
 
