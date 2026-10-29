@@ -59,6 +59,9 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_adapter: PrefixCacheSchedulerAdapter | None = None
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
+    # True only for a runner that applies vLLM's deferred draft-count correction
+    # before ``_prefix_cache_save_step``; admits speculative decoding with the cache.
+    _prefix_cache_corrects_draft_positions: bool = False
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
         """Freeze the model's cache policy at load_model."""

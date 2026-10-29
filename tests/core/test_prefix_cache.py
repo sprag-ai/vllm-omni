@@ -792,6 +792,24 @@ def test_deferred_unpadded_registers_on_padded_step():
     assert torch.equal(outs.mm_outputs["codes.audio"]["a"], audio)
 
 
+def test_check_kv_groups_accepts_drafter_wrapped_full_attention():
+    """A drafter wraps the group in UniformTypeKVCacheSpecs; full attention
+    members are accepted, any other member type is refused."""
+    kv = pytest.importorskip("vllm.v1.kv_cache_interface")
+
+    def full():
+        return kv.FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+
+    wrapped = kv.UniformTypeKVCacheSpecs(block_size=BLOCK_SIZE, kv_cache_specs={"target": full(), "draft": full()})
+    check_prefix_cache_kv_groups([SimpleNamespace(kv_cache_spec=wrapped)])
+    sliding = kv.SlidingWindowSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, sliding_window=8
+    )
+    mixed = kv.UniformTypeKVCacheSpecs(block_size=BLOCK_SIZE, kv_cache_specs={"target": full(), "draft": sliding})
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="full-attention layers"):
+        check_prefix_cache_kv_groups([SimpleNamespace(kv_cache_spec=mixed)])
+
+
 def test_check_kv_groups_rejects_empty_or_multi():
     with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
         check_prefix_cache_kv_groups([])
@@ -799,7 +817,9 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, corrects=False
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
         cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
@@ -808,6 +828,7 @@ def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object()
         model_config=None,
         is_pooling_model=pooling,
         speculative_config=spec,
+        corrects_draft_positions=corrects,
     )
 
 
@@ -823,6 +844,9 @@ def test_stage_prefix_cache_config_gate():
     assert _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), enable=False) is None
     with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
         _stage_cfg(spec=SimpleNamespace(method="ngram"), groups=())
+    # A runner that corrects draft positions before the save passes the accounting check.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+        _stage_cfg(spec=SimpleNamespace(method="eagle3"), groups=(), corrects=True)
     with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
         _stage_cfg(match_unit=BLOCK_SIZE // 2, groups=())
     # A unit equal to the block is a whole-block match; only the group check is left.

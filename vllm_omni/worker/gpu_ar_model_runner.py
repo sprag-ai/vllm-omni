@@ -368,6 +368,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
+    _prefix_cache_corrects_draft_positions = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1349,6 +1350,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
+            if deferred_state_corrections_fn is not None and self.omni_prefix_cache is not None:
+                # The save's slot map reads num_computed_tokens_cpu, which async scheduling
+                # leaves assuming the previous step's drafts were all accepted until this runs.
+                deferred_state_corrections_fn()
+                deferred_state_corrections_fn = None
             # Prefix-cache write: freeze + submit; policy gating (full
             # hidden, skip/deferred keys) happens inside the manager.
             prefix_cache_step_id = self._prefix_cache_save_step(
