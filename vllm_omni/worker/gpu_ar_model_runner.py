@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -405,6 +406,35 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+
+    def _warm_up_async_spec_decode_correction(self) -> None:
+        """Compile vLLM's async draft-count correction for each batch-size specialization.
+
+        The correction is a lazily compiled function that specializes batches of one request;
+        unwarmed, the first step that grows a batch past one compiles inline for about a second.
+        """
+        if not self.use_async_spec_decode:
+            return
+
+        # Compiled variants are also guarded on dispatch keys: the runner's persistent buffers
+        # were made outside inference mode, the per-step counts inside it.
+        def persistent(n: int, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+            with torch.inference_mode(False):
+                return torch.zeros(n, dtype=dtype, device=self.device)
+
+        def per_step(n: int) -> torch.Tensor:
+            return torch.zeros(n, dtype=torch.int32, device=self.device)
+
+        for num_reqs in (1, 2):
+            for prev_num_reqs in (1, 2):
+                update_num_computed_tokens_for_batch_change(
+                    persistent(self.max_num_reqs),
+                    persistent(num_reqs),
+                    persistent(num_reqs, torch.int64),
+                    per_step(prev_num_reqs),
+                    persistent(self.max_num_reqs),
+                    per_step(num_reqs),
+                )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1035,6 +1065,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._warmup_state_cleared = True
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
+            # Here rather than at load: compiled variants are guarded on grad mode and the torch
+            # thread count, which only match serving inside a real step.
+            self._warm_up_async_spec_decode_correction()
 
         # Exactly once per real scheduler_output, before _update_states
         # (dummy/warmup runs never reach execute_model).
