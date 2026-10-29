@@ -1265,7 +1265,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 )
 
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+                # An omni stage may also return its captured layers beside the drafter's.
+                hidden_states = outputs[0]
             else:
                 hidden_states = outputs
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)

@@ -46,6 +46,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
@@ -1330,7 +1331,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and isinstance(model_output, OmniOutput):
+                # EAGLE 3 on an omni stage: the drafter's layers ride in the envelope.
+                hidden_states, aux_hidden_states = model_output.text_hidden_states, model_output.aux_hidden_states
+            elif self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:

@@ -23,6 +23,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
@@ -174,6 +175,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsRealtime,
     SupportsQuant,
     SupportsTranscription,
+    SupportsEagle3,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -319,6 +321,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            # vLLM's EAGLE proposer reads the image placeholder id from the
+            # target's top-level config, which Qwen3-Omni keeps on the thinker's.
+            if not hasattr(self.config, "image_token_index"):
+                self.config.image_token_index = thinker_config.image_token_id
             if supports_encoder_cudagraph(self.thinker):
                 # Expose the protocol on this stage instance only. Defining
                 # these methods on the shared class also advertises an encoder
@@ -815,7 +821,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
-            if isinstance(model_outputs, tuple):
+            aux_hidden_states = None
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 3:
+                text_hidden_states, captured_layer_dict, aux_hidden_states = model_outputs
+            elif isinstance(model_outputs, tuple) and isinstance(model_outputs[1], list):
+                # The EAGLE-3 pair a thinker returns when no layer capture was requested.
+                text_hidden_states, aux_hidden_states = model_outputs
+                captured_layer_dict = None
+            elif isinstance(model_outputs, tuple):
                 text_hidden_states, captured_layer_dict = model_outputs
             else:
                 # Bare tensor: capture was not requested (no accept_hidden_layer).
@@ -843,6 +856,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             return OmniOutput(
                 text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
                 multimodal_outputs=multimodal_outputs,
+                aux_hidden_states=aux_hidden_states,
             )
         elif self.model_stage == "talker":
             talker_hidden = model_outputs
