@@ -26,7 +26,11 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
+from vllm.v1.worker.workspace import use_workspace_lane
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -169,9 +173,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
             return None
 
         input_batch = self.execute_model_state.input_batch
+        attn_metadata = self.execute_model_state.attn_metadata
+        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
+        aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync_state = self.execute_model_state.dp_sync_state
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
+        num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         pending_aux_output = None
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
@@ -315,6 +324,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 
+        # The drafter reads one position ahead of the target, and postprocess
+        # advances the prefill position the gather reads.
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+        if self.speculator is not None and self.speculator.supports_mm_inputs and self.model_state.supports_mm_inputs:
+            mm_inputs = self.model_state.gather_mm_embeddings(input_batch, draft_lookahead=1)
+
         # Postprocess AFTER creating async output (so copy_event is
         # recorded before postprocess, matching upstream pattern).
         self.postprocess_sampled(
@@ -324,6 +339,24 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_rejected,
             input_batch.query_start_loc,
         )
+        if self.speculator is not None:
+            self._propose_draft_tokens(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                num_spec_tokens,
+                dp_sync_state,
+                mm_inputs,
+            )
+        if self.num_speculative_steps > 0:
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                self.req_states.draft_tokens[input_batch.idx_mapping, :num_spec_tokens],
+            )
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
@@ -331,6 +364,49 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    def _propose_draft_tokens(
+        self,
+        input_batch: Any,
+        attn_metadata: Any,
+        slot_mappings_by_layer: Any,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Any,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        num_spec_tokens: int,
+        dp_sync_state: Any,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> None:
+        """Draft the next step's speculative tokens for each request in the batch, as the upstream runner does."""
+        assert self.speculator is not None and self.sampler is not None
+        if isinstance(self.speculator, DraftModelSpeculator):
+            self.speculator.observe_verification(input_batch.idx_mapping, num_sampled, num_rejected)
+        spec_hidden_states = get_drafter_hidden_states(self.model, hidden_states)
+        if isinstance(self.sampler, GPUWatermarkSampler):
+            self.speculator.prepare_watermarking(self.sampler, input_batch.idx_mapping)
+        with use_workspace_lane(self._draft_workspace_lane):
+            draft_tokens = self.speculator.propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                spec_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                self.req_states.last_sampled_tokens,
+                self.req_states.next_prefill_tokens,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                num_speculative_tokens=num_spec_tokens,
+                dp_sync_state=dp_sync_state,
+                mm_inputs=mm_inputs,
+            )
+        if num_spec_tokens < self.num_speculative_steps:
+            draft_tokens[:, num_spec_tokens:] = -1
+        self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+        if self.adaptive_verification is not None:
+            self.adaptive_verification.record_confidences(self.speculator.draft_token_confidence_probs, input_batch)
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:

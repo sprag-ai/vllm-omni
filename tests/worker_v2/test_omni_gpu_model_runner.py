@@ -526,3 +526,24 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     assert runner.execute_model_state.cudagraph_stats is None
     if runner_kind != "generation":
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
+
+
+@pytest.mark.parametrize(("output_type", "refused"), [("text", False), ("latent", True)])
+def test_speculation_is_refused_on_a_stage_whose_output_is_not_text(output_type: str, refused: bool) -> None:
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle3"))
+    runner.model_config = SimpleNamespace(engine_output_type=output_type)
+
+    if refused:
+        with pytest.raises(NotImplementedError, match="engine output is text"):
+            runner._validate_speculation_support()
+    else:
+        runner._validate_speculation_support()
+
+
+def test_a_stage_without_speculation_runs_whatever_its_output() -> None:
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(speculative_config=None)
+    runner.model_config = SimpleNamespace(engine_output_type="latent")
+
+    runner._validate_speculation_support()

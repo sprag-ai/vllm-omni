@@ -214,6 +214,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         with self._staged_writes.activate():
             super().__init__(*args, **kwargs)
         self._validate_parallel_support()
+        self._validate_speculation_support()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -234,6 +235,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             raise NotImplementedError(
                 "Omni Model Runner V2 does not support prefill context parallelism; "
                 "use model_runner: v1 when prefill_context_parallel_size > 1"
+            )
+
+    def _validate_speculation_support(self) -> None:
+        # A drafted step commits several tokens per request, while a stage that
+        # hands hidden states to the next stage sizes that handoff for one.
+        output_type = getattr(self.model_config, "engine_output_type", "text")
+        if self.vllm_config.speculative_config is not None and output_type != "text":
+            raise NotImplementedError(
+                f"speculative decoding is supported only on a stage whose engine output is text, not {output_type!r}"
             )
 
     @staged_writes.runner_context
@@ -746,6 +756,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # --- Model forward ---
+        aux_hidden_states = None
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # FULL graph replay.  Preprocess already wrote to the static
             # inputs_embeds buffer above.
@@ -753,7 +764,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.kv_connector.pre_forward(scheduler_output)
             replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
             self._last_multimodal_outputs = None
-            hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+            if self.use_aux_hidden_state_outputs and isinstance(replayed, tuple):
+                hidden_states, aux_hidden_states = replayed
+                self._last_aux_output = None
+            else:
+                hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
             if hasattr(self.model, "_last_captured_layers"):
                 self.model._last_captured_layers = self._last_aux_output
         else:
@@ -798,6 +813,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hidden_states = model_output.text_hidden_states
                 if model_output.multimodal_outputs:
                     self._last_multimodal_outputs = cast(dict[str, Any], model_output.multimodal_outputs)
+            elif isinstance(model_output, tuple) and len(model_output) == 2 and self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
             elif isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, self._last_aux_output = model_output
                 if hasattr(self.model, "_last_captured_layers"):
@@ -812,7 +829,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
-            aux_hidden_states=None,
+            aux_hidden_states=aux_hidden_states,
             dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
             ec_connector_output=ec_connector_output,
