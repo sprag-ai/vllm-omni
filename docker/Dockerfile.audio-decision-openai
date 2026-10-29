@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 ARG BASE_IMAGE=ghcr.io/sprag-ai/native-audio-decision@sha256:82649e1f66eec7b813240b06824365f156f92636fb97e36387be726b9b6211dd
 FROM ${BASE_IMAGE}
-ARG PACKAGE_VERSION=0.30.2.dev1
+ARG PACKAGE_VERSION=0.30.2.dev2
 WORKDIR /opt/vllm-omni-decision
 COPY . .
 RUN test "$(python -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')" = 0.30.0 \
