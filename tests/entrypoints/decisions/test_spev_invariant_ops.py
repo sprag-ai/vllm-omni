@@ -62,3 +62,34 @@ def test_invariant_experts_ignore_batch():
     shifted = run(torch.cat([torch.arange(40, 300, device="cuda"), torch.arange(7, device="cuda")]))[-7:]
     assert torch.equal(alone, small)
     assert torch.equal(alone, shifted)
+
+
+def branch_requests(trees):
+    from vllm_omni.model_executor.models.spev.branch_attention import RequestMaskCache
+
+    requests, offset = [], 0
+    for tree in trees:
+        requests.append((offset, offset + tree.length, tree, RequestMaskCache()))
+        offset += tree.length
+    return requests, offset
+
+
+def test_varlen_branch_attention_matches_masked_plan_and_ignores_batch():
+    from vllm_omni.model_executor.models.spev.branch_attention import BatchAttentionPlan, VarlenAttentionPlan
+    from vllm_omni.model_executor.models.spev.candidate_tree import CandidateTree
+
+    torch.manual_seed(8)
+    trees = [CandidateTree(301, (5, 33, 2)), CandidateTree(77, (40,)), CandidateTree(512, (3, 3, 9, 64))]
+    requests, tokens = branch_requests(trees)
+    query = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(tokens, 4, 128, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(tokens, 4, 128, device="cuda", dtype=torch.bfloat16)
+    joint = VarlenAttentionPlan(requests, query.device).forward(query, key, value, 128**-0.5)
+    reference = BatchAttentionPlan(requests, query.device).forward(query, key, value, 128**-0.5)
+    torch.testing.assert_close(joint.float(), reference.float(), atol=2e-2, rtol=0)
+    start, end = requests[1][:2]
+    alone, _ = branch_requests(trees[1:2])
+    single = VarlenAttentionPlan(alone, query.device).forward(
+        query[start:end], key[start:end], value[start:end], 128**-0.5
+    )
+    assert torch.equal(single, joint[start:end])

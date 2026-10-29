@@ -8,7 +8,7 @@ from contextvars import ContextVar
 import torch
 from torch import nn
 
-from .branch_attention import BatchAttentionPlan, RequestMaskCache
+from .branch_attention import RequestMaskCache, attention_plan
 
 LAYOUTS = ContextVar("spev_batch_layouts", default=None)
 
@@ -55,7 +55,7 @@ class IsolatedAttention(nn.Module):
             if not requests or requests[-1][1] != len(query):
                 raise ValueError("Decision attention requires complete request prefills")
             if requests.attention is None:
-                requests.attention = BatchAttentionPlan(requests, query.device)
+                requests.attention = attention_plan(requests, query.device, query.dtype)
             output = requests.attention.forward(
                 query.view(-1, self.num_heads, self.head_dim),
                 key.view(-1, self.num_kv_heads, self.head_dim),
