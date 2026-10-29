@@ -129,12 +129,17 @@ class CheckpointRotary(nn.Module):
             self.rotary = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
         self.rotary.to(device)
         self.head_dim = head_dim
+        self._positions = None
+        self._tables = None
 
     def forward(self, positions, query, key):
         length = len(query)
         q = query.view(1, length, -1, self.head_dim).transpose(1, 2)
         k = key.view(1, length, -1, self.head_dim).transpose(1, 2)
-        cos, sin = self.rotary(q, positions[:, None, :])
+        if positions is not self._positions:
+            self._tables = self.rotary(q, positions[:, None, :])
+            self._positions = positions
+        cos, sin = self._tables
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         return q.transpose(1, 2).reshape(length, -1), k.transpose(1, 2).reshape(length, -1)
 

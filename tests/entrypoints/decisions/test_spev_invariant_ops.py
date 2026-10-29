@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-row results of SPEV's invariant kernels across batch sizes and positions."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -93,3 +95,50 @@ def test_varlen_branch_attention_matches_masked_plan_and_ignores_batch():
         query[start:end], key[start:end], value[start:end], 128**-0.5
     )
     assert torch.equal(single, joint[start:end])
+
+
+def test_invariant_audio_convolution_matches_conv2d_and_ignores_batch():
+    from vllm_omni.model_executor.models.spev.audio import InvariantConv2d
+
+    torch.manual_seed(9)
+    source = torch.nn.Conv2d(1, 480, 3, 2, padding=1).cuda().to(torch.bfloat16)
+    conv = InvariantConv2d.from_conv(source)
+    chunks = torch.randn(9, 1, 128, 100, device="cuda", dtype=torch.bfloat16)
+    joint = conv(chunks)
+    torch.testing.assert_close(joint.float(), source(chunks).float(), atol=5e-2, rtol=2e-2)
+    assert torch.equal(conv(chunks[2:3]), joint[2:3])
+
+
+def test_invariant_encoder_attention_ignores_other_sequences():
+    from vllm_omni.model_executor.models.spev.audio import InvariantEncoderAttention
+
+    torch.manual_seed(10)
+    attention = InvariantEncoderAttention(SimpleNamespace(scale=64**-0.5))
+    bounds = torch.tensor([0, 104, 208, 260], device="cuda", dtype=torch.int32)
+    query, key, value = (torch.randn(1, 260, 20, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    joint = attention(query, key, value, bounds, 104)
+    alone = attention(
+        query[:, 208:], key[:, 208:], value[:, 208:], torch.tensor([0, 52], device="cuda", dtype=torch.int32), 52
+    )
+    assert torch.equal(alone, joint[208:])
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rms_norm_kernel_matches_checkpoint_rounding_and_ignores_batch(with_residual):
+    from vllm_omni.model_executor.models.spev.normalization import rms_norm
+
+    torch.manual_seed(11)
+    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn(300, 32 * 128 + 512, device="cuda", dtype=torch.bfloat16)
+    value = packed[:, : 32 * 128].view(300, 32, 128)
+    residual = torch.randn_like(value) if with_residual else None
+    joint = rms_norm(value, weight, 1e-6, residual)
+    combined = value + residual if with_residual else value
+    expected = combined.float()
+    expected = weight * (expected * torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-6)).to(value.dtype)
+    alone = rms_norm(value[5:6], weight, 1e-6, residual[5:6] if with_residual else None)
+    if with_residual:
+        (joint, carried), (alone, _) = joint, alone
+        assert torch.equal(carried, combined)
+    torch.testing.assert_close(joint.float(), expected.float(), atol=2e-2, rtol=1e-2)
+    assert torch.equal(alone, joint[5:6])

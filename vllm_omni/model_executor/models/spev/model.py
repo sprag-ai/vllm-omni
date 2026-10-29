@@ -5,9 +5,6 @@
 import torch
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder as TransformersAudioEncoder,
-)
 from vllm import envs
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -16,8 +13,10 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
+    _get_feat_extract_output_lengths,
 )
 from vllm_omni.model_executor.models.spev.attention_backend import checkpoint_attention
+from vllm_omni.model_executor.models.spev.audio import encode_audio, install_invariant_audio
 from vllm_omni.model_executor.models.spev.checkpoint_ops import (
     CheckpointDecoderLayer,
     CheckpointExperts,
@@ -87,14 +86,13 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
             if envs.VLLM_FLOAT32_MATMUL_PRECISION != "highest":
                 raise ValueError("SPEV isolated checkpoints require highest FP32 matmul precision")
             thinker_config = hf_config.thinker_config if self.standalone_checkpoint else hf_config
-            thinker_config.audio_config._attn_implementation = "sdpa"
-            self.audio_tower = TransformersAudioEncoder(thinker_config.audio_config)
             thinker_config.vision_config._attn_implementation = "sdpa"
             self.visual = CheckpointVisionEncoder(thinker_config.vision_config)
             head = IsolatedDecisionHead(
                 config.hidden_size, config.width, config.head_heads, config.head_ff, config.head_depth
             )
             self.pooler = IsolatedCandidatePooler(head.float().eval(), self._embed_criteria)
+            rotary = None
             for layer in self.language_model.model.layers:
                 layer.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
                 layer.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
@@ -104,9 +102,11 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
                 attention = layer.self_attn
                 attention.qkv_proj = CheckpointQKV(attention.qkv_proj, attention.q_size, attention.kv_size)
                 attention.o_proj = CheckpointLinear(attention.o_proj)
-                attention.rotary_emb = CheckpointRotary(
-                    thinker_config.text_config, attention.qkv_proj.weight.device, attention.head_dim
-                )
+                if rotary is None:
+                    rotary = CheckpointRotary(
+                        thinker_config.text_config, attention.qkv_proj.weight.device, attention.head_dim
+                    )
+                attention.rotary_emb = rotary
                 layer.mlp = CheckpointExperts(layer.mlp, thinker_config.text_config)
             for index in range(len(thinker_config.vision_config.deepstack_visual_indexes)):
                 self.language_model.model.layers[index] = CheckpointDecoderLayer(
@@ -125,18 +125,9 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
             return super()._process_audio_input(audio_input)
         features = audio_input["input_features"].to(self.audio_tower.dtype)
         lengths = audio_input["audio_feature_lengths"].to(features.device)
-        outputs, offset = [], 0
-        with checkpoint_attention():
-            for index, length in enumerate(lengths.tolist()):
-                outputs.append(
-                    self.audio_tower(
-                        features[:, offset : offset + length], feature_lens=lengths[index : index + 1]
-                    ).last_hidden_state
-                )
-                offset += length
-        if offset != features.shape[-1]:
+        if int(lengths.sum()) != features.shape[-1]:
             raise ValueError("SPEV audio features do not match their sequence lengths")
-        return tuple(outputs)
+        return encode_audio(self.audio_tower, features, lengths, _get_feat_extract_output_lengths(lengths))
 
     def forward(
         self,
@@ -197,6 +188,7 @@ class SPEVForDecisions(Qwen3OmniMoeThinkerForConditionalGeneration):
         self.pooler.head.load_state_dict(head)
         self.pooler.head.requires_grad_(False)
         if self.spev_config.architecture == "isolated_evidence_v1":
+            install_invariant_audio(self.audio_tower)
             self.pooler.head.to(device=device, dtype=torch.float32)
         scale = self.spev_config.alpha / self.spev_config.rank
         self._spev_adapter = tensors
