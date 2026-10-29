@@ -99,8 +99,9 @@ class IsolatedCandidatePooler(Pooler):
             with checkpoint_attention():
                 return score_questions(self.head, records)
         layouts = decision_layouts(pooling_metadata)
-        records, request_counts, offset = [], [], 0
+        requests, offset = [], 0
         for layout in layouts:
+            records = []
             tree = layout.tree
             hidden = hidden_states[offset : offset + tree.length]
             offset += tree.length
@@ -122,13 +123,11 @@ class IsolatedCandidatePooler(Pooler):
                         question_type=kind,
                     )
                 )
-            request_counts.append(len(layout.question_types))
+            requests.append(records)
         with checkpoint_attention():
-            values = score_questions(self.head, records)
-        results, offset = [], 0
-        for layout, count in zip(layouts, request_counts):
-            grouped = values[offset : offset + count]
-            offset += count
+            values = [score_questions(self.head, records) for records in requests]
+        results = []
+        for layout, grouped in zip(layouts, values):
             scores = torch.empty(len(layout.anchors), device=grouped[0].device, dtype=grouped[0].dtype)
             for question, value in enumerate(grouped):
                 scores[[i for i, owner in enumerate(layout.candidate_questions) if owner == question]] = value
