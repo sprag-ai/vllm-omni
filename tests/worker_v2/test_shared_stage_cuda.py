@@ -40,7 +40,8 @@ def test_aux_pytree_tracks_replayed_graph_values():
         captured = runner._flatten_capture_aux_output((source * 2, {"layers": [source + 1, source + 2]}))
     source.fill_(7)
     graph.replay()
-    hidden, aux = runner._split_fullgraph_output(captured)
+    hidden, aux, drafter_aux = runner._split_fullgraph_output(captured)
+    assert drafter_aux is None
     assert torch.equal(hidden, torch.full_like(source, 14))
     assert torch.equal(aux["layers"][0], torch.full_like(source, 8))
     assert torch.equal(aux["layers"][1], torch.full_like(source, 9))

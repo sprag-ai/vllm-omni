@@ -149,3 +149,29 @@ def test_a_streaming_new_segment_is_still_cached():
     )
 
     assert payload is None and "r" in manager._pending_streaming_prefills
+
+
+def test_mrv2_snapshot_ids_drop_the_rows_of_rejected_drafts():
+    # MRv2 hands over a row for every scheduled position, rejected drafts
+    # included, and carries the committed tokens on the request snapshot.
+    manager = _Manager()
+    spoken = []
+    output = [11]
+    steps = [
+        (PROMPT, [11]),
+        ([11, 12, 77, 78], [12, 13]),
+        ([13, 14, 15, 16], [14, 15, 16, EOS]),
+    ]
+    for rows, committed in steps:
+        if rows is not PROMPT:
+            output.extend(committed)
+        request = _request(output, history=manager.put_req_chunk["r"] == 0)
+        request.sampled_token_ids = committed
+        payload = q3.thinker2talker_async_chunk(manager, _output(rows), request, is_finished=committed[-1] == EOS)
+        if payload is None:
+            continue
+        manager.put_req_chunk["r"] += 1
+        sent = payload.embed.prefill[len(PROMPT) :] if payload.embed.prefill is not None else payload.embed.decode
+        spoken.extend(int(row[0]) for row in sent)
+
+    assert spoken == [11, 12, 13, 14, 15, 16]

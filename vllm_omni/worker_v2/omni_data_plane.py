@@ -45,13 +45,17 @@ class _NativeRequestState:
     # finish reason. MiniCPM-o duplex Talkers only end this way.
     aborted: bool = False
 
-    def accept_tokens(self, token_ids: list[int]) -> None:
+    def accept_tokens(self, token_ids: list[int]) -> list[int]:
         """Fence publications past the sampled stop, before scheduler ACK.
 
         Async scheduling may already have executed another step when the
         scheduler consumes EOS. Keep the terminating step's payload, but do
         not publish the later steps while lifecycle reservations drain.
         Resumable requests keep their segment boundaries owned by the scheduler.
+
+        Returns:
+            The leading ``token_ids`` the request keeps, through the stop when
+            one is sampled.
         """
         params = self.sampling_params
         stop_ids = set(getattr(params, "stop_token_ids", None) or ())
@@ -59,14 +63,17 @@ class _NativeRequestState:
             stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
         min_tokens = getattr(params, "min_tokens", 0) or 0
         max_tokens = getattr(params, "max_tokens", None)
+        accepted: list[int] = []
         for token_id in token_ids:
             self.output_token_ids.append(int(token_id))
+            accepted.append(int(token_id))
             if not self.resumable and (
                 (len(self.output_token_ids) >= min_tokens and token_id in stop_ids)
                 or (max_tokens is not None and len(self.output_token_ids) >= max_tokens)
             ):
                 self.output_stopped = True
                 break
+        return accepted
 
     def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
@@ -546,10 +553,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             # Native transport runs ahead of scheduler consumption. Its
             # terminal notification fences resource cleanup, not the sampled
             # token boundary: a later in-flight frame must not reach the codec.
+            accepted: list[int] = []
             if state.output_stopped:
                 payload = None
             else:
-                state.accept_tokens(sampled_by_req.get(req_id, []))
+                accepted = state.accept_tokens(sampled_by_req.get(req_id, []))
                 payload = payload_by_req.get(req_id)
             if not self._async_chunk:
                 # Full-payload consumers execute once, after the producer has
@@ -572,7 +580,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
-                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        sampled_token_ids=accepted if not state.finished else None,
                     ),
                     payload,
                 )

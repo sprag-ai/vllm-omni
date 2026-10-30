@@ -397,11 +397,27 @@ def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
     assert runner.model.forward is original_forward and runner.use_aux_hidden_state_outputs is False
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.FULL: [full]}  # FULL kept
 
-    hidden, aux = runner._split_fullgraph_output((captured["hidden"], captured["leaves"]))
+    hidden, aux, drafter_aux = runner._split_fullgraph_output((captured["hidden"], captured["leaves"]))
     reference_hidden, reference_aux = _aux_output(4)
     assert torch.equal(hidden, reference_hidden)
     assert set(aux["hidden_states"]["layers"]) == {0, 24}
     assert torch.equal(aux["hidden_states"]["layers"][24], reference_aux["hidden_states"]["layers"][24])
+    assert drafter_aux is None
+
+
+def test_full_graph_aux_contract_round_trips_drafter_hidden_states():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    hidden, aux = _aux_output(4)
+    drafter_aux = [hidden + 10, hidden + 20, hidden + 30]
+
+    replayed = runner._flatten_capture_aux_output((hidden, aux, drafter_aux))
+    split_hidden, split_aux, split_drafter = runner._split_fullgraph_output(replayed)
+
+    assert torch.equal(split_hidden, hidden)
+    assert torch.equal(split_aux["hidden_states"]["layers"][0], aux["hidden_states"]["layers"][0])
+    assert [int(t[0, 0]) for t in split_drafter] == [10, 20, 30]
 
 
 @pytest.mark.parametrize(
@@ -435,7 +451,7 @@ def test_full_graph_output_without_contract_is_hidden_only():
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(2, 2)
-    assert runner._split_fullgraph_output(hidden) == (hidden, None)
+    assert runner._split_fullgraph_output(hidden) == (hidden, None, None)
 
 
 @pytest.mark.parametrize("runner_kind", ["gpu", "ar", "generation"])
@@ -528,11 +544,17 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
 
 
-@pytest.mark.parametrize(("output_type", "refused"), [("text", False), ("latent", True)])
-def test_speculation_is_refused_on_a_stage_whose_output_is_not_text(output_type: str, refused: bool) -> None:
+@pytest.mark.parametrize(
+    ("output_type", "handoff", "refused"),
+    [("text", False, False), ("latent", False, True), ("latent", True, False)],
+)
+def test_speculation_is_refused_on_a_non_text_stage_without_a_speculative_handoff(
+    output_type: str, handoff: bool, refused: bool
+) -> None:
     runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
     runner.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle3"))
     runner.model_config = SimpleNamespace(engine_output_type=output_type)
+    runner.model = SimpleNamespace(supports_speculative_handoff=handoff)
 
     if refused:
         with pytest.raises(NotImplementedError, match="engine output is text"):
@@ -545,5 +567,6 @@ def test_a_stage_without_speculation_runs_whatever_its_output() -> None:
     runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
     runner.vllm_config = SimpleNamespace(speculative_config=None)
     runner.model_config = SimpleNamespace(engine_output_type="latent")
+    runner.model = SimpleNamespace()
 
     runner._validate_speculation_support()

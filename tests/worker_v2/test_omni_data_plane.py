@@ -312,6 +312,16 @@ def test_emit_cohort_one_batch_and_trims_non_resumable_history(plane):
     assert request.output_token_count == 1025 and request.all_token_ids == []
 
 
+def test_snapshot_carries_the_step_tokens_through_the_stop(plane):
+    plane.register_request(_new_request("r0", "ext-0"))
+    plane._native_requests["r0"].resumable = False
+    plane.emit_chunks(
+        req_ids=["r0"], inter_stage_outputs=[{"h": "a"}], sampled_token_ids=[[21, 22, 2150, 23]], terminal_req_ids=set()
+    )
+    request, _ = plane.record.batches[0][0]
+    assert request.sampled_token_ids == [21, 22, 2150] and request.output_token_ids == [21, 22, 2150]
+
+
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
     batches, cleaned = plane.record.batches, plane.record.cleaned
     plane.register_request(_new_request())

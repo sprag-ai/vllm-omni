@@ -310,6 +310,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         # axis, so MRv2 may replay decode in FULL graphs and return them too.
         self.supports_mrv2_full_graph_aux_outputs = self._returns_tuple
 
+        # The thinker-to-talker processor trims each step's rows to its committed tokens.
+        self.supports_speculative_handoff = self.model_stage == "thinker"
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
             # MRv2: the Talker's prompt ends with the first generated token's

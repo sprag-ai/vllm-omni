@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -35,6 +36,7 @@ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.core.sched.adaptive_speculation import AdaptiveSpeculationConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
@@ -102,6 +104,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
     _aux_output_spec: Any = None
+    _drafter_idle = False
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
@@ -114,17 +117,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.model, "_last_captured_layers"
         )
 
-    def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
-        """FULL replay output -> ``(hidden_states, aux pytree or None)``."""
+    def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any, list[torch.Tensor] | None]:
+        """FULL replay output -> ``(hidden_states, aux pytree or None, drafter aux hidden states or None)``."""
         if self._full_graph_aux_outputs and isinstance(replayed, tuple):
             hidden, leaves = replayed
-            return hidden, tree_unflatten(list(leaves), self._aux_output_spec)
-        return replayed, None
+            aux, drafter_aux = tree_unflatten(list(leaves), self._aux_output_spec)
+            return hidden, aux, drafter_aux or None
+        return replayed, None, None
 
     def _flatten_capture_aux_output(self, model_output: Any) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """``(hidden, aux pytree)`` -> ``(hidden, leaves)`` for the graph manager's aux buffers."""
-        hidden, aux = model_output
-        leaves, spec = tree_flatten(aux)
+        """``(hidden, aux pytree[, drafter aux hidden states])`` -> ``(hidden, leaves)`` for the graph manager."""
+        hidden, aux, *drafter_aux = model_output
+        leaves, spec = tree_flatten((aux, drafter_aux[0] if drafter_aux else []))
         num_tokens = hidden.shape[0]
         if not leaves or any(not isinstance(leaf, torch.Tensor) or leaf.shape[:1] != (num_tokens,) for leaf in leaves):
             raise RuntimeError(
@@ -214,7 +218,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         with self._staged_writes.activate():
             super().__init__(*args, **kwargs)
         self._validate_parallel_support()
-        self._validate_speculation_support()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -239,12 +242,47 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _validate_speculation_support(self) -> None:
         # A drafted step commits several tokens per request, while a stage that
-        # hands hidden states to the next stage sizes that handoff for one.
+        # hands hidden states to the next stage sizes that handoff for one
+        # unless the model declares otherwise.
         output_type = getattr(self.model_config, "engine_output_type", "text")
-        if self.vllm_config.speculative_config is not None and output_type != "text":
+        if (
+            self.vllm_config.speculative_config is not None
+            and output_type != "text"
+            and not getattr(self.model, "supports_speculative_handoff", False)
+        ):
             raise NotImplementedError(
-                f"speculative decoding is supported only on a stage whose engine output is text, not {output_type!r}"
+                f"speculative decoding is supported only on a stage whose engine output is text, not {output_type!r}, "
+                f"unless {type(self.model).__name__} supports a speculative handoff"
             )
+
+    def initialize_kv_cache(self, *args: Any, **kwargs: Any) -> None:
+        with self._undrafted_decode_graph_schedule():
+            super().initialize_kv_cache(*args, **kwargs)
+
+    @contextmanager
+    def _undrafted_decode_graph_schedule(self) -> Iterator[None]:
+        """Name both draft counts of an adaptive-speculation stage while the CUDA graph manager is built.
+
+        Such a step drafts ``num_speculative_tokens`` or nothing, and the manager
+        captures FULL decode graphs only for the draft counts a dynamic schedule names.
+        """
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is None
+            or speculative_config.uses_dynamic_speculative_decoding()
+            or AdaptiveSpeculationConfig.from_additional_config(self.vllm_config.additional_config) is None
+        ):
+            yield
+            return
+        max_num_reqs = max(2, self.vllm_config.scheduler_config.max_num_seqs)
+        speculative_config.num_speculative_tokens_per_batch_size = [
+            (1, 1, 0),
+            (2, max_num_reqs, speculative_config.num_speculative_tokens),
+        ]
+        try:
+            yield
+        finally:
+            speculative_config.num_speculative_tokens_per_batch_size = None
 
     @staged_writes.runner_context
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -400,6 +438,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 _mr_module.init_model_state = _orig
         self._last_aux_output = None
         self._last_multimodal_outputs = None
+        self._validate_speculation_support()
         self._configure_cudagraph_output_contract()
 
         # Preprocess models own embedding buffers; encoder_runner sizing would
@@ -764,11 +803,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.kv_connector.pre_forward(scheduler_output)
             replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
             self._last_multimodal_outputs = None
-            if self.use_aux_hidden_state_outputs and isinstance(replayed, tuple):
+            if self._full_graph_aux_outputs:
+                hidden_states, self._last_aux_output, aux_hidden_states = self._split_fullgraph_output(replayed)
+            elif self.use_aux_hidden_state_outputs and isinstance(replayed, tuple):
                 hidden_states, aux_hidden_states = replayed
                 self._last_aux_output = None
             else:
-                hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+                hidden_states, self._last_aux_output = replayed, None
             if hasattr(self.model, "_last_captured_layers"):
                 self.model._last_captured_layers = self._last_aux_output
         else:
@@ -813,10 +854,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hidden_states = model_output.text_hidden_states
                 if model_output.multimodal_outputs:
                     self._last_multimodal_outputs = cast(dict[str, Any], model_output.multimodal_outputs)
-            elif isinstance(model_output, tuple) and len(model_output) == 2 and self.use_aux_hidden_state_outputs:
+            elif (
+                isinstance(model_output, tuple)
+                and len(model_output) == 2
+                and self.use_aux_hidden_state_outputs
+                and not isinstance(model_output[1], dict)
+            ):
                 hidden_states, aux_hidden_states = model_output
-            elif isinstance(model_output, tuple) and len(model_output) == 2:
-                hidden_states, self._last_aux_output = model_output
+            elif isinstance(model_output, tuple) and len(model_output) in (2, 3):
+                hidden_states, self._last_aux_output, *drafter_aux = model_output
+                aux_hidden_states = drafter_aux[0] if drafter_aux else None
                 if hasattr(self.model, "_last_captured_layers"):
                     self.model._last_captured_layers = self._last_aux_output
             else:
@@ -824,6 +871,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
+        self._drafter_idle = not dummy_run and bool(getattr(scheduler_output, "skip_draft_kv_sync", False))
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,

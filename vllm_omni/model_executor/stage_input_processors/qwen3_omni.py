@@ -553,8 +553,11 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     # Tokens this scheduler step committed, snapshotted by the connector
-    # before any resumable cleanup could rewrite the request.
-    committed_ids = tuple(int(token_id) for token_id in new_token_ids)
+    # before any resumable cleanup could rewrite the request. The MRv2 data
+    # plane carries them on its request snapshot instead.
+    committed_ids = tuple(int(token_id) for token_id in new_token_ids) or tuple(
+        int(token_id) for token_id in getattr(request, "sampled_token_ids", None) or ()
+    )
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None

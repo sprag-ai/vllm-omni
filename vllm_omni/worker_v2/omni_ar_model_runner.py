@@ -378,10 +378,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         dp_sync_state: Any,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> None:
-        """Draft the next step's speculative tokens for each request in the batch, as the upstream runner does."""
+        """Draft the next step's speculative tokens for each request in the batch, as the upstream runner does.
+
+        A step the scheduler marks drafter-idle drafts nothing and skips the
+        drafter's pass over the step's tokens.
+        """
         assert self.speculator is not None and self.sampler is not None
         if isinstance(self.speculator, DraftModelSpeculator):
             self.speculator.observe_verification(input_batch.idx_mapping, num_sampled, num_rejected)
+        if self._drafter_idle and num_spec_tokens == 0:
+            self.req_states.draft_tokens[input_batch.idx_mapping] = -1
+            return
         spec_hidden_states = get_drafter_hidden_states(self.model, hidden_states)
         if isinstance(self.sampler, GPUWatermarkSampler):
             self.speculator.prepare_watermarking(self.sampler, input_batch.idx_mapping)
