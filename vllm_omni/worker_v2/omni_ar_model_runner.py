@@ -160,7 +160,6 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
             OmniPrefixCacheUnmatchError: The model's multimodal outputs are not a payload dict.
         """
         step = self._prefix_cache_step
-        self._prefix_cache_step = None
         if step is None or self.omni_prefix_cache is None:
             return None
         if multimodal_outputs and not isinstance(multimodal_outputs, dict):
@@ -169,12 +168,15 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
                 "disable enable_prefix_caching for this model"
             )
         self._prefix_cache_group_view.bind_batch(input_batch.req_ids)
-        step_id = self._prefix_cache_save_step(
-            text_hidden,
-            multimodal_outputs,
-            num_tokens_unpadded=input_batch.num_tokens,
-            num_tokens_padded=input_batch.num_tokens_after_padding,
-        )
+        try:
+            step_id = self._prefix_cache_save_step(
+                text_hidden,
+                multimodal_outputs,
+                num_tokens_unpadded=input_batch.num_tokens,
+                num_tokens_padded=input_batch.num_tokens_after_padding,
+            )
+        finally:
+            self._prefix_cache_step = None
         if step_id is None:
             return None
         hit_req_ids = [

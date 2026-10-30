@@ -9,7 +9,7 @@ import torch
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.worker_v2.omni_ar_model_runner import OmniAsyncOutput
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
 from vllm_omni.worker_v2.prefix_cache import SchedulerBlockView
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -80,6 +80,55 @@ def test_prefix_hit_merges_the_rows_an_earlier_request_computed():
     merged = manager.materialize(hit, ["b"]).hidden_states["b"]
 
     assert torch.equal(merged, torch.cat([prompt_rows, tail_rows]))
+
+
+def _runner(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = object.__new__(OmniARModelRunner)
+    runner.is_pooling_model = False
+    runner.omni_prefix_cache = OmniPrefixCacheManager(
+        PrefixCacheConfig(num_blocks=16, block_size=BLOCK_SIZE), eager=True
+    )
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+    runner._prefix_cache_group_view = SchedulerBlockView(BLOCK_SIZE)
+    return runner
+
+
+def _runner_step(runner, scheduler_output, rows):
+    runner._begin_prefix_cache_step(scheduler_output)
+    batch = SimpleNamespace(
+        req_ids=list(scheduler_output.num_scheduled_tokens),
+        num_tokens=rows.shape[0],
+        num_tokens_after_padding=rows.shape[0],
+    )
+    return runner._save_prefix_cache_step(rows, {}, batch)
+
+
+def test_runner_holds_only_steps_with_a_prefix_hit(monkeypatch):
+    runner = _runner(monkeypatch)
+    prompt_rows = _rows(range(10, 18))
+
+    assert _runner_step(runner, _sched(new=[_new_req("a", [0, 1])], scheduled={"a": 8}), prompt_rows) is None
+    hit = _runner_step(
+        runner,
+        _sched(new=[_new_req("b", [0, 1, 5], num_computed=8)], finished=["a"], scheduled={"b": 1}),
+        _rows([90]),
+    )
+
+    assert hit is not None and hit[1] == ["b"]
+    merged = runner.omni_prefix_cache.materialize(hit[0], ["b"]).hidden_states["b"]
+    assert torch.equal(merged, torch.cat([prompt_rows, _rows([90])]))
+
+
+def test_runner_skips_vllm_warmup_steps(monkeypatch):
+    runner = _runner(monkeypatch)
+
+    saved = _runner_step(runner, _sched(new=[_new_req("_warmup_0_", [0])], scheduled={"_warmup_0_": 2}), _rows([1, 2]))
+
+    assert saved is None
+    assert runner._prefix_cache_step is None
 
 
 def test_view_maps_positions_through_appended_blocks():
