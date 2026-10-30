@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -23,6 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.adaptive_speculation import AcceptanceDraftSchedule, AdaptiveSpeculationConfig
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
@@ -143,6 +144,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         install_decode_allocate_fast_path(self.kv_cache_manager)
+        self._adaptive_drafts = self._make_adaptive_draft_schedule()
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -793,16 +795,66 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        output = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        schedule = getattr(self, "_adaptive_drafts", None)
+        if schedule is not None:
+            # The lookup runs only when the step schedules tokens; drafter_idle is reset there.
+            output.skip_draft_kv_sync = schedule.drafter_idle and output.total_num_scheduled_tokens > 0
+        return output
+
+    def _make_adaptive_draft_schedule(self) -> AcceptanceDraftSchedule | None:
+        """Build the stage's acceptance-driven draft schedule; None when it is off.
+
+        Raises:
+            ValueError: The setting is on without speculative decoding, or alongside
+                ``num_speculative_tokens_per_batch_size``.
+        """
+        config = AdaptiveSpeculationConfig.from_additional_config(self.vllm_config.additional_config)
+        if config is None:
+            return None
+        if self.num_spec_tokens <= 0:
+            raise ValueError("adaptive_speculation requires speculative decoding on this stage")
+        if self.dynamic_sd_lookup is not None:
+            raise ValueError("adaptive_speculation replaces num_speculative_tokens_per_batch_size; set one of them")
+        schedule = AcceptanceDraftSchedule(
+            config, self.num_spec_tokens, lambda: (request.request_id for request in self.running)
+        )
+        logger.info(
+            "Adaptive speculation: %d draft tokens per step while running requests average >= %.2f tokens "
+            "per verification step, otherwise none",
+            self.num_spec_tokens,
+            config.min_tokens_per_step,
+        )
+        # Upstream reads the next step's draft count from this lookup and, while it
+        # is set, stops padding new decodes to the drafted query length.
+        self.dynamic_sd_lookup = cast(list[int], schedule)
+        return schedule
+
+    def _record_verified_drafts(
+        self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        """Feed each verified request's committed token count to the draft schedule."""
+        schedule = self._adaptive_drafts
+        sampled_token_ids = model_runner_output.sampled_token_ids
+        drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        if schedule is None or not drafts or not sampled_token_ids:
+            return
+        index = model_runner_output.req_id_to_index
+        for req_id, draft in drafts.items():
+            i = index.get(req_id)
+            if draft and i is not None and i < len(sampled_token_ids) and sampled_token_ids[i]:
+                schedule.record(req_id, len(sampled_token_ids[i]))
 
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if getattr(self, "_adaptive_drafts", None) is not None:
+            self._record_verified_drafts(scheduler_output, model_runner_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
