@@ -109,7 +109,7 @@ class _CacheStub:
         self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
-    def materialize(self, step_id, req_ids):
+    def materialize(self, step_id, req_ids, committed=None):
         self.materialize_calls.append((step_id, req_ids))
         return self.outs
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import gc
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple, cast
@@ -23,18 +23,21 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -42,10 +45,12 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.core.sched.adaptive_speculation import AdaptiveSpeculationConfig
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
@@ -69,6 +74,98 @@ from vllm_omni.worker.sampling_utils import (
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
+
+
+def _committed_num_scheduled_tokens(
+    scheduler_output: SchedulerOutput,
+    valid_sampled_token_ids: list[list[int]],
+    req_id: str,
+    idx: int,
+    num_scheduled: int,
+) -> int:
+    """Rows of a speculative step that survive verification.
+
+    The target forward also produces rows for rejected draft tokens. Only the
+    previously unprocessed token plus the accepted draft prefix are committed,
+    and the rejection sampler's emitted count is that number. Requests without
+    drafts, prefill included, keep their full scheduled span. Under async
+    scheduling the emitted tokens come from the step's host copy, so this is
+    only called where that copy has been parsed.
+    """
+    # Read directly: a getattr default would return the untrimmed span if
+    # upstream renamed the field, handing rejected draft rows downstream.
+    drafts = scheduler_output.scheduled_spec_decode_tokens
+    if not drafts or not drafts.get(req_id):
+        return num_scheduled
+    if idx >= len(valid_sampled_token_ids):
+        return num_scheduled
+    sampled = valid_sampled_token_ids[idx]
+    if not sampled:
+        return num_scheduled
+    return min(num_scheduled, len(sampled))
+
+
+class OneTokenDecodeCudagraphDispatcher(CudagraphDispatcher):
+    """Graph dispatcher that also keeps FULL graphs for one-token decode batches.
+
+    A speculative stage captures FULL decode graphs only for batches of
+    ``1 + num_speculative_tokens`` tokens per request. A step that drafts nothing
+    is a one-token decode, which would otherwise replay piecewise with attention
+    launched outside the graph.
+
+    Attributes:
+        one_token_decode: Dispatcher whose uniform decode is one token per request,
+            holding the extra FULL keys; None until keys are initialized for a
+            speculative FULL decode mode.
+    """
+
+    one_token_decode: CudagraphDispatcher | None = None
+
+    def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1) -> None:
+        super().initialize_cudagraph_keys(cudagraph_mode, uniform_decode_query_len)
+        self.one_token_decode = None
+        if (
+            uniform_decode_query_len > 1
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and cudagraph_mode.separate_routine()
+        ):
+            one_token = CudagraphDispatcher(self.vllm_config)
+            one_token.uniform_decode_query_len = 1
+            # The shared sizes are rounded up to multiples of the drafted query length,
+            # which would pad a lone decode to that many tokens through every expert.
+            sizes = self.compilation_config.cudagraph_capture_sizes or []
+            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+            one_token_sizes = sorted({1, 2, *(size for size in sizes if size <= max_num_seqs)})
+            one_token.compilation_config = copy(self.compilation_config)
+            one_token.compilation_config.cudagraph_capture_sizes = one_token_sizes
+            one_token.compilation_config.max_cudagraph_capture_size = one_token_sizes[-1]
+            one_token.initialize_cudagraph_keys(cudagraph_mode, 1)
+            # Only its FULL decode graphs are captured; piecewise shapes stay with the main keys.
+            one_token.cudagraph_keys[CUDAGraphMode.PIECEWISE].clear()
+            self.one_token_decode = one_token
+
+    def one_token_decode_descs(self) -> list[BatchDescriptor]:
+        """FULL descriptors of one-token decode batches the main keys lack."""
+        if self.one_token_decode is None:
+            return []
+        own = self.cudagraph_keys[CUDAGraphMode.FULL]
+        return [d for d in self.one_token_decode.cudagraph_keys[CUDAGraphMode.FULL] if d.uniform and d not in own]
+
+    def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
+        extra = self.one_token_decode_descs()
+        if not extra:
+            return super().get_capture_descs()
+        # One FULL group: graph-memory profiling keeps one estimate per mode.
+        result = []
+        merged = False
+        for mode, descs in super().get_capture_descs():
+            if mode == CUDAGraphMode.FULL:
+                descs = sorted([*descs, *extra], key=lambda d: (d.num_tokens, d.num_active_loras), reverse=True)
+                merged = True
+            result.append((mode, descs))
+        if not merged:
+            result.append((CUDAGraphMode.FULL, sorted(extra, key=lambda d: d.num_tokens, reverse=True)))
+        return result
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -203,7 +300,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
         self,
         *,
-        model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        model_runner_output_builder: Callable[[list[list[int]] | None], OmniModelRunnerOutput],
         cuda_device: torch.device | int | str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -247,7 +344,9 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self._num_nans_cpu = self._num_nans.to("cpu", non_blocking=True) if self._num_nans is not None else None
             self.async_copy_ready_event.record()
 
-        self._model_runner_output_builder: Callable[[], OmniModelRunnerOutput] | None = model_runner_output_builder
+        self._model_runner_output_builder: Callable[[list[list[int]] | None], OmniModelRunnerOutput] | None = (
+            model_runner_output_builder
+        )
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
@@ -258,12 +357,26 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         )
         self._background_thread.start()
 
+    def _verified_token_ids(self) -> list[list[int]] | None:
+        """Tokens a speculative step committed, or None for a step without drafts.
+
+        Parsed from this step's host copy exactly as ``get_output`` parses them, so
+        the Omni payload is sized by the same counts the scheduler receives.
+        """
+        if self.sampled_token_ids_cpu.shape[-1] == 1:
+            return None
+        self.async_copy_ready_event.synchronize()
+        verified, _ = RejectionSampler.parse_output(
+            self.sampled_token_ids_cpu, self.vocab_size, self._invalid_req_indices
+        )
+        return verified
+
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
             return
         with record_function_or_nullcontext("omni_async_output:get_output/build_model_runner_output"):
             assert self._model_runner_output_builder is not None
-            self._model_runner_output = self._model_runner_output_builder()
+            self._model_runner_output = self._model_runner_output_builder(self._verified_token_ids())
         self._model_runner_output_builder = None
 
     def _build_output_in_background(self) -> None:
@@ -367,6 +480,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
+    _prefix_cache_corrects_draft_positions = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -399,10 +513,100 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        if self.speculative_config is not None and AdaptiveSpeculationConfig.from_additional_config(
+            self.vllm_config.additional_config
+        ):
+            self.cudagraph_dispatcher = OneTokenDecodeCudagraphDispatcher(self.vllm_config)
+
+    @contextmanager
+    def _one_token_decode_shapes(self):
+        """Dispatch and build batches as one-token decodes for the duration of the block."""
+        dispatcher, query_len = self.cudagraph_dispatcher, self.uniform_decode_query_len
+        assert isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher) and dispatcher.one_token_decode is not None
+        self.cudagraph_dispatcher, self.uniform_decode_query_len = dispatcher.one_token_decode, 1
+        try:
+            yield
+        finally:
+            self.cudagraph_dispatcher, self.uniform_decode_query_len = dispatcher, query_len
+
+    def propose_draft_token_ids(self, scheduler_output: SchedulerOutput, sampled_token_ids, *args, **kwargs):
+        if not getattr(scheduler_output, "skip_draft_kv_sync", False) or not isinstance(
+            sampled_token_ids, torch.Tensor
+        ):
+            return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
+        # Every running request is retired from drafting, so its drafter cache is
+        # never read again. Keep only the sampled-token bookkeeping async scheduling needs.
+        next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+            sampled_token_ids, self.requests, self.input_batch, self.discard_request_mask.gpu
+        )
+        self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+        return torch.empty(sampled_token_ids.shape[0], 0, dtype=torch.int64, device=sampled_token_ids.device)
+
+    def _warmup_and_capture(self, desc: BatchDescriptor, *args, **kwargs):
+        dispatcher = self.cudagraph_dispatcher
+        if isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher) and desc in dispatcher.one_token_decode_descs():
+            with self._one_token_decode_shapes():
+                return super()._warmup_and_capture(desc, *args, **kwargs)
+        return super()._warmup_and_capture(desc, *args, **kwargs)
+
+    def _determine_batch_execution_and_padding(self, num_tokens: int, num_reqs: int, *args, **kwargs):
+        dispatcher = self.cudagraph_dispatcher
+        if (
+            isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher)
+            and dispatcher.one_token_decode is not None
+            and kwargs.get("force_uniform_decode") is None
+            and kwargs.get("max_num_scheduled_tokens") == 1
+            and num_tokens == num_reqs
+        ):
+            with self._one_token_decode_shapes():
+                return super()._determine_batch_execution_and_padding(num_tokens, num_reqs, *args, **kwargs)
+        return super()._determine_batch_execution_and_padding(num_tokens, num_reqs, *args, **kwargs)
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if (
+            self.speculative_config is not None
+            and self.use_async_scheduling
+            and not self._should_use_async_omni_output()
+        ):
+            # Under async scheduling the verified tokens reach the host only after the
+            # step's output copy, which the deferred Omni output waits on. A synchronous
+            # build would size every payload by its scheduled rows, rejected drafts included.
+            raise ValueError(
+                "Speculative decoding with async scheduling requires the deferred Omni output "
+                "path (async_chunk, a model that sets use_async_omni_output, no routed-expert "
+                "return); otherwise set async_scheduling: false on this stage."
+            )
+
+    def _warm_up_async_spec_decode_correction(self) -> None:
+        """Compile vLLM's async draft-count correction for each batch-size specialization.
+
+        The correction is a lazily compiled function that specializes batches of one request;
+        unwarmed, the first step that grows a batch past one compiles inline for about a second.
+        """
+        if not self.use_async_spec_decode:
+            return
+
+        # Compiled variants are also guarded on dispatch keys: the runner's persistent buffers
+        # were made outside inference mode, the per-step counts inside it.
+        def persistent(n: int, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+            with torch.inference_mode(False):
+                return torch.zeros(n, dtype=dtype, device=self.device)
+
+        def per_step(n: int) -> torch.Tensor:
+            return torch.zeros(n, dtype=torch.int32, device=self.device)
+
+        for num_reqs in (1, 2):
+            for prev_num_reqs in (1, 2):
+                update_num_computed_tokens_for_batch_change(
+                    persistent(self.max_num_reqs),
+                    persistent(num_reqs),
+                    persistent(num_reqs, torch.int64),
+                    per_step(prev_num_reqs),
+                    persistent(self.max_num_reqs),
+                    per_step(num_reqs),
+                )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -872,11 +1076,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
         step_id: int | None,
+        committed: dict[str, int],
     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
         """Prefix-cache payload sources for the pooler payload build.
 
         req_ids must be the step's snapshot, not ``input_batch.req_ids``: under
         async omni output this runs a step late, when the live batch has moved on.
+        ``committed`` caps the merged rows of requests whose drafts were verified.
         """
         if not get_pp_group().is_last_rank:
             raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
@@ -891,7 +1097,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
             return hidden_states_cpu, None, None
-        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
+        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids), committed)
         return hidden_states_cpu, combined_hidden, combined_mm
 
     def _build_omni_pooler_payload(
@@ -1033,6 +1239,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._warmup_state_cleared = True
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
+            # Here rather than at load: compiled variants are guarded on grad mode and the torch
+            # thread count, which only match serving inside a real step.
+            self._warm_up_async_spec_decode_correction()
 
         # Exactly once per real scheduler_output, before _update_states
         # (dummy/warmup runs never reach execute_model).
@@ -1330,7 +1539,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and isinstance(model_output, OmniOutput):
+                # EAGLE 3 on an omni stage: the drafter's layers ride in the envelope.
+                hidden_states, aux_hidden_states = model_output.text_hidden_states, model_output.aux_hidden_states
+            elif self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
@@ -1345,6 +1557,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
+            if deferred_state_corrections_fn is not None and self.omni_prefix_cache is not None:
+                # The save's slot map reads num_computed_tokens_cpu, which async scheduling
+                # leaves assuming the previous step's drafts were all accepted until this runs.
+                deferred_state_corrections_fn()
+                deferred_state_corrections_fn = None
             # Prefix-cache write: freeze + submit; policy gating (full
             # hidden, skip/deferred keys) happens inside the manager.
             prefix_cache_step_id = self._prefix_cache_save_step(
@@ -1764,8 +1981,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
-        if self.speculative_config is not None:
-            return False
 
         model_config = getattr(self, "model_config", None)
         if model_config is None:
@@ -1957,7 +2172,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
-                        sched = int(num_scheduled_tokens_np[idx])
+                        sched = _committed_num_scheduled_tokens(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                            rid,
+                            idx,
+                            int(num_scheduled_tokens_np[idx]),
+                        )
                         end = start + sched
                         req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
 
@@ -1991,6 +2212,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
+                    committed={
+                        rid: _committed_num_scheduled_tokens(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                            rid,
+                            idx,
+                            int(num_scheduled_tokens_np[idx]),
+                        )
+                        for rid, idx in req_id_to_index_output_copy.items()
+                    },
                 )
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
@@ -2023,7 +2254,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
-                    sched = int(num_scheduled_tokens_np[idx])
+                    sched = _committed_num_scheduled_tokens(
+                        scheduler_output,
+                        valid_sampled_token_ids,
+                        rid,
+                        idx,
+                        int(num_scheduled_tokens_np[idx]),
+                    )
                     end = start + sched
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
@@ -2348,7 +2585,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("omni_async_output:get_omni_connector_output"):
             omni_connector_output = self.get_omni_connector_output()
 
-        def output_builder() -> OmniModelRunnerOutput:
+        def output_builder(verified_token_ids: list[list[int]] | None = None) -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
@@ -2366,7 +2603,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     multimodal_outputs=mm_snapshot,
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
-                    valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
+                    valid_sampled_token_ids=(
+                        valid_sampled_token_ids_snapshot if verified_token_ids is None else verified_token_ids
+                    ),
                     logprobs_lists=logprobs_lists_snapshot,
                     prompt_logprobs_dict=prompt_logprobs_dict_snapshot,
                     num_nans_in_logits=num_nans_in_logits_snapshot,
