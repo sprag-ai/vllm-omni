@@ -34,6 +34,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
@@ -498,8 +499,8 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     calls = []
     sync_calls = []
 
-    def builder():
-        calls.append("build")
+    def builder(verified_token_ids):
+        calls.append(("build", verified_token_ids))
         return OmniModelRunnerOutput(req_ids=["r1"], req_id_to_index={"r1": 0})
 
     async_output._model_runner_output = None
@@ -516,11 +517,47 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
 
     output = async_output.get_output()
 
-    assert calls == ["build"]
+    # A step without drafts has nothing to verify, so the builder keeps its snapshot.
+    assert calls == [("build", None)]
     assert sync_calls == ["sync"]
     assert async_output._model_runner_output_builder is None
     assert output.req_ids == ["r1"]
     assert output.sampled_token_ids == [[7]]
+
+
+def test_omni_async_output_builds_from_the_verified_tokens_of_a_speculative_step():
+    """Async scheduling leaves the accepted drafts on the device at bookkeeping.
+
+    The builder must size payloads by the counts the scheduler will receive, so it
+    is handed the step's host copy parsed exactly as ``get_output`` parses it:
+    placeholders dropped, discarded requests emptied, and only after the copy event.
+    """
+    async_output = object.__new__(OmniAsyncGPUModelRunnerOutput)
+    events = []
+
+    def builder(verified_token_ids):
+        events.append(("build", verified_token_ids))
+        return OmniModelRunnerOutput(req_ids=["a", "b", "c"], req_id_to_index={"a": 0, "b": 1, "c": 2})
+
+    placeholder = -1
+    async_output._model_runner_output = None
+    async_output._model_runner_output_builder = builder
+    async_output._invalid_req_indices = [2]
+    async_output.sampled_token_ids_cpu = torch.tensor(
+        [[11, 12, placeholder], [21, placeholder, placeholder], [31, 32, 33]], dtype=torch.long
+    )
+    async_output.async_copy_ready_event = SimpleNamespace(synchronize=lambda: events.append("sync"))
+    async_output._sampled_token_ids = async_output.sampled_token_ids_cpu
+    async_output._logprobs_tensors = None
+    async_output._logprobs_tensors_cpu = None
+    async_output._routed_experts = None
+    async_output._routed_experts_cpu = None
+    async_output.vocab_size = 100
+
+    output = async_output.get_output()
+
+    assert events[:2] == ["sync", ("build", [[11, 12], [21], []])]
+    assert output.sampled_token_ids == [[11, 12], [21], []]
 
 
 def test_omni_async_gpu_model_runner_output_reraises_background_exception():
@@ -591,6 +628,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -635,6 +673,7 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=6,
             num_scheduled_tokens={"r1": 1, "r2": 2, "r3": 3},
         ),
@@ -690,6 +729,7 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch,
     GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -723,6 +763,10 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
+    # The deferred builder parses verified drafts from the step's host copy.
+    runner.speculative_config = SimpleNamespace(method="eagle3", num_speculative_tokens=4)
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+
     # Prefix cache no longer forces the sync output path; leftover mm is
     # snapshotted at save so the builder can materialize a step late.
     runner.omni_prefix_cache = object()
@@ -733,6 +777,24 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+def test_load_model_refuses_async_speculation_without_the_deferred_output(monkeypatch):
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *a, **k: None)
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_duplex_sampling_hook", lambda self, force=False: None)
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.speculative_config = SimpleNamespace(method="eagle3", num_speculative_tokens=4)
+    runner.model.use_async_omni_output = True
+
+    GPUARModelRunner.load_model(runner)
+
+    runner.model.has_postprocess = True
+    with pytest.raises(ValueError, match="requires the deferred Omni output path"):
+        GPUARModelRunner.load_model(runner)
+
+    runner.use_async_scheduling = False
+    GPUARModelRunner.load_model(runner)
 
 
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
@@ -752,6 +814,7 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 2},
         ),
@@ -799,6 +862,7 @@ def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_onl
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -846,6 +910,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=5,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -938,6 +1003,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner._pooler_payload_include_hidden_flag = True
     runner.execute_model_state = ExecuteModelState(
         SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -1053,6 +1119,7 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 1, "r2": 1},
         ),
@@ -1100,7 +1167,7 @@ def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypat
         def discard_step(self, step_id):
             calls.append(("discard", step_id))
 
-        def materialize(self, step_id, req_ids):
+        def materialize(self, step_id, req_ids, committed=None):
             calls.append(("materialize", step_id))
             stale = {
                 "model_outputs": {rid: [] for rid in req_ids},
@@ -1120,7 +1187,11 @@ def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypat
     song = torch.ones(2, 8)
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
-        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 1, "r2": 1},
+            scheduled_spec_decode_tokens={},
+        ),
         hidden_states=torch.zeros(2, 4),
         staged_hidden_states_cpu=None,
         multimodal_outputs={
@@ -1172,6 +1243,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -1212,6 +1284,7 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
@@ -1272,6 +1345,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -1346,6 +1420,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
         runner,
         scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={},
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
@@ -2249,3 +2324,23 @@ def test_shutdown_drops_cached_sampled_token_override(mocker):
 
     assert runner._sampled_token_ids_cpu_override is None
     upstream.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "drafts,sampled,num_scheduled,expected",
+    [
+        ({}, [[1]], 4, 4),
+        ({"other": [9]}, [[1]], 4, 4),
+        ({"r": [9, 9, 9]}, [], 4, 4),
+        ({"r": [9, 9, 9]}, [[]], 4, 4),
+        ({"r": [9, 9, 9]}, [[1, 2]], 4, 2),
+        ({"r": [9]}, [[1, 2, 3, 4, 5]], 2, 2),
+    ],
+    ids=["no-drafts", "other-req", "idx-out-of-range", "nothing-sampled", "two-of-three", "never-exceeds-span"],
+)
+def test_committed_rows_trim_to_the_accepted_prefix(drafts, sampled, num_scheduled, expected):
+    """Only the prior token plus the accepted draft prefix may go downstream."""
+    from vllm_omni.worker.gpu_ar_model_runner import _committed_num_scheduled_tokens
+
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens=drafts)
+    assert _committed_num_scheduled_tokens(scheduler_output, sampled, "r", 0, num_scheduled) == expected

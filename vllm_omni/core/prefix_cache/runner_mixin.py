@@ -177,7 +177,10 @@ class PrefixCacheRunnerMixin:
             self._omni_prefix_cache_cfg = None
 
     def _prefix_cache_materialize(
-        self, step_id: int | None, req_ids: list[str]
+        self,
+        step_id: int | None,
+        req_ids: list[str],
+        committed: dict[str, int] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
         """Per-request merged outputs for a saved step.
 
@@ -185,8 +188,9 @@ class PrefixCacheRunnerMixin:
         ``input_batch`` (under async output this runs a step late).
         ``step_id`` None means save did not run — nothing to consume.
         ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
+        ``committed`` caps each request's rows from this step; see ``materialize``.
         """
         if step_id is None or self.omni_prefix_cache is None:
             return None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
+        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids), committed)
         return outs.hidden_states, (outs.mm_outputs or None)

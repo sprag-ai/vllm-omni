@@ -69,13 +69,23 @@ def test_decode_rows_are_consumed_one_per_step_in_arrival_order():
     assert payload["embed"]["cached_decode"] is None
 
 
-@pytest.mark.parametrize(("v2", "resumable"), [(True, True), (False, False), (False, True)])
-def test_v1_and_resumable_requests_keep_the_indexed_cache_path(v2, resumable):
+def test_v2_resumable_requests_keep_the_indexed_cache_path():
     model = _talker()
-    model.vllm_config.model_config.use_v2_model_runner = v2
-    payload = {"embed": {"cached_decode": _rows(1, 2, 3), "decode": None}, "meta": {"resumable": resumable}}
+    payload = {"embed": {"cached_decode": _rows(1, 2, 3), "decode": None}, "meta": {"resumable": True}}
     payload["meta"]["num_processed_tokens"] = 2
     assert _step(model, payload)[0].item() == 3
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+def test_v1_speaks_every_row_of_a_speculative_chunk(resumable):
+    model = _talker()
+    model.vllm_config.model_config.use_v2_model_runner = False
+    payload = {"embed": {"cached_decode": None, "decode": _rows(1, 2, 3)}, "meta": {"resumable": resumable}}
+    steps = [_step(model, payload)[0].item()]
+    for arrival in (None, _rows(4), None, None):
+        payload["embed"]["decode"] = arrival
+        steps.append(_step(model, payload)[0].item())
+    assert steps == [1, 2, 3, 4, -1]
 
 
 def test_make_omni_output_aligns_codes_to_request_spans():

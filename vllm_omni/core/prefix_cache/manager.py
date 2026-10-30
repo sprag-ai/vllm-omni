@@ -647,7 +647,12 @@ class OmniPrefixCacheManager:
             raise
 
     @torch.inference_mode()
-    def materialize(self, step_id: int, req_ids: list[str]) -> StageCacheOutputs:
+    def materialize(
+        self,
+        step_id: int,
+        req_ids: list[str],
+        committed: dict[ReqId, int] | None = None,
+    ) -> StageCacheOutputs:
         """Per-request merged outputs for the step saved as `step_id`.
 
         Any thread. `req_ids` must be (a subset of) the save-time snapshot;
@@ -656,6 +661,11 @@ class OmniPrefixCacheManager:
         this step's rows — normal path, nothing logged. A hit span that
         resolves to absent rows raises OmniPrefixCacheUnmatchError: fatal
         by contract (do not pretend it was a miss).
+
+        ``committed`` caps a request's rows from this step. A speculative step
+        saves rows for its rejected draft tokens too, as vLLM writes their KV:
+        the next step rewrites those slots before any block hash covers them.
+        The cap keeps them out of what is emitted downstream.
 
         Two phases: under the lock, publish finished writes and pin every
         row source (task refs + masks, absent checks included) — not yet
@@ -681,6 +691,10 @@ class OmniPrefixCacheManager:
                     )
 
                 cached_keys = ctx.cached_keys
+                num_keep = {
+                    r: min(e - s, int(committed[r])) if committed is not None and r in committed else e - s
+                    for r, (s, e) in ctx.spans.items()
+                }
 
                 hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}
                 for req_id in req_ids:
@@ -717,7 +731,7 @@ class OmniPrefixCacheManager:
                 hidden_out = {}
                 for req_id in req_ids:
                     hidden_out[req_id] = self._merge_cached_for_req(
-                        ctx, req_id, hidden_key, current[hidden_key], hit_sources
+                        ctx, req_id, hidden_key, current[hidden_key], hit_sources, num_keep[req_id]
                     )
 
             mm_out: dict[str, dict[str, Any]] = {}
@@ -730,10 +744,11 @@ class OmniPrefixCacheManager:
                     # Leftover snapshot; spans stay within [0, n), no re-slice.
                     cur = val
                 mm_out[key] = {
-                    req_id: self._merge_cached_for_req(ctx, req_id, key, cur, hit_sources) for req_id in req_ids
+                    req_id: self._merge_cached_for_req(ctx, req_id, key, cur, hit_sources, num_keep[req_id])
+                    for req_id in req_ids
                 }
 
-            self._merge_uncached_mm(ctx, req_ids, cached_keys, mm_out)
+            self._merge_uncached_mm(ctx, req_ids, cached_keys, mm_out, num_keep)
             return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
         finally:
             if ctx is not None and not step_released:
@@ -1277,8 +1292,9 @@ class OmniPrefixCacheManager:
         key: str,
         current_cpu: torch.Tensor,
         hit_sources: dict[tuple[str, str], _SlotRef | Future],
+        keep: int,
     ) -> torch.Tensor:
-        """Hit prefix + this step's rows for one (req, key).
+        """Hit prefix + the first ``keep`` of this step's rows for one (req, key).
 
         No hit → this step's slice only. Prefetch Future → write the
         slice into the reserved tail. Else cat(fetch, new).
@@ -1287,16 +1303,16 @@ class OmniPrefixCacheManager:
         new_rows = current_cpu[start:end]
         src = hit_sources.get((req_id, key))
         if src is None:
-            return new_rows
+            return new_rows[:keep]
         if isinstance(src, Future):
             # Prefetched during the forward, prefix already in place; only
             # this step's rows land here. result() re-raises fetch/validation
             # errors — unread hits still raise after the thread hop.
             merged = src.result()
             merged[merged.shape[0] - new_rows.shape[0] :] = new_rows
-            return merged
+            return merged[: merged.shape[0] - new_rows.shape[0] + keep]
         cached = self._fetch_source(src)
-        return torch.cat([cached, new_rows], dim=0)
+        return torch.cat([cached, new_rows[:keep]], dim=0)
 
     def _merge_uncached_mm(
         self,
@@ -1304,6 +1320,7 @@ class OmniPrefixCacheManager:
         req_ids: list[str],
         cached_keys: set[str],
         mm_out: dict[str, dict[str, Any]],
+        num_keep: dict[str, int],
     ) -> None:
         """Write leftover mm that is not a pool key into mm_out.
 
@@ -1322,12 +1339,12 @@ class OmniPrefixCacheManager:
             per_req: dict[str, Any] = {}
             for req_id in req_ids:
                 idx = order.index(req_id)
-                start, end = ctx.spans[req_id]
+                start, _ = ctx.spans[req_id]
                 per_req[req_id] = to_payload_element(
                     val,
                     idx,
                     start=start,
-                    end=end,
+                    end=start + num_keep[req_id],
                     pass_lists_through=True,
                     seq_len=total_length,
                 )

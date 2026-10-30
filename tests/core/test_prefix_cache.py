@@ -1148,6 +1148,64 @@ def test_save_slot_mismatch_fails_fast():
         )
 
 
+def _save_rows(mgr, view, req_id, blocks, start_pos, rows, *, hit=0) -> int:
+    """One single-request step whose hidden rows are given rather than derived from slots."""
+    view.order = [req_id]
+    view.req_blocks[req_id], view.computed[req_id] = blocks, start_pos
+    n = int(rows.shape[0])
+    view.step_slot_mapping = view.slots_for(req_id, start_pos, start_pos + n)
+    new_req = FakeNewReq(req_id, num_computed_tokens=hit, block_ids=[list(blocks)])
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(FakeSchedOut(new_reqs=[new_req], num_scheduled={req_id: n}))
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+    return mgr.save_outputs(rows, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
+
+
+def test_materialize_caps_a_speculative_step_at_its_committed_rows():
+    """Rows for rejected drafts are saved but never emitted downstream.
+
+    Both requests verify drafts over 4 rows. `a` keeps 2; `b` has no entry and
+    keeps its full span, as a request without drafts does.
+    """
+    mgr, view = make_manager()
+    sid = run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4)})
+
+    outs = mgr.materialize(sid, ["a", "b"], committed={"a": 2})
+
+    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 2)))
+    assert torch.equal(outs.hidden_states["b"], expected_rows(view.slots_for("b", 0, 4)))
+
+
+def test_rejected_draft_rows_are_rewritten_before_a_hit_reads_them():
+    """The write side keeps rejected rows, as vLLM keeps their KV.
+
+    `a` prefills block 0, then verifies drafts at positions 4..8 and accepts one,
+    so the rows for 6..8 came from rejected inputs. The next step re-runs 6..10
+    with committed tokens. A later hit on blocks 0 and 1 covers positions 6 and 7
+    and must read the rewritten rows, not the rejected ones.
+    """
+    mgr, view = make_manager()
+    view.req_blocks["a"] = [0, 1, 2]
+    true_rows = expected_rows(view.slots_for("a", 0, 12))
+    rejected = torch.full((3, HIDDEN), -1.0, dtype=DTYPE)
+
+    mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 0, true_rows[:4].clone()), ["a"])
+    verify = torch.cat([true_rows[4:6], rejected])
+    outs = mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 4, verify), ["a"], committed={"a": 2})
+    assert torch.equal(outs.hidden_states["a"], true_rows[4:6])
+    mgr.materialize(_save_rows(mgr, view, "a", [0, 1, 2], 6, true_rows[6:11].clone()), ["a"])
+
+    view.req_blocks["b"] = [0, 1, 3]
+    b_row = expected_rows(view.slots_for("b", 8, 9))
+    merged = mgr.materialize(_save_rows(mgr, view, "b", [0, 1, 3], 8, b_row.clone(), hit=8), ["b"]).hidden_states["b"]
+
+    assert torch.equal(merged[:8], true_rows[:8])
+    assert torch.equal(merged[8:], b_row)
+
+
 def test_materialize_rejects_out_of_snapshot_ids():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
