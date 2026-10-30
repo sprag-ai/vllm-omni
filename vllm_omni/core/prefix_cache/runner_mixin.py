@@ -97,11 +97,7 @@ class PrefixCacheRunnerMixin:
         self._omni_prefix_cache_cfg = None
         if cfg is None or not get_pp_group().is_last_rank:
             return
-        view = get_prefix_cache_group_view(
-            self.input_batch,
-            cfg.block_size,
-            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
-        )
+        view = self._create_prefix_cache_group_view(cfg)
         if view is None:
             raise OmniPrefixCacheUnmatchError(
                 "omni prefix caching requires a block table on the input batch; "
@@ -112,6 +108,18 @@ class PrefixCacheRunnerMixin:
         self.omni_prefix_cache = manager
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = view
+
+    def _create_prefix_cache_group_view(self, cfg: PrefixCacheConfig) -> Any:
+        """Build the KV-cache group view the manager writes through.
+
+        Returns:
+            The view, or None when the runner has no block table to read.
+        """
+        return get_prefix_cache_group_view(
+            self.input_batch,
+            cfg.block_size,
+            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
+        )
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
         """Per-step lifecycle entry; must run before ``_update_states``
