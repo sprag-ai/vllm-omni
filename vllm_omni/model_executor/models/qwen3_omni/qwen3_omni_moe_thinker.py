@@ -575,6 +575,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
         captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
+        aux_hidden_states = self._maybe_add_hidden_state([], self.start_layer, hidden_states, residual)
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
             for layer_idx in capture_set:
@@ -604,6 +605,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
 
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             captured = (
@@ -620,10 +622,9 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             # the dict in one expression instead; the contents are identical.
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual, **captured})
         hidden_states, _ = self.norm(hidden_states, residual)
-        if captured_hidden_states is not None:
-            return hidden_states, captured_hidden_states
-        else:
-            return hidden_states, None
+        if aux_hidden_states:
+            return hidden_states, captured_hidden_states, aux_hidden_states
+        return hidden_states, captured_hidden_states
 
 
 class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
@@ -1450,17 +1451,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             if isinstance(model_output, IntermediateTensors):
                 model_output[_get_capture_key(_EMBEDDING_LAYER_INDEX)] = embedding_capture
             else:
-                model_output[-1]["hidden_states"]["layers"][_EMBEDDING_LAYER_INDEX] = embedding_capture
+                model_output[1]["hidden_states"]["layers"][_EMBEDDING_LAYER_INDEX] = embedding_capture
 
         if isinstance(model_output, IntermediateTensors):
             return model_output
-        hidden_states, captured_hidden_states = model_output
+        hidden_states, captured_hidden_states, *rest = model_output
+        aux_hidden_states = rest[0] if rest else None
         if capture_layer_indices is None and not return_hidden_states:
-            # No capture requested. Return a bare tensor: stock vLLM's
-            # GPUModelRunner indexes the forward output directly, so a tuple
-            # here breaks non-staged runs that resolve this class through the
-            # global registry (e.g. plain `vllm serve` of the thinker).
-            return hidden_states
+            # No capture requested. Return what stock vLLM's GPUModelRunner
+            # expects (a bare tensor, or the EAGLE-3 pair), so non-staged runs
+            # that resolve this class through the global registry keep working.
+            return (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
+        if aux_hidden_states:
+            return hidden_states, captured_hidden_states, aux_hidden_states
         return hidden_states, captured_hidden_states
 
     def compute_logits(
