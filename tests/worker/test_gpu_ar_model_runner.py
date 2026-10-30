@@ -2344,3 +2344,49 @@ def test_committed_rows_trim_to_the_accepted_prefix(drafts, sampled, num_schedul
 
     scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens=drafts)
     assert _committed_num_scheduled_tokens(scheduler_output, sampled, "r", 0, num_scheduled) == expected
+
+
+def test_one_token_decode_graphs_join_the_full_capture_group():
+    """One-token decode graphs are captured with the drafted ones, in one FULL group."""
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    from vllm_omni.worker.gpu_ar_model_runner import OneTokenDecodeCudagraphDispatcher
+
+    def dispatcher(full, piecewise=()):
+        d = object.__new__(OneTokenDecodeCudagraphDispatcher)
+        d.cudagraph_keys = {CUDAGraphMode.FULL: set(full), CUDAGraphMode.PIECEWISE: set(piecewise)}
+        d.keys_initialized = True
+        d.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+        return d
+
+    drafted = [BatchDescriptor(num_tokens=n, num_reqs=n // 4, uniform=True) for n in (4, 8)]
+    one_token = [BatchDescriptor(num_tokens=n, num_reqs=n, uniform=True) for n in (4, 8)]
+    piecewise = [BatchDescriptor(num_tokens=8, num_reqs=None, uniform=False)]
+    main = dispatcher(drafted, piecewise)
+    main.one_token_decode = dispatcher(one_token, piecewise)
+
+    groups = dict(main.get_capture_descs())
+
+    assert set(main.one_token_decode_descs()) == set(one_token)
+    assert set(groups[CUDAGraphMode.FULL]) == {*drafted, *one_token}
+    assert groups[CUDAGraphMode.PIECEWISE] == piecewise
+
+
+def test_an_idle_drafter_step_keeps_the_bookkeeping_and_drafts_nothing():
+    """A step the scheduler marks idle skips the drafter but still records the valid sampled counts."""
+    runner = object.__new__(GPUARModelRunner)
+    calls = []
+    runner.drafter = SimpleNamespace(
+        prepare_next_token_ids_padded=lambda *args: calls.append("prepare") or ("next", "count")
+    )
+    runner.requests, runner.input_batch = {}, object()
+    runner.discard_request_mask = SimpleNamespace(gpu=None)
+    runner._copy_valid_sampled_token_count = lambda next_ids, count: calls.append((next_ids, count))
+
+    drafts = runner.propose_draft_token_ids(
+        SimpleNamespace(skip_draft_kv_sync=True), torch.zeros(3, 1, dtype=torch.int64), None
+    )
+
+    assert drafts.shape == (3, 0)
+    assert calls == ["prepare", ("next", "count")]

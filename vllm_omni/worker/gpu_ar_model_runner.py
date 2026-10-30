@@ -12,7 +12,7 @@ from __future__ import annotations
 import gc
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple, cast
@@ -23,12 +23,13 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -44,6 +45,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.core.sched.adaptive_speculation import AdaptiveSpeculationConfig
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -101,6 +103,69 @@ def _committed_num_scheduled_tokens(
     if not sampled:
         return num_scheduled
     return min(num_scheduled, len(sampled))
+
+
+class OneTokenDecodeCudagraphDispatcher(CudagraphDispatcher):
+    """Graph dispatcher that also keeps FULL graphs for one-token decode batches.
+
+    A speculative stage captures FULL decode graphs only for batches of
+    ``1 + num_speculative_tokens`` tokens per request. A step that drafts nothing
+    is a one-token decode, which would otherwise replay piecewise with attention
+    launched outside the graph.
+
+    Attributes:
+        one_token_decode: Dispatcher whose uniform decode is one token per request,
+            holding the extra FULL keys; None until keys are initialized for a
+            speculative FULL decode mode.
+    """
+
+    one_token_decode: CudagraphDispatcher | None = None
+
+    def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1) -> None:
+        super().initialize_cudagraph_keys(cudagraph_mode, uniform_decode_query_len)
+        self.one_token_decode = None
+        if (
+            uniform_decode_query_len > 1
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and cudagraph_mode.separate_routine()
+        ):
+            one_token = CudagraphDispatcher(self.vllm_config)
+            one_token.uniform_decode_query_len = 1
+            # The shared sizes are rounded up to multiples of the drafted query length,
+            # which would pad a lone decode to that many tokens through every expert.
+            sizes = self.compilation_config.cudagraph_capture_sizes or []
+            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+            one_token_sizes = sorted({1, 2, *(size for size in sizes if size <= max_num_seqs)})
+            one_token.compilation_config = copy(self.compilation_config)
+            one_token.compilation_config.cudagraph_capture_sizes = one_token_sizes
+            one_token.compilation_config.max_cudagraph_capture_size = one_token_sizes[-1]
+            one_token.initialize_cudagraph_keys(cudagraph_mode, 1)
+            # Only its FULL decode graphs are captured; piecewise shapes stay with the main keys.
+            one_token.cudagraph_keys[CUDAGraphMode.PIECEWISE].clear()
+            self.one_token_decode = one_token
+
+    def one_token_decode_descs(self) -> list[BatchDescriptor]:
+        """FULL descriptors of one-token decode batches the main keys lack."""
+        if self.one_token_decode is None:
+            return []
+        own = self.cudagraph_keys[CUDAGraphMode.FULL]
+        return [d for d in self.one_token_decode.cudagraph_keys[CUDAGraphMode.FULL] if d.uniform and d not in own]
+
+    def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
+        extra = self.one_token_decode_descs()
+        if not extra:
+            return super().get_capture_descs()
+        # One FULL group: graph-memory profiling keeps one estimate per mode.
+        result = []
+        merged = False
+        for mode, descs in super().get_capture_descs():
+            if mode == CUDAGraphMode.FULL:
+                descs = sorted([*descs, *extra], key=lambda d: (d.num_tokens, d.num_active_loras), reverse=True)
+                merged = True
+            result.append((mode, descs))
+        if not merged:
+            result.append((CUDAGraphMode.FULL, sorted(extra, key=lambda d: d.num_tokens, reverse=True)))
+        return result
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -448,6 +513,54 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        if self.speculative_config is not None and AdaptiveSpeculationConfig.from_additional_config(
+            self.vllm_config.additional_config
+        ):
+            self.cudagraph_dispatcher = OneTokenDecodeCudagraphDispatcher(self.vllm_config)
+
+    @contextmanager
+    def _one_token_decode_shapes(self):
+        """Dispatch and build batches as one-token decodes for the duration of the block."""
+        dispatcher, query_len = self.cudagraph_dispatcher, self.uniform_decode_query_len
+        assert isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher) and dispatcher.one_token_decode is not None
+        self.cudagraph_dispatcher, self.uniform_decode_query_len = dispatcher.one_token_decode, 1
+        try:
+            yield
+        finally:
+            self.cudagraph_dispatcher, self.uniform_decode_query_len = dispatcher, query_len
+
+    def propose_draft_token_ids(self, scheduler_output: SchedulerOutput, sampled_token_ids, *args, **kwargs):
+        if not getattr(scheduler_output, "skip_draft_kv_sync", False) or not isinstance(
+            sampled_token_ids, torch.Tensor
+        ):
+            return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
+        # Every running request is retired from drafting, so its drafter cache is
+        # never read again. Keep only the sampled-token bookkeeping async scheduling needs.
+        next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+            sampled_token_ids, self.requests, self.input_batch, self.discard_request_mask.gpu
+        )
+        self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+        return torch.empty(sampled_token_ids.shape[0], 0, dtype=torch.int64, device=sampled_token_ids.device)
+
+    def _warmup_and_capture(self, desc: BatchDescriptor, *args, **kwargs):
+        dispatcher = self.cudagraph_dispatcher
+        if isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher) and desc in dispatcher.one_token_decode_descs():
+            with self._one_token_decode_shapes():
+                return super()._warmup_and_capture(desc, *args, **kwargs)
+        return super()._warmup_and_capture(desc, *args, **kwargs)
+
+    def _determine_batch_execution_and_padding(self, num_tokens: int, num_reqs: int, *args, **kwargs):
+        dispatcher = self.cudagraph_dispatcher
+        if (
+            isinstance(dispatcher, OneTokenDecodeCudagraphDispatcher)
+            and dispatcher.one_token_decode is not None
+            and kwargs.get("force_uniform_decode") is None
+            and kwargs.get("max_num_scheduled_tokens") == 1
+            and num_tokens == num_reqs
+        ):
+            with self._one_token_decode_shapes():
+                return super()._determine_batch_execution_and_padding(num_tokens, num_reqs, *args, **kwargs)
+        return super()._determine_batch_execution_and_padding(num_tokens, num_reqs, *args, **kwargs)
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
