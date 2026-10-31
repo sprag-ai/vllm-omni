@@ -223,6 +223,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
             else None
         )
+        # Live requests whose final stage is this one: no payload is built or sent for them.
+        self._final_stage_req_ids: set[str] = set()
 
     def _validate_parallel_support(self) -> None:
         parallel_config = self.vllm_config.parallel_config
@@ -291,8 +293,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        self._final_stage_req_ids.difference_update(getattr(scheduler_output, "finished_req_ids", ()))
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
             if is_warmup_request(request_data.req_id):
+                continue
+            if not self._request_needs_downstream_payload(request_data):
+                self._final_stage_req_ids.add(request_data.req_id)
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
@@ -304,6 +310,24 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             plane.request_terminal(natural_terminal_req_ids)
         if aborted_req_ids:
             plane.abort_requests(aborted_req_ids)
+
+    def _request_needs_downstream_payload(self, request_data: Any) -> bool:
+        """Whether a new request needs this stage's outputs after this stage.
+
+        A request whose final stage is this one (text-only output from the
+        Thinker, for example) needs none. Models that return multimodal
+        outputs to the client, single-stage audio models, and requests without
+        a final-stage marker keep the payload.
+        """
+        if getattr(self.model, "omni_client_multimodal_output_keys", ()):
+            return True
+        if (getattr(self.model_config, "engine_output_type", None) or "").lower() == "audio":
+            return True
+        info = _resolve_additional_information(getattr(request_data, "additional_information", None))
+        final_stage_id = info.get("omni_final_stage_id")
+        if final_stage_id is None:
+            return True
+        return int(final_stage_id) > getattr(self.model_config, "stage_id", 0)
 
     def _sync_native_data_plane_payloads(
         self,

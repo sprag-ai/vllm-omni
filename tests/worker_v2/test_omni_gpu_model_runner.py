@@ -68,6 +68,7 @@ def _make_runner():
     runner.model_config = SimpleNamespace(logits_processors=None)
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
+    runner._final_stage_req_ids = set()
     return runner
 
 
@@ -198,11 +199,60 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip(warmup_r
     plane.abort_requests.assert_called_once_with({"aborted"})
 
 
+def test_requests_that_end_at_this_stage_skip_the_data_plane():
+    runner = _make_runner()
+    runner.model = SimpleNamespace()
+    runner.model_config = object.__new__(OmniModelConfig)
+    runner.model_config.async_chunk = True
+    runner.model_config.stage_id = 0
+    runner.model_config.engine_output_type = "latent"
+    plane = MagicMock()
+    runner._omni_data_plane = plane
+    text_only = SimpleNamespace(req_id="text", additional_information={"omni_final_stage_id": 0})
+    spoken = SimpleNamespace(req_id="spoken", additional_information={"omni_final_stage_id": 2})
+    unmarked = SimpleNamespace(req_id="unmarked", additional_information=None)
+    step = SimpleNamespace(
+        scheduled_new_reqs=[text_only, spoken, unmarked],
+        pending_input_registrations=[],
+        data_plane_terminal_req_ids=set(),
+        finished_req_ids=set(),
+    )
+
+    runner._prepare_native_data_plane(step)
+
+    assert [call.args[0].req_id for call in plane.register_request.call_args_list] == ["spoken", "unmarked"]
+    assert runner._final_stage_req_ids == {"text"}
+
+    runner._prepare_native_data_plane(
+        SimpleNamespace(
+            scheduled_new_reqs=[],
+            pending_input_registrations=[],
+            data_plane_terminal_req_ids=set(),
+            finished_req_ids={"text"},
+        )
+    )
+    assert runner._final_stage_req_ids == set()
+
+
+@pytest.mark.parametrize(
+    ("model_attrs", "output_type"),
+    [({"omni_client_multimodal_output_keys": ("audio",)}, "latent"), ({}, "audio")],
+)
+def test_client_and_single_stage_audio_outputs_keep_the_payload(model_attrs, output_type):
+    runner = _make_runner()
+    runner.model = SimpleNamespace(**model_attrs)
+    runner.model_config = SimpleNamespace(stage_id=0, engine_output_type=output_type)
+    request = SimpleNamespace(req_id="r1", additional_information={"omni_final_stage_id": 0})
+
+    assert runner._request_needs_downstream_payload(request)
+
+
 def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()
     runner.model_config = object.__new__(OmniModelConfig)
     runner.model_config.async_chunk = False
+    runner._final_stage_req_ids = set()
     plane = mocker.Mock()
     runner._omni_data_plane = plane
     scheduler_output = SchedulerOutput.make_empty()

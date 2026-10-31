@@ -267,7 +267,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Omni: pooler_output ---
         engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
-        need_pooler = engine_output_type != "text"
+        need_pooler = self._batch_needs_pooler(engine_output_type, input_batch.req_ids)
 
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
@@ -336,6 +336,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    def _batch_needs_pooler(self, engine_output_type: str, req_ids: list[str]) -> bool:
+        """Whether this step's outputs are copied out for a later stage or the client.
+
+        False for text-output stages, and for batches whose requests all end at this stage.
+        """
+        if engine_output_type == "text":
+            return False
+        return any(req_id not in self._final_stage_req_ids for req_id in req_ids)
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
