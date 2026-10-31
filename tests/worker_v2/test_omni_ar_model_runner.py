@@ -980,3 +980,19 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+@pytest.mark.parametrize(
+    ("output_type", "req_ids", "expected"),
+    [
+        ("text", ["spoken"], False),
+        ("latent", ["text_a", "text_b"], False),
+        ("latent", ["text_a", "spoken"], True),
+        ("latent", ["spoken"], True),
+    ],
+)
+def test_outputs_are_copied_only_when_a_request_needs_them(output_type, req_ids, expected):
+    runner = object.__new__(OmniARModelRunner)
+    runner._final_stage_req_ids = {"text_a", "text_b"}
+
+    assert runner._batch_needs_pooler(output_type, req_ids) is expected

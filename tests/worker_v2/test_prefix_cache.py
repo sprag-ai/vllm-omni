@@ -1,241 +1,221 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Model Runner V2 binding of the omni prefix cache."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
-from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
-from vllm_omni.worker_v2.prefix_cache import SchedulerBlockView
+import vllm_omni.worker_v2.prefix_cache as mrv2_prefix_cache
+from tests.worker_v2.test_omni_ar_model_runner import _async_output
+from vllm_omni.core.prefix_cache import MRv2FullAttentionGroupView
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.prefix_cache import PrefixCacheRewrite
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-BLOCK_SIZE = 4
-HIDDEN = 3
 
+class _FakePrefixCache:
+    """Merged rows: each rewritten request gets ``prefix[req_id]``."""
 
-def _new_req(req_id, block_ids, num_computed=0):
-    return SimpleNamespace(req_id=req_id, block_ids=(list(block_ids),), num_computed_tokens=num_computed)
+    def __init__(self, rewrite_ids=(), *, prefix=None, fail=False):
+        self.rewrite_ids = frozenset(rewrite_ids)
+        self.prefix = prefix or {}
+        self.fail = fail
+        self.consumed: list[tuple[str, int]] = []
 
+    def step_rewrite_req_ids(self, step_id):
+        return self.rewrite_ids
 
-def _sched(*, new=(), cached=(), finished=(), preempted=(), scheduled=None):
-    cached_reqs = SimpleNamespace(
-        req_ids=[req_id for req_id, _, _ in cached],
-        num_computed_tokens=[computed for _, computed, _ in cached],
-        new_block_ids=[None if blocks is None else (list(blocks),) for _, _, blocks in cached],
-        resumed_req_ids=set(),
-    )
-    return SimpleNamespace(
-        scheduled_new_reqs=list(new),
-        scheduled_cached_reqs=cached_reqs,
-        finished_req_ids=set(finished),
-        preempted_req_ids=set(preempted),
-        num_scheduled_tokens=dict(scheduled or {}),
-    )
-
-
-def _rows(values):
-    return torch.tensor(values, dtype=torch.float32).unsqueeze(1).expand(len(values), HIDDEN).clone()
-
-
-def _step(manager, adapter, view, scheduler_output, rows):
-    """Run one engine step through the view, adapter and manager; returns the step id."""
-    step = adapter.translate_step(scheduler_output)
-    manager.new_step_starts(step)
-    view.observe(scheduler_output)
-    view.bind_batch(list(scheduler_output.num_scheduled_tokens))
-    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
-    return manager.save_outputs(
-        rows,
-        {},
-        num_tokens_unpadded=rows.shape[0],
-        num_tokens_padded=rows.shape[0],
-        write_layout=layout,
-    )
-
-
-def test_prefix_hit_merges_the_rows_an_earlier_request_computed():
-    manager = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=16, block_size=BLOCK_SIZE), eager=True)
-    adapter = PrefixCacheSchedulerAdapter()
-    view = SchedulerBlockView(BLOCK_SIZE)
-
-    prompt_rows = _rows(range(10, 18))
-    first = _step(manager, adapter, view, _sched(new=[_new_req("a", [0, 1])], scheduled={"a": 8}), prompt_rows)
-    manager.materialize(first, ["a"])
-    decode = _step(manager, adapter, view, _sched(cached=[("a", 8, [2])], scheduled={"a": 1}), _rows([18]))
-    manager.materialize(decode, ["a"])
-
-    tail_rows = _rows([90, 91])
-    hit = _step(
-        manager,
-        adapter,
-        view,
-        _sched(new=[_new_req("b", [0, 1, 5], num_computed=8)], finished=["a"], scheduled={"b": 2}),
-        tail_rows,
-    )
-    merged = manager.materialize(hit, ["b"]).hidden_states["b"]
-
-    assert torch.equal(merged, torch.cat([prompt_rows, tail_rows]))
-
-
-def _runner(monkeypatch):
-    import vllm.distributed.parallel_state as parallel_state
-
-    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
-    runner = object.__new__(OmniARModelRunner)
-    runner.is_pooling_model = False
-    runner.omni_prefix_cache = OmniPrefixCacheManager(
-        PrefixCacheConfig(num_blocks=16, block_size=BLOCK_SIZE), eager=True
-    )
-    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
-    runner._prefix_cache_group_view = SchedulerBlockView(BLOCK_SIZE)
-    return runner
-
-
-def _runner_step(runner, scheduler_output, rows):
-    runner._begin_prefix_cache_step(scheduler_output)
-    batch = SimpleNamespace(
-        req_ids=list(scheduler_output.num_scheduled_tokens),
-        num_tokens=rows.shape[0],
-        num_tokens_after_padding=rows.shape[0],
-    )
-    return runner._save_prefix_cache_step(rows, {}, batch)
-
-
-def test_runner_holds_only_steps_with_a_prefix_hit(monkeypatch):
-    runner = _runner(monkeypatch)
-    prompt_rows = _rows(range(10, 18))
-
-    assert _runner_step(runner, _sched(new=[_new_req("a", [0, 1])], scheduled={"a": 8}), prompt_rows) is None
-    hit = _runner_step(
-        runner,
-        _sched(new=[_new_req("b", [0, 1, 5], num_computed=8)], finished=["a"], scheduled={"b": 1}),
-        _rows([90]),
-    )
-
-    assert hit is not None and hit[1] == ["b"]
-    merged = runner.omni_prefix_cache.materialize(hit[0], ["b"]).hidden_states["b"]
-    assert torch.equal(merged, torch.cat([prompt_rows, _rows([90])]))
-
-
-def test_runner_skips_vllm_warmup_steps(monkeypatch):
-    runner = _runner(monkeypatch)
-
-    saved = _runner_step(runner, _sched(new=[_new_req("_warmup_0_", [0])], scheduled={"_warmup_0_": 2}), _rows([1, 2]))
-
-    assert saved is None
-    assert runner._prefix_cache_step is None
-
-
-def _kv_cache_runner(monkeypatch, engine_output_type):
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
-
-    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-
-    monkeypatch.setattr(OmniGPUModelRunner, "initialize_kv_cache", lambda *args, **kwargs: None)
-    runner = object.__new__(OmniARModelRunner)
-    group = SimpleNamespace(kv_cache_spec=object.__new__(FullAttentionSpec))
-    runner.kv_cache_config = SimpleNamespace(num_blocks=16, kv_cache_groups=[group])
-    runner.cache_config = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
-    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
-    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=64, max_model_len=128)
-    runner.model_config = SimpleNamespace(engine_output_type=engine_output_type, max_model_len=128)
-    runner.is_pooling_model = False
-    runner.speculative_config = None
-    return runner
-
-
-def test_text_output_stage_runs_no_prefix_cache(monkeypatch):
-    runner = _kv_cache_runner(monkeypatch, "text")
-    runner.speculative_config = object()
-
-    runner.initialize_kv_cache(runner.kv_cache_config)
-
-    assert runner._omni_prefix_cache_cfg is None
-
-
-def test_payload_stage_stages_a_prefix_cache_config(monkeypatch):
-    runner = _kv_cache_runner(monkeypatch, "latent")
-
-    runner.initialize_kv_cache(runner.kv_cache_config)
-
-    assert runner._omni_prefix_cache_cfg.block_size == BLOCK_SIZE
-
-
-def test_view_maps_positions_through_appended_blocks():
-    view = SchedulerBlockView(BLOCK_SIZE)
-    view.observe(_sched(new=[_new_req("a", [7])], scheduled={"a": 4}))
-    view.observe(_sched(cached=[("a", 4, [2])], scheduled={"a": 2}))
-
-    assert view.step_slots_cpu(["a"], {"a": 2}).tolist() == [8, 9]
-
-
-def test_view_forgets_finished_and_preempted_requests():
-    view = SchedulerBlockView(BLOCK_SIZE)
-    view.observe(_sched(new=[_new_req("a", [0]), _new_req("b", [1])], scheduled={"a": 1, "b": 1}))
-    view.observe(_sched(finished=["a"], preempted=["b"]))
-
-    for req_id in ("a", "b"):
-        with pytest.raises(OmniPrefixCacheUnmatchError):
-            view.step_slots_cpu([req_id], {req_id: 1})
-
-
-def test_view_refuses_a_position_past_the_mirrored_blocks():
-    view = SchedulerBlockView(BLOCK_SIZE)
-    view.observe(_sched(new=[_new_req("a", [0])], scheduled={"a": 5}))
-
-    with pytest.raises(OmniPrefixCacheUnmatchError):
-        view.step_slots_cpu(["a"], {"a": 5})
-
-
-class _RecordingManager:
-    def __init__(self, merged):
-        self.merged = merged
-        self.calls = []
-
-    def materialize(self, step_id, req_ids):
-        self.calls.append(("materialize", step_id, list(req_ids)))
-        return self.merged
+    def materialize(self, step_id, req_ids, *, include_uncached=True):
+        assert include_uncached is False
+        self.consumed.append(("materialize", step_id))
+        if self.fail:
+            raise RuntimeError("materialize failed")
+        hidden = {r: self.prefix[r]["hidden"] for r in req_ids}
+        mm = {"codes.audio": {r: self.prefix[r]["codes.audio"] for r in req_ids}}
+        return SimpleNamespace(hidden_states=hidden, mm_outputs=mm)
 
     def discard_step(self, step_id):
-        self.calls.append(("discard", step_id))
+        self.consumed.append(("discard", step_id))
 
 
-def _async_output(manager, req_ids, hit_req_ids):
-    output = object.__new__(OmniAsyncOutput)
-    output.model_runner_output = SimpleNamespace(req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)})
-    output._num_reqs = len(req_ids)
-    output._prefix_cache_hits = (manager, 7, hit_req_ids)
-    return output
+@pytest.mark.parametrize("opted_in", [False, True])
+def test_policy_is_native_kv_only_unless_model_opts_in(opted_in):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._snapshot_prefix_cache_model_policy(SimpleNamespace(supports_mrv2_prefix_cache_outputs=opted_in))
+    assert runner._omni_cache_policy.native_kv_cache_only is (not opted_in)
+    assert runner._omni_cache_policy.needs_full_hidden_states is opted_in
 
 
-def test_hit_payload_keeps_the_step_keys_the_cache_does_not_hold():
-    prefix = torch.ones(5, HIDDEN)
-    merged = SimpleNamespace(hidden_states={"b": prefix}, mm_outputs={"hidden.24": {"b": prefix}})
-    manager = _RecordingManager(merged)
-    output = _async_output(manager, ["a", "b"], ["b"])
-    step_payloads = [{"hidden.24": torch.zeros(1, HIDDEN)}, {"hidden.24": torch.zeros(2, HIDDEN), "embed.sampled": 1}]
+def test_tracking_adapter_and_ledger_view():
+    runner = object.__new__(OmniGPUModelRunner)
+    adapter = runner._new_prefix_cache_adapter()
+    assert adapter._track
+    view = runner._build_prefix_cache_group_view(SimpleNamespace(block_size=16), adapter)
+    assert isinstance(view, MRv2FullAttentionGroupView) and view.block_size == 16
 
-    payloads = output._overlay_prefix_hit_payloads(
-        step_payloads, output._take_prefix_cache_payloads(merge=True, include_hidden=False)
+
+def test_shutdown_releases_cache_after_runner_resources(monkeypatch):
+    calls = []
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._omni_data_plane = SimpleNamespace(close=lambda: calls.append("plane"))
+    runner._shutdown_omni_prefix_cache = lambda: calls.append("prefix_cache")
+    monkeypatch.setattr(GPUModelRunner, "shutdown", lambda self: calls.append("upstream"))
+    runner.shutdown()
+    assert calls == ["plane", "prefix_cache", "upstream"]
+
+
+def _init_runner(monkeypatch, cfg, *, block_sizes=(16,), dcp_size=1, concurrent=2):
+    runner = object.__new__(OmniGPUModelRunner)
+    for name in ("kv_cache_config", "cache_config", "scheduler_config", "model_config"):
+        setattr(runner, name, SimpleNamespace())
+    runner.is_pooling_model = False
+    runner.vllm_config = SimpleNamespace(max_concurrent_batches=concurrent, speculative_config=None)
+    runner.block_tables = SimpleNamespace(block_sizes=list(block_sizes))
+    runner.dcp_size = dcp_size
+    runner._shutdown_omni_prefix_cache = MagicMock()
+    runner._ensure_omni_prefix_cache = MagicMock()
+    monkeypatch.setattr(mrv2_prefix_cache, "stage_prefix_cache_config", MagicMock(return_value=cfg))
+    return runner
+
+
+def test_init_stages_config_with_async_depth(monkeypatch):
+    runner = _init_runner(monkeypatch, PrefixCacheConfig(num_blocks=8, block_size=16), concurrent=3)
+    runner._init_omni_prefix_cache(is_profiling=False)
+    runner._shutdown_omni_prefix_cache.assert_called_once()
+    runner._ensure_omni_prefix_cache.assert_called_once()
+    assert runner._omni_prefix_cache_cfg.staging_depth == 7
+
+    runner = _init_runner(monkeypatch, PrefixCacheConfig(num_blocks=8, block_size=16))
+    runner._init_omni_prefix_cache(is_profiling=True)
+    runner._ensure_omni_prefix_cache.assert_not_called()
+
+    runner = _init_runner(monkeypatch, None)
+    runner._init_omni_prefix_cache(is_profiling=False)
+    runner._ensure_omni_prefix_cache.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "dcp_size", "match"), [((32,), 1, "does not match"), ((16,), 2, "decode context")]
+)
+def test_init_refuses_unmirrored_layouts(monkeypatch, block_sizes, dcp_size, match):
+    cfg = PrefixCacheConfig(num_blocks=8, block_size=16)
+    runner = _init_runner(monkeypatch, cfg, block_sizes=block_sizes, dcp_size=dcp_size)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match=match):
+        runner._init_omni_prefix_cache(is_profiling=False)
+    runner._ensure_omni_prefix_cache.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("rewrite_ids", "output_type", "written_in_sample", "kept"),
+    [
+        ({"b"}, "latent", False, True),
+        (set(), "latent", False, False),
+        ({"b"}, "text", False, False),
+        ({"b"}, "latent", True, False),
+    ],
+)
+def test_save_keeps_step_only_for_rewrites(rewrite_ids, output_type, written_in_sample, kept):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.omni_prefix_cache = cache = _FakePrefixCache(rewrite_ids)
+    runner._prefix_cache_group_view = view = MagicMock()
+    runner._omni_cache_policy = ModelCachePolicy(
+        needs_full_hidden_states=not written_in_sample, mm_outputs_written_in_sample=written_in_sample
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=output_type))
+    runner._prefix_cache_save_step = MagicMock(return_value=9)
+    batch = SimpleNamespace(req_ids=["a", "b", "pad"], num_reqs=2, num_tokens=3, num_tokens_after_padding=4)
+
+    rewrite = runner._prefix_cache_save_mrv2(batch, torch.zeros(4, 2), {})
+
+    assert [c.args[0] for c in view.bind.call_args_list] == [batch, None]
+    assert runner._prefix_cache_save_step.call_args.kwargs == {"num_tokens_unpadded": 3, "num_tokens_padded": 4}
+    if kept:
+        assert rewrite.rows == ((1, "b"),) and cache.consumed == []
+    else:
+        assert rewrite is None and cache.consumed == [("discard", 9)]
+
+
+def test_save_is_a_noop_without_cache():
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner._prefix_cache_save_step = MagicMock()
+    assert runner._prefix_cache_save_mrv2(SimpleNamespace(), torch.zeros(1), None) is None
+    runner._prefix_cache_save_step.assert_not_called()
+
+
+def test_finalizer_without_rewrite_is_the_base_finalizer():
+    base = MagicMock()
+    assert OmniARModelRunner._prefix_cache_output_finalizer(None, base, mergeable=False) is base
+
+
+def test_finalizer_refuses_model_owned_outputs():
+    cache = _FakePrefixCache({"hit"})
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="model-owned"):
+        OmniARModelRunner._prefix_cache_output_finalizer(PrefixCacheRewrite(cache, 2, ()), None, mergeable=False)
+    assert cache.consumed == [("discard", 2)]
+
+
+def _two_request_output(monkeypatch, finalize_output, *, async_chunk):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 3]),
+        num_scheduled_tokens=np.array([1, 2]),
+        num_tokens_after_padding=3,
+    )
+    return _async_output(
+        req_ids=["hit", "miss"],
+        sampler_output=SamplerOutput(torch.tensor([[1], [2]]), None, None, torch.tensor([1, 1]), torch.tensor([0, 0])),
+        num_sampled_tokens=torch.tensor([1, 1]),
+        text_hidden=torch.arange(6, dtype=torch.float32).reshape(3, 2),
+        multimodal_outputs={"codes": {"audio": torch.arange(3).reshape(3, 1)}},
+        input_batch=batch,
+        async_chunk=async_chunk,
+        finalize_output=finalize_output,
     )
 
-    assert payloads[0] is step_payloads[0]
-    assert payloads[1]["embed.sampled"] == 1
-    assert torch.equal(payloads[1]["hidden.24"], prefix)
-    assert "hidden" not in payloads[1]
-    assert manager.calls == [("materialize", 7, ["b"])]
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_rewrite_replaces_only_rewritten_payloads_before_publication(monkeypatch, async_chunk):
+    merged = {"hidden": torch.full((4, 2), 7.0), "codes.audio": torch.full((4, 1), 9)}
+    cache = _FakePrefixCache({"hit"}, prefix={"hit": merged})
+    published = []
+
+    def publish(output):
+        published.append([dict(p) for p in output.inter_stage_outputs])
+        return output
+
+    finalize = OmniARModelRunner._prefix_cache_output_finalizer(
+        PrefixCacheRewrite(cache, 5, ((0, "hit"),)), publish, mergeable=True
+    )
+    result = _two_request_output(monkeypatch, finalize, async_chunk=async_chunk).get_output()
+
+    [(hit, miss)] = published
+    assert torch.equal(hit["codes.audio"], merged["codes.audio"])
+    assert torch.equal(miss["codes.audio"], torch.tensor([[1], [2]]))
+    if async_chunk:
+        assert "hidden" not in hit
+    else:
+        assert torch.equal(hit["hidden"], merged["hidden"])
+        assert torch.equal(miss["hidden"], torch.tensor([[2.0, 3.0], [4.0, 5.0]]))
+        assert torch.equal(result.multimodal_outputs[0]["codes.audio"], merged["codes.audio"])
+    assert cache.consumed == [("materialize", 5)]
 
 
-def test_step_context_is_discarded_when_no_payload_reads_it():
-    manager = _RecordingManager(None)
-    output = _async_output(manager, ["a"], ["a"])
-
-    output._take_prefix_cache_payloads(merge=False, include_hidden=False)
-    output._take_prefix_cache_payloads(merge=True, include_hidden=False)
-
-    assert manager.calls == [("discard", 7)]
+def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
+    cache = _FakePrefixCache({"hit"}, fail=True)
+    rewrite = PrefixCacheRewrite(cache, 3, ((0, "hit"),))
+    finalize = OmniARModelRunner._prefix_cache_output_finalizer(rewrite, None, mergeable=True)
+    with pytest.raises(RuntimeError, match="materialize failed"):
+        _two_request_output(monkeypatch, finalize, async_chunk=False).get_output()
+    with pytest.raises(RuntimeError, match="already consumed"):
+        rewrite.discard()
+    assert cache.consumed == [("materialize", 3)]
