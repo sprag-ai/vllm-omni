@@ -114,6 +114,10 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
 
     def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
         super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        # A text-output stage builds no stage payload, so cached rows would never be read.
+        if getattr(self.model_config, "engine_output_type", "text") == "text":
+            self._omni_prefix_cache_cfg = None
+            return
         self._omni_prefix_cache_cfg = stage_prefix_cache_config(
             kv_cache_config=self.kv_cache_config,
             cache_config=self.cache_config,

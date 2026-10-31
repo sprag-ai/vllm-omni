@@ -131,6 +131,41 @@ def test_runner_skips_vllm_warmup_steps(monkeypatch):
     assert runner._prefix_cache_step is None
 
 
+def _kv_cache_runner(monkeypatch, engine_output_type):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    monkeypatch.setattr(OmniGPUModelRunner, "initialize_kv_cache", lambda *args, **kwargs: None)
+    runner = object.__new__(OmniARModelRunner)
+    group = SimpleNamespace(kv_cache_spec=object.__new__(FullAttentionSpec))
+    runner.kv_cache_config = SimpleNamespace(num_blocks=16, kv_cache_groups=[group])
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=64, max_model_len=128)
+    runner.model_config = SimpleNamespace(engine_output_type=engine_output_type, max_model_len=128)
+    runner.is_pooling_model = False
+    runner.speculative_config = None
+    return runner
+
+
+def test_text_output_stage_runs_no_prefix_cache(monkeypatch):
+    runner = _kv_cache_runner(monkeypatch, "text")
+    runner.speculative_config = object()
+
+    runner.initialize_kv_cache(runner.kv_cache_config)
+
+    assert runner._omni_prefix_cache_cfg is None
+
+
+def test_payload_stage_stages_a_prefix_cache_config(monkeypatch):
+    runner = _kv_cache_runner(monkeypatch, "latent")
+
+    runner.initialize_kv_cache(runner.kv_cache_config)
+
+    assert runner._omni_prefix_cache_cfg.block_size == BLOCK_SIZE
+
+
 def test_view_maps_positions_through_appended_blocks():
     view = SchedulerBlockView(BLOCK_SIZE)
     view.observe(_sched(new=[_new_req("a", [7])], scheduled={"a": 4}))
