@@ -28,12 +28,6 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 
-from vllm_omni.core.prefix_cache import stage_prefix_cache_config
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind
-from vllm_omni.core.prefix_cache.group_view import check_prefix_cache_kv_groups
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
-from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
@@ -41,13 +35,10 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
-from vllm_omni.worker.output.payload_build import build_combined_prefix_cache_mm_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
-from vllm_omni.worker_v2.prefix_cache import SchedulerBlockView
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
-from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -99,7 +90,7 @@ def _guard_graph_replay_for_pooler_copy(
         main_stream.wait_event(copy_event)
 
 
-class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
+class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -111,91 +102,6 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
         self._async_mm_snapshot_pending = [False] * 4
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
-
-    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
-        super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
-        # A text-output stage builds no stage payload, so cached rows would never be read.
-        if getattr(self.model_config, "engine_output_type", "text") == "text":
-            self._omni_prefix_cache_cfg = None
-            return
-        self._omni_prefix_cache_cfg = stage_prefix_cache_config(
-            kv_cache_config=self.kv_cache_config,
-            cache_config=self.cache_config,
-            kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
-            scheduler_config=self.scheduler_config,
-            model_config=self.model_config,
-            is_pooling_model=self.is_pooling_model,
-            speculative_config=self.speculative_config,
-        )
-
-    def load_model(self, *args: Any, **kwargs: Any) -> None:
-        super().load_model(*args, **kwargs)
-        self._snapshot_prefix_cache_model_policy(self.model)
-
-    def _create_prefix_cache_group_view(self, cfg: Any) -> SchedulerBlockView:
-        check_prefix_cache_kv_groups(getattr(self.kv_cache_config, "kv_cache_groups", None))
-        if self.dcp_size != 1:
-            raise OmniPrefixCacheUnmatchError(
-                f"omni prefix caching does not support decode context parallel (dcp_size={self.dcp_size}); "
-                "disable enable_prefix_caching"
-            )
-        return SchedulerBlockView(cfg.block_size)
-
-    def _begin_prefix_cache_step(self, scheduler_output: SchedulerOutput) -> None:
-        """Register this step with the omni prefix cache; vLLM warmup steps are not cached."""
-        self._prefix_cache_step = None
-        req_ids = [*scheduler_output.num_scheduled_tokens, *scheduler_output.finished_req_ids]
-        if any(is_warmup_request(req_id) for req_id in req_ids):
-            return
-        self._prefix_cache_step_begin(scheduler_output)
-        if self.omni_prefix_cache is not None:
-            self._prefix_cache_group_view.observe(scheduler_output)
-
-    def _save_prefix_cache_step(
-        self, text_hidden: torch.Tensor, multimodal_outputs: Any, input_batch: Any
-    ) -> tuple[int, list[str]] | None:
-        """Write this step's rows into the omni prefix cache.
-
-        Returns:
-            The step id and the ids of requests whose prompt prefix was a cache hit, or None when
-            nothing needs merging. A returned step id must be materialized or discarded exactly once.
-
-        Raises:
-            OmniPrefixCacheUnmatchError: The model's multimodal outputs are not a payload dict.
-        """
-        step = self._prefix_cache_step
-        if step is None or self.omni_prefix_cache is None:
-            return None
-        if multimodal_outputs and not isinstance(multimodal_outputs, dict):
-            raise OmniPrefixCacheUnmatchError(
-                f"omni prefix caching cannot store {type(multimodal_outputs).__name__} outputs; "
-                "disable enable_prefix_caching for this model"
-            )
-        self._prefix_cache_group_view.bind_batch(input_batch.req_ids)
-        try:
-            step_id = self._prefix_cache_save_step(
-                text_hidden,
-                multimodal_outputs,
-                num_tokens_unpadded=input_batch.num_tokens,
-                num_tokens_padded=input_batch.num_tokens_after_padding,
-            )
-        finally:
-            self._prefix_cache_step = None
-        if step_id is None:
-            return None
-        hit_req_ids = [
-            event.req_id for event in step.events if event.kind is PrefixCacheEventKind.STARTED and event.hit_end > 0
-        ]
-        if not hit_req_ids or self._model_mm_outputs_written_in_sample():
-            self.omni_prefix_cache.discard_step(step_id)
-            return None
-        return step_id, hit_req_ids
-
-    def shutdown(self) -> None:
-        try:
-            self._shutdown_omni_prefix_cache()
-        finally:
-            super().shutdown()
 
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
@@ -218,7 +124,6 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
         randomize_inputs: bool = False,
     ) -> Any:
         if not dummy_run:
-            self._begin_prefix_cache_step(scheduler_output)
             self._handle_kv_transfer_pre(scheduler_output)
         return super().execute_model(
             scheduler_output,
@@ -287,7 +192,6 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
-        prefix_cache_hits = self._save_prefix_cache_step(text_hidden, multimodal_outputs, input_batch)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
             snapshot_slot = self._last_multimodal_snapshot_slot
@@ -401,7 +305,6 @@ class OmniARModelRunner(PrefixCacheRunnerMixin, OmniGPUModelRunner):
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
             extra_multimodal_outputs=extra_outputs,
-            prefix_cache_hits=(None if prefix_cache_hits is None else (self.omni_prefix_cache, *prefix_cache_hits)),
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -833,10 +736,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         pending_aux_output: Any | None = None,
         streaming_audio: StreamingAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
-        prefix_cache_hits: tuple[OmniPrefixCacheManager, int, list[str]] | None = None,
     ):
         self.model_runner_output = model_runner_output
-        self._prefix_cache_hits = prefix_cache_hits
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
@@ -992,56 +893,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
 
             self.copy_event.record(copy_stream)
 
-    def _take_prefix_cache_payloads(self, *, merge: bool, include_hidden: bool) -> dict[str, dict[str, Any]]:
-        """Consume this step's prefix-cache context exactly once.
-
-        Args:
-            merge: False discards the step without reading it.
-            include_hidden: Whether each payload carries the merged hidden states under ``hidden``.
-
-        Returns:
-            Flat payload of each prefix-hit request covering its cached prefix and this step's rows.
-        """
-        if self._prefix_cache_hits is None:
-            return {}
-        manager, step_id, hit_req_ids = self._prefix_cache_hits
-        self._prefix_cache_hits = None
-        if not merge:
-            manager.discard_step(step_id)
-            return {}
-        merged = manager.materialize(step_id, hit_req_ids)
-        batch_index = self.model_runner_output.req_id_to_index
-        payloads: dict[str, dict[str, Any]] = {}
-        for req_id in hit_req_ids:
-            payload = (
-                build_combined_prefix_cache_mm_payload(merged.mm_outputs, rid=req_id, list_idx=batch_index[req_id])
-                if merged.mm_outputs
-                else {}
-            )
-            if include_hidden and merged.hidden_states is not None:
-                payload["hidden"] = merged.hidden_states[req_id]
-            payloads[req_id] = payload
-        return payloads
-
-    def _overlay_prefix_hit_payloads(
-        self, payloads: list[dict[str, Any] | None] | None, merged: dict[str, dict[str, Any]]
-    ) -> list[dict[str, Any] | None] | None:
-        """Overlay each prefix-hit request's merged keys on its step payload; other keys stay."""
-        if not merged:
-            return payloads
-        payloads = list(payloads) if payloads is not None else [None] * self._num_reqs
-        for req_id, payload in merged.items():
-            index = self.model_runner_output.req_id_to_index[req_id]
-            payloads[index] = {**(payloads[index] or {}), **payload} or None
-        return payloads
-
     def get_output(self) -> OmniModelRunnerOutput:
-        try:
-            return self._get_output()
-        finally:
-            self._take_prefix_cache_payloads(merge=False, include_hidden=False)
-
-    def _get_output(self) -> OmniModelRunnerOutput:
         self.copy_event.synchronize()
 
         # Sampled token ids
@@ -1102,15 +954,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._total_tokens,
                     self._padded_total_tokens,
                 )
-                merged = self._take_prefix_cache_payloads(merge=True, include_hidden=False)
-                if merged:
-                    split = {req_id: partition_flat_payload(payload) for req_id, payload in merged.items()}
-                    pooler_inter = self._overlay_prefix_hit_payloads(
-                        pooler_inter, {req_id: inter for req_id, (inter, _) in split.items()}
-                    )
-                    pooler_client = self._overlay_prefix_hit_payloads(
-                        pooler_client, {req_id: client for req_id, (_, client) in split.items()}
-                    )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
                 # PCM chunks are host tensors this output owns (fresh, or views of its
@@ -1137,9 +980,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._padded_total_tokens,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
-            pooler_payload = self._overlay_prefix_hit_payloads(
-                pooler_payload, self._take_prefix_cache_payloads(merge=True, include_hidden=True)
-            )
             self.model_runner_output.pooler_output = pooler_payload
             self.model_runner_output.inter_stage_outputs = pooler_payload
             self.model_runner_output.multimodal_outputs = (
