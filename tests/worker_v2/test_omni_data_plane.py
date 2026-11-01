@@ -14,7 +14,6 @@ import pytest
 import torch
 from vllm import SamplingParams
 
-from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
