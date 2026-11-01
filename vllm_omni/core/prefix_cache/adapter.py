@@ -121,6 +121,16 @@ class PrefixCacheSchedulerAdapter:
             raise OmniPrefixCacheUnmatchError(f"no block ids recorded for req {req_id}")
         return ids
 
+    def retract_delivered(self, req_id: str, count: int) -> None:
+        """Move a live request's delivered watermark back by ``count`` rows.
+
+        For rows a speculative step scheduled but rejected: the scheduler's
+        next start excludes them, which must not read as a delivered overlap.
+        """
+        done = self._delivered.get(req_id)
+        if done is not None and count > 0:
+            self._delivered[req_id] = max(0, done - count)
+
     @staticmethod
     def _group0(blocks: Any) -> list[int]:
         groups = PrefixCacheSchedulerAdapter._blocks_value(blocks)

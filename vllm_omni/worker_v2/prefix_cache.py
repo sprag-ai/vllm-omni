@@ -6,13 +6,15 @@
 ``load_model`` / ``initialize_kv_cache`` / ``shutdown`` chain. A runner only
 calls ``_prefix_cache_step_begin`` before it retires finished requests, and an
 AR runner ``_prefix_cache_save_mrv2`` after postprocess plus
-``_prefix_cache_output_finalizer`` for its async output.
+``_prefix_cache_output_finalizer`` for its async output. A speculative AR
+runner also calls ``_prefix_cache_record_rejections`` after sampling.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -79,6 +81,21 @@ class PrefixCacheRewrite:
                         payload[key] = per_req[req_id]
 
 
+@dataclass
+class _StepRejections:
+    """Rejected draft counts of one sampled step, copied to the host after ``event``."""
+
+    step: int
+    req_ids: tuple[str, ...]
+    rejected: torch.Tensor
+    event: torch.cuda.Event
+    retracted: bool = False
+
+    def by_request(self) -> dict[str, int]:
+        self.event.synchronize()
+        return {req_id: n for req_id, n in zip(self.req_ids, self.rejected.tolist()) if n > 0}
+
+
 class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
     """Stage-output prefix cache for Model Runner V2.
 
@@ -89,6 +106,10 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
     """
 
     _prefix_cache_coalesce_decode = True
+    # True for a runner that calls _prefix_cache_record_rejections after sampling.
+    _prefix_cache_corrects_draft_positions = False
+    _prefix_cache_step_count = 0
+    _prefix_cache_rejections: deque[_StepRejections] | None = None
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
@@ -137,6 +158,7 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
             is_pooling_model=self.is_pooling_model,
             speculative_config=getattr(self.vllm_config, "speculative_config", None),
             model_cache_policy=self._omni_cache_policy,
+            corrects_draft_positions=self._prefix_cache_corrects_draft_positions,
         )
         if cfg is None:
             return
@@ -152,9 +174,63 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         if cfg.staging_depth < depth:
             cfg = replace(cfg, staging_depth=depth)
         self._omni_prefix_cache_cfg = cfg
+        self._prefix_cache_rejections = (
+            deque() if getattr(self.vllm_config, "speculative_config", None) is not None else None
+        )
         # Built now, not on the first step: the adapter's block ledger must
         # observe every request from its first scheduled step.
         self._ensure_omni_prefix_cache()
+
+    def _prefix_cache_scheduler_lag(self) -> int:
+        """Steps whose rejected drafts the scheduler has not yet subtracted when it schedules the next one."""
+        return 1 if getattr(self.scheduler_config, "async_scheduling", False) else 0
+
+    def _prefix_cache_step_begin(self, scheduler_output: Any) -> None:
+        self._prefix_cache_step_count += 1
+        self._prefix_cache_retract_rejected_rows()
+        super()._prefix_cache_step_begin(scheduler_output)
+
+    def _prefix_cache_retract_rejected_rows(self) -> None:
+        """Pull each request's delivered watermark back by the drafts the scheduler has since rejected.
+
+        The scheduler's start for this step already excludes the rejections of
+        every step up to ``step - 1 - lag``; without the retraction the adapter
+        reads them as an overlap and trims committed rows from the payload.
+        """
+        records, adapter = self._prefix_cache_rejections, self._prefix_cache_adapter
+        if not records or adapter is None:
+            return
+        settled = self._prefix_cache_step_count - 1 - self._prefix_cache_scheduler_lag()
+        for record in records:
+            if record.step <= settled and not record.retracted:
+                for req_id, count in record.by_request().items():
+                    adapter.retract_delivered(req_id, count)
+                record.retracted = True
+        while records and records[0].retracted and records[0].step < self._prefix_cache_step_count - 1:
+            records.popleft()
+
+    def _prefix_cache_record_rejections(self, input_batch: Any, num_rejected: torch.Tensor) -> None:
+        """Copy this step's per-request rejected draft counts to the host without waiting on them."""
+        if self._prefix_cache_rejections is None or self.omni_prefix_cache is None:
+            return
+        n = input_batch.num_reqs
+        rejected = torch.empty(n, dtype=num_rejected.dtype, pin_memory=True)
+        rejected.copy_(num_rejected[:n], non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._prefix_cache_rejections.append(
+            _StepRejections(self._prefix_cache_step_count, tuple(input_batch.req_ids[:n]), rejected, event)
+        )
+
+    def _prefix_cache_position_corrections(self) -> dict[str, int]:
+        """Drafts of the previous step that this step's scheduled positions still count as accepted."""
+        records = self._prefix_cache_rejections
+        if not records or self._prefix_cache_scheduler_lag() == 0:
+            return {}
+        previous = records[-1]
+        if previous.step != self._prefix_cache_step_count - 1:
+            return {}
+        return previous.by_request()
 
     def _prefix_cache_save_mrv2(
         self, input_batch: Any, hidden_states: torch.Tensor, multimodal_outputs: dict[str, Any] | None
@@ -168,7 +244,7 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         cache, view = self.omni_prefix_cache, self._prefix_cache_group_view
         if cache is None or view is None:
             return None
-        view.bind(input_batch)
+        view.bind(input_batch, self._prefix_cache_position_corrections())
         try:
             step_id = self._prefix_cache_save_step(
                 hidden_states,

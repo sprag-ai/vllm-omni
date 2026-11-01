@@ -97,6 +97,8 @@ def _guard_graph_replay_for_pooler_copy(
 class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
+    _prefix_cache_corrects_draft_positions = True
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.kv_transfer_manager: OmniKVTransferManager | None = None
@@ -226,6 +228,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             )
         sampler_output = sampling_output.sampler_output
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
+        self._prefix_cache_record_rejections(input_batch, num_rejected)
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)

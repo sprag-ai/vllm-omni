@@ -219,3 +219,43 @@ def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="already consumed"):
         rewrite.discard()
     assert cache.consumed == [("materialize", 3)]
+
+
+class _Ledger:
+    def __init__(self):
+        self.retracted: list[tuple[str, int]] = []
+
+    def retract_delivered(self, req_id, count):
+        self.retracted.append((req_id, count))
+
+
+def _rejections(step, rejected):
+    return mrv2_prefix_cache._StepRejections(
+        step, tuple(rejected), torch.tensor(list(rejected.values())), SimpleNamespace(synchronize=lambda: None)
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rejected_drafts_correct_positions_and_watermark_on_the_schedulers_lag(monkeypatch, async_scheduling):
+    """Sync scheduling subtracts a step's rejections before the next step; async one step later."""
+    monkeypatch.setattr(mrv2_prefix_cache.PrefixCacheRunnerMixin, "_prefix_cache_step_begin", lambda self, so: None)
+    runner = object.__new__(OmniARModelRunner)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+    runner._prefix_cache_adapter = ledger = _Ledger()
+    runner._prefix_cache_rejections = mrv2_prefix_cache.deque()
+    runner._prefix_cache_step_count = 0
+
+    runner._prefix_cache_step_begin(None)
+    runner._prefix_cache_rejections.append(_rejections(1, {"a": 2, "b": 0}))
+    runner._prefix_cache_step_begin(None)
+    if async_scheduling:
+        assert runner._prefix_cache_position_corrections() == {"a": 2}
+        assert ledger.retracted == []
+    else:
+        assert runner._prefix_cache_position_corrections() == {}
+        assert ledger.retracted == [("a", 2)]
+    runner._prefix_cache_rejections.append(_rejections(2, {"a": 0, "b": 1}))
+    runner._prefix_cache_step_begin(None)
+    assert ledger.retracted == ([("a", 2)] if async_scheduling else [("a", 2), ("b", 1)])
+    assert runner._prefix_cache_position_corrections() == ({"b": 1} if async_scheduling else {})
+    assert [r.step for r in runner._prefix_cache_rejections] == [2]

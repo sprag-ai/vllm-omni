@@ -10,7 +10,7 @@ returns None when the input batch has no block table.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -80,9 +80,17 @@ class MRv2FullAttentionGroupView:
         self._adapter = adapter
         self.block_size = block_size
         self._input_batch: Any = None
+        self._position_corrections: Mapping[str, int] = {}
 
-    def bind(self, input_batch: Any) -> None:
+    def bind(self, input_batch: Any, position_corrections: Mapping[str, int] | None = None) -> None:
+        """Bind the step being saved.
+
+        ``position_corrections`` holds, per request, the draft tokens of the
+        previous step that the batch's ``num_computed_tokens_np`` still counts
+        as accepted; they are subtracted from its first position.
+        """
         self._input_batch = input_batch
+        self._position_corrections = position_corrections or {}
 
     def _batch(self) -> Any:
         if self._input_batch is None:
@@ -108,7 +116,8 @@ class MRv2FullAttentionGroupView:
                     f"req {req_id}: scheduled {count} tokens, bound input batch disagrees"
                 )
             blocks = self._adapter.block_ids(req_id)
-            pos = np.arange(count, dtype=np.int64) + int(batch.num_computed_tokens_np[row])
+            start = int(batch.num_computed_tokens_np[row]) - int(self._position_corrections.get(req_id, 0))
+            pos = np.arange(count, dtype=np.int64) + start
             idx = pos // bs
             if int(idx[-1]) >= len(blocks):
                 raise OmniPrefixCacheUnmatchError(
@@ -178,10 +187,20 @@ def check_prefix_cache_kv_groups(kv_cache_groups: Iterable[Any] | None) -> None:
             "omni prefix caching requires a single full-attention kv-cache group; "
             f"found {len(groups)}. disable enable_prefix_caching for this model"
         )
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
     spec = getattr(groups[0], "kv_cache_spec", None)
-    if not isinstance(spec, FullAttentionSpec):
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        # Attaching a drafter wraps the group in this; every member needing the same
+        # token slots is the property the row-to-slot mapping relies on.
+        members = list(spec.kv_cache_specs.values())
+        if not members or not all(isinstance(m, FullAttentionSpec) for m in members):
+            raise OmniPrefixCacheUnmatchError(
+                "omni prefix caching requires full-attention layers; found a uniform-type "
+                f"group of {sorted({type(m).__name__ for m in members})}. "
+                "disable enable_prefix_caching for this model"
+            )
+    elif not isinstance(spec, FullAttentionSpec):
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching requires a single full-attention kv-cache group; "
             f"found {type(spec).__name__}. disable enable_prefix_caching for this model"
@@ -202,21 +221,24 @@ def check_prefix_cache_kv_transfer(kv_transfer_config: object) -> None:
         )
 
 
-def check_prefix_cache_token_accounting(cache_config: object, speculative_config: object) -> None:
+def check_prefix_cache_token_accounting(
+    cache_config: object, speculative_config: object, *, corrects_draft_positions: bool = False
+) -> None:
     """Reject configs where ``num_computed_tokens`` stops meaning "first
     scheduled position, block aligned".
 
     Speculative decoding: with async scheduling vLLM keeps
     ``num_computed_tokens_cpu`` optimistic (all drafts accepted) during the
     forward and corrects it after; ``step_slots_cpu`` would read the
-    uncorrected value and mirror rows at the wrong slots. Refused as a
-    whole until that path is verified. ``prefix_match_unit`` smaller than
+    uncorrected value and mirror rows at the wrong slots. Admitted only for a
+    runner that subtracts each step's rejected drafts from the slot positions
+    and the delivered watermark (``corrects_draft_positions``). ``prefix_match_unit`` smaller than
     the block enables sub-block hits, which the hit registry rejects as
     unaligned on the first hit; refuse at init instead.
     """
-    if speculative_config is not None:
+    if speculative_config is not None and not corrects_draft_positions:
         raise OmniPrefixCacheUnmatchError(
-            "omni prefix caching is not supported together with speculative decoding; "
+            "omni prefix caching is not supported together with speculative decoding on this runner; "
             "disable enable_prefix_caching on this stage"
         )
     unit = getattr(cache_config, "prefix_match_unit", None)
@@ -238,6 +260,7 @@ def stage_prefix_cache_config(
     is_pooling_model: bool,
     speculative_config: object = None,
     model_cache_policy: ModelCachePolicy = ModelCachePolicy(),
+    corrects_draft_positions: bool = False,
 ) -> PrefixCacheConfig | None:
     """Runner-side gate shared by the GPU and NPU model runners.
 
@@ -255,7 +278,9 @@ def stage_prefix_cache_config(
     if model_cache_policy.native_kv_cache_only:
         return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
-    check_prefix_cache_token_accounting(cache_config, speculative_config)
+    check_prefix_cache_token_accounting(
+        cache_config, speculative_config, corrects_draft_positions=corrects_draft_positions
+    )
     check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
     return PrefixCacheConfig.from_vllm_config(
         num_blocks=kv_cache_config.num_blocks,  # type: ignore[attr-defined]
