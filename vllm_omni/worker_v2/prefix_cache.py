@@ -89,7 +89,7 @@ class _StepRejections:
     req_ids: tuple[str, ...]
     rejected: torch.Tensor
     event: torch.cuda.Event
-    retracted: bool = False
+    reported: bool = False
 
     def by_request(self) -> dict[str, int]:
         self.event.synchronize()
@@ -187,26 +187,21 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
 
     def _prefix_cache_step_begin(self, scheduler_output: Any) -> None:
         self._prefix_cache_step_count += 1
-        self._prefix_cache_retract_rejected_rows()
+        self._prefix_cache_report_rejected_rows()
         super()._prefix_cache_step_begin(scheduler_output)
 
-    def _prefix_cache_retract_rejected_rows(self) -> None:
-        """Pull each request's delivered watermark back by the drafts the scheduler has since rejected.
-
-        The scheduler's start for this step already excludes the rejections of
-        every step up to ``step - 1 - lag``; without the retraction the adapter
-        reads them as an overlap and trims committed rows from the payload.
-        """
+    def _prefix_cache_report_rejected_rows(self) -> None:
+        """Hand the adapter the rejected drafts of every step the scheduler has seen the output of."""
         records, adapter = self._prefix_cache_rejections, self._prefix_cache_adapter
         if not records or adapter is None:
             return
         settled = self._prefix_cache_step_count - 1 - self._prefix_cache_scheduler_lag()
         for record in records:
-            if record.step <= settled and not record.retracted:
+            if record.step <= settled and not record.reported:
                 for req_id, count in record.by_request().items():
-                    adapter.retract_delivered(req_id, count)
-                record.retracted = True
-        while records and records[0].retracted and records[0].step < self._prefix_cache_step_count - 1:
+                    adapter.add_rejected_rows(req_id, count)
+                record.reported = True
+        while records and records[0].reported and records[0].step < self._prefix_cache_step_count - 1:
             records.popleft()
 
     def _prefix_cache_record_rejections(self, input_batch: Any, num_rejected: torch.Tensor) -> None:

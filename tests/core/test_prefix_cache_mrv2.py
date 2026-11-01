@@ -160,18 +160,29 @@ def test_view_subtracts_position_corrections():
     assert view.step_slots_cpu(["a"], {"a": 2}).tolist() == [22, 23]
 
 
-@pytest.mark.parametrize("retract", [False, True])
-def test_rejected_drafts_trim_only_without_retraction(retract):
+@pytest.mark.parametrize("reported", [False, True])
+def test_rejected_drafts_trim_only_when_unreported(reported):
     """Async scheduling: each start counts the previous step's drafts as accepted
     until the step after, when the scheduler subtracts the 2 it rejected."""
     adapter = PrefixCacheSchedulerAdapter(track_requests=True)
     adapter.translate_step(sched_output(new=[("a", 0, [0, 1, 2, 3])], scheduled={"a": 8}))
     adapter.translate_step(sched_output(cached=[("a", 8, None)], scheduled={"a": 4}))
     assert adapter.translate_step(sched_output(cached=[("a", 12, None)], scheduled={"a": 4})).deliveries == ()
-    if retract:
-        adapter.retract_delivered("a", 2)
+    if reported:
+        adapter.add_rejected_rows("a", 2)
     step = adapter.translate_step(sched_output(cached=[("a", 14, None)], scheduled={"a": 4}))
-    assert step.deliveries == (() if retract else (PrefixCacheDelivery("a", trim=2),))
+    assert step.deliveries == (() if reported else (PrefixCacheDelivery("a", trim=2),))
+    assert adapter.translate_step(sched_output(cached=[("a", 18, None)], scheduled={"a": 4})).deliveries == ()
+
+
+def test_rejected_rows_the_scheduler_did_not_subtract_are_discarded():
+    """A start that keeps the rejected drafts, as kernel warmup does, is neither a replay nor a trim."""
+    adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    adapter.translate_step(sched_output(new=[("a", 0, [0, 1, 2, 3])], scheduled={"a": 13}))
+    adapter.add_rejected_rows("a", 3)
+    assert adapter.translate_step(sched_output(cached=[("a", 13, None)], scheduled={"a": 4})).deliveries == ()
+    step = adapter.translate_step(sched_output(cached=[("a", 15, None)], scheduled={"a": 4}))
+    assert step.deliveries == (PrefixCacheDelivery("a", trim=2),)
 
 
 def test_view_refuses_disagreeing_or_unbound_state():

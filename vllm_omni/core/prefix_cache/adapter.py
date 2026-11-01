@@ -113,6 +113,7 @@ class PrefixCacheSchedulerAdapter:
         self._track = track_requests
         self._block_ids: dict[str, list[int]] = {}
         self._delivered: dict[str, int] = {}
+        self._rejected: dict[str, int] = {}
 
     def block_ids(self, req_id: str) -> list[int]:
         """Group-0 block ids of a live request (``track_requests`` only)."""
@@ -121,15 +122,15 @@ class PrefixCacheSchedulerAdapter:
             raise OmniPrefixCacheUnmatchError(f"no block ids recorded for req {req_id}")
         return ids
 
-    def retract_delivered(self, req_id: str, count: int) -> None:
-        """Move a live request's delivered watermark back by ``count`` rows.
+    def add_rejected_rows(self, req_id: str, count: int) -> None:
+        """Record delivered rows of a live request that its speculative steps rejected.
 
-        For rows a speculative step scheduled but rejected: the scheduler's
-        next start excludes them, which must not read as a delivered overlap.
+        At the request's next scheduled step, a start that falls short of the
+        delivered watermark by up to these rows moves the watermark back
+        instead of trimming; a start that does not fall short discards them.
         """
-        done = self._delivered.get(req_id)
-        if done is not None and count > 0:
-            self._delivered[req_id] = max(0, done - count)
+        if count > 0 and req_id in self._delivered:
+            self._rejected[req_id] = self._rejected.get(req_id, 0) + count
 
     @staticmethod
     def _group0(blocks: Any) -> list[int]:
@@ -146,6 +147,9 @@ class PrefixCacheSchedulerAdapter:
         done = self._delivered.get(req_id)
         if count <= 0:
             return
+        rejected = self._rejected.pop(req_id, 0)
+        if done is not None and start < done:
+            done -= min(rejected, done - start)
         if done is None:
             # No delivery history (first sight of a running request): nothing to reconcile.
             self._delivered[req_id] = start + count
@@ -197,6 +201,7 @@ class PrefixCacheSchedulerAdapter:
             for req_id in terminal_ids:
                 self._block_ids.pop(req_id, None)
                 self._delivered.pop(req_id, None)
+                self._rejected.pop(req_id, None)
             # Preemption frees the blocks; the delivered watermark survives.
             for req_id in getattr(scheduler_output, "preempted_req_ids", None) or ():
                 self._block_ids.pop(str(req_id), None)

@@ -223,10 +223,10 @@ def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
 
 class _Ledger:
     def __init__(self):
-        self.retracted: list[tuple[str, int]] = []
+        self.rejected: list[tuple[str, int]] = []
 
-    def retract_delivered(self, req_id, count):
-        self.retracted.append((req_id, count))
+    def add_rejected_rows(self, req_id, count):
+        self.rejected.append((req_id, count))
 
 
 def _rejections(step, rejected):
@@ -250,12 +250,12 @@ def test_rejected_drafts_correct_positions_and_watermark_on_the_schedulers_lag(m
     runner._prefix_cache_step_begin(None)
     if async_scheduling:
         assert runner._prefix_cache_position_corrections() == {"a": 2}
-        assert ledger.retracted == []
+        assert ledger.rejected == []
     else:
         assert runner._prefix_cache_position_corrections() == {}
-        assert ledger.retracted == [("a", 2)]
+        assert ledger.rejected == [("a", 2)]
     runner._prefix_cache_rejections.append(_rejections(2, {"a": 0, "b": 1}))
     runner._prefix_cache_step_begin(None)
-    assert ledger.retracted == ([("a", 2)] if async_scheduling else [("a", 2), ("b", 1)])
+    assert ledger.rejected == ([("a", 2)] if async_scheduling else [("a", 2), ("b", 1)])
     assert runner._prefix_cache_position_corrections() == ({"b": 1} if async_scheduling else {})
     assert [r.step for r in runner._prefix_cache_rejections] == [2]
