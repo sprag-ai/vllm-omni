@@ -427,6 +427,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             req_ids=list(getattr(output, "req_ids", [])),
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=getattr(output, "sampled_token_ids", None),
+            num_draft_tokens=getattr(output, "num_draft_tokens", None),
         )
         output.inter_stage_outputs = None
         output.omni_connector_output = plane.get_omni_connector_output()

@@ -291,6 +291,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
             kv_connector_output=None,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
+        if input_batch.num_draft_tokens_per_req is not None:
+            model_runner_output.num_draft_tokens = input_batch.num_draft_tokens_per_req[: input_batch.num_reqs].tolist()
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
         prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)

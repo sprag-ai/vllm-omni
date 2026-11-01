@@ -151,7 +151,9 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
-    input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
+    input_batch = SimpleNamespace(
+        req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]), num_draft_tokens_per_req=np.array([2])
+    )
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
     input_batch.idx_mapping_np = np.array([0])
     input_batch.num_computed_prefill_tokens_np = np.array([0])
@@ -217,6 +219,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     built = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs["model_runner_output"]
     assert built.kv_connector_output is connector_output
     torch.testing.assert_close(built.prompt_token_id_logprobs_dict["req"], torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
+    assert built.num_draft_tokens == [2]
     assert runner._resolve_global_request_id("req") == "global-req"  # from the intermediate buffer
     assert runner._resolve_global_request_id("unknown") == "unknown"  # fallback to the local id
 

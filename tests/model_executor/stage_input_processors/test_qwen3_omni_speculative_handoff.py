@@ -121,6 +121,7 @@ def test_speech_ends_at_a_tool_call_inside_an_accepted_span():
 def test_a_streaming_multi_row_decode_step_is_not_a_new_segment():
     manager = _Manager()
     request = _request([11, 12, 13, 14], resumable=True)
+    request.num_draft_tokens = 2
     rows = torch.tensor([[float(t)] * HIDDEN for t in (11, 12, 13)])
 
     payload = q3._construct_thinker2talker_streaming_input_async_chunk(
@@ -135,6 +136,7 @@ def test_a_streaming_multi_row_decode_step_is_not_a_new_segment():
 def test_a_streaming_final_step_trims_rows_past_the_stop():
     manager = _Manager()
     request = _request([11, 12, 13, EOS], resumable=True)
+    request.num_draft_tokens = 2
     rows = torch.tensor([[float(t)] * HIDDEN for t in (12, 13, EOS)])
 
     payload = q3._construct_thinker2talker_streaming_input_async_chunk(
@@ -142,6 +144,36 @@ def test_a_streaming_final_step_trims_rows_past_the_stop():
     )
 
     assert [int(row[0]) for row in payload.embed.decode] == [12, 13]
+
+
+def test_a_streaming_step_with_rejected_drafts_is_not_a_new_segment():
+    manager = _Manager()
+    request = _request([11, 12, 13], resumable=True)
+    request.num_draft_tokens = 3
+    rows = torch.tensor([[float(t)] * HIDDEN for t in (11, 12, 77, 78)])
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False, request, rows, torch.randn(4, HIDDEN), manager, (12, 13)
+    )
+
+    assert payload is not None and payload.embed.prefill is None
+    assert [int(row[0]) for row in payload.embed.decode] == [11, 12]
+    assert "r" not in manager._pending_streaming_prefills
+
+
+def test_a_streaming_step_with_rejected_drafts_keeps_the_tool_call_cut():
+    manager = _Manager()
+    q3._mark_tool_speech_cut(manager, "r")
+    request = _request([11, 12, 13], resumable=True)
+    request.num_draft_tokens = 3
+    rows = torch.randn(4, HIDDEN)
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False, request, rows, torch.randn(4, HIDDEN), manager, (12, 13)
+    )
+
+    assert payload is None and q3._tool_speech_is_cut(manager, "r")
+    assert "r" not in manager._pending_streaming_prefills
 
 
 def test_a_streaming_new_segment_is_still_cached():

@@ -325,6 +325,18 @@ def test_snapshot_carries_the_step_tokens_through_the_stop(plane):
     assert request.sampled_token_ids == [21, 22, 2150] and request.output_token_ids == [21, 22, 2150]
 
 
+def test_snapshot_carries_the_drafts_its_step_verified(plane):
+    plane.register_request(_new_request("r0", "ext-0"))
+    plane.register_request(_new_request("r1", "ext-1"))
+    plane.complete_outputs(
+        req_ids=["r0", "r1"],
+        inter_stage_outputs=[{"h": "a"}, {"h": "b"}],
+        sampled_token_ids=[[21, 22], [31]],
+        num_draft_tokens=[3, 0],
+    )
+    assert [request.num_draft_tokens for request, _ in plane.record.batches[0]] == [3, 0]
+
+
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
     batches, cleaned = plane.record.batches, plane.record.cleaned
     plane.register_request(_new_request())

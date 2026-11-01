@@ -349,15 +349,10 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    # A speculative decode step also carries several rows. Row count alone
-    # cannot tell that apart from a new input segment; a step whose rows are
-    # all accounted for by newly committed output tokens is a decode step.
-    committed_tokens = len(new_token_ids)
-    is_speculative_decode = 1 < thinker_emb.shape[0] <= committed_tokens
-    # A stop token inside an accepted span leaves more rows than committed
-    # tokens on the final chunk; caching that as a new segment clips the turn.
-    if is_finished and not is_speculative_decode and 0 < committed_tokens < thinker_emb.shape[0]:
-        is_speculative_decode = True
+    # A speculative decode step also carries several rows, which row and token
+    # counts cannot tell apart from a short new input segment once a draft is
+    # rejected. Only a decode step verifies drafts.
+    is_speculative_decode = int(getattr(request, "num_draft_tokens", 0) or 0) > 0
     if is_speculative_decode:
         keep = _captured_speech_rows(thinker_emb.shape[0], new_token_ids)
         thinker_emb = thinker_emb[:keep]

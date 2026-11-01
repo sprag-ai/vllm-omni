@@ -65,6 +65,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # MRv2 consumers must treat the value as immutable and must not perform
     # another device-to-host conversion or rebuild it from sampler tensors.
     sampled_token_ids_materialized: bool = False
+    # Per-request draft tokens this step verified, indexed by req_index; None
+    # when the stage does not speculate.
+    num_draft_tokens: list[int] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
