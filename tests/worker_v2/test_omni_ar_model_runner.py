@@ -1027,3 +1027,19 @@ def test_the_drafter_gets_the_targets_aux_states_and_its_drafts_land_in_request_
     assert call["args"][4] is aux
     assert call["kwargs"]["num_speculative_tokens"] == scheduled
     assert runner.req_states.draft_tokens[[2, 0]].tolist() == expected
+
+
+@pytest.mark.parametrize(
+    ("output_type", "req_ids", "expected"),
+    [
+        ("text", ["spoken"], False),
+        ("latent", ["text_a", "text_b"], False),
+        ("latent", ["text_a", "spoken"], True),
+        ("latent", ["spoken"], True),
+    ],
+)
+def test_outputs_are_copied_only_when_a_request_needs_them(output_type, req_ids, expected):
+    runner = object.__new__(OmniARModelRunner)
+    runner._final_stage_req_ids = {"text_a", "text_b"}
+
+    assert runner._batch_needs_pooler(output_type, req_ids) is expected
