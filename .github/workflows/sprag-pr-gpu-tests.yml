@@ -35,6 +35,8 @@ jobs:
 
       - name: Install
         run: |
+          # Triton builds its CUDA launcher with the system C compiler on first use; the runner image has none.
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends gcc libc6-dev
           version="$(sed -n 's|^ARG BASE_IMAGE=vllm/vllm-openai:v\(.*\)$|\1|p' docker/Dockerfile.cuda | head -1)"
           [ -n "${version}" ] || { echo "::error::could not read the vLLM version from docker/Dockerfile.cuda"; exit 1; }
           uv venv --python 3.12
