@@ -1985,11 +1985,15 @@ class TestPreferModelSamplerNoneFallback:
 
         handler = _Capture(level=logging.WARNING)
         ar_module.logger.addHandler(handler)
+        # A dependency imported by other tests raises the root logger to ERROR.
+        previous_level = ar_module.logger.level
+        ar_module.logger.setLevel(logging.WARNING)
         try:
             for _ in range(3):
                 out = GPUARModelRunner._sample(runner, torch.zeros(1, 4), None)
                 assert out is sentinel
         finally:
+            ar_module.logger.setLevel(previous_level)
             ar_module.logger.removeHandler(handler)
 
         fallback_records = [r for r in records if "falling back to the default sampler" in r.getMessage()]
