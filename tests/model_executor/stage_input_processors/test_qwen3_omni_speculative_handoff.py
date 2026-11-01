@@ -27,7 +27,12 @@ class _Manager:
         self.request_payload: dict[str, dict] = {}
         self._pending_streaming_prefills: dict[str, dict] = {}
         self.config = SimpleNamespace(
-            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT))
+            hf_config=SimpleNamespace(
+                im_start_token_id=151644,
+                user_token_id=872,
+                thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+                talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT),
+            )
         )
 
     def process(self, rows, request, new_token_ids, is_finished=False):
