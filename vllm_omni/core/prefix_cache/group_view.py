@@ -117,6 +117,8 @@ class MRv2FullAttentionGroupView:
                 )
             blocks = self._adapter.block_ids(req_id)
             start = int(batch.num_computed_tokens_np[row]) - int(self._position_corrections.get(req_id, 0))
+            if start < 0:
+                raise OmniPrefixCacheUnmatchError(f"req {req_id}: corrected first position {start} is negative")
             pos = np.arange(count, dtype=np.int64) + start
             idx = pos // bs
             if int(idx[-1]) >= len(blocks):

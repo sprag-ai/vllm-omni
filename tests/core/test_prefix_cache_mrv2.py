@@ -158,6 +158,9 @@ def test_view_subtracts_position_corrections():
     assert view.step_slots_cpu(["a", "b"], {"a": 2, "b": 2}).tolist() == [20, 21, 37, 38]
     view.bind(input_batch([("a", 6, 2)]))
     assert view.step_slots_cpu(["a"], {"a": 2}).tolist() == [22, 23]
+    view.bind(input_batch([("a", 1, 2)]), {"a": 2})
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="negative"):
+        view.step_slots_cpu(["a"], {"a": 2})
 
 
 @pytest.mark.parametrize("reported", [False, True])
