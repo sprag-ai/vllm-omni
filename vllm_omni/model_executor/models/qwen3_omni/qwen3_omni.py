@@ -23,6 +23,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
@@ -135,6 +136,17 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _as_row_matrix(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    """Normalise a thinker embed payload to [rows, hidden] on ``device``."""
+    if tensor is None:
+        return None
+    tensor = tensor.to(device)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
 # The encoder CUDA graph protocol, forwarded from the thinker to the stage
 # wrapper that the runner inspects.
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
@@ -176,6 +188,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsRealtime,
     SupportsQuant,
     SupportsTranscription,
+    SupportsEagle3,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -299,6 +312,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         # axis, so MRv2 may replay decode in FULL graphs and return them too.
         self.supports_mrv2_full_graph_aux_outputs = self._returns_tuple
 
+        # The thinker-to-talker processor trims each step's rows to its committed tokens.
+        self.supports_speculative_handoff = self.model_stage == "thinker"
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
             # MRv2: the Talker's prompt ends with the first generated token's
@@ -324,6 +339,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            # vLLM's EAGLE proposer reads the image placeholder id from the
+            # target's top-level config, which Qwen3-Omni keeps on the thinker's.
+            image_token_id = getattr(thinker_config, "image_token_id", None)
+            if not hasattr(self.config, "image_token_index") and image_token_id is not None:
+                self.config.image_token_index = image_token_id
             if supports_encoder_cudagraph(self.thinker):
                 # Expose the protocol on this stage instance only. Defining
                 # these methods on the shared class also advertises an encoder
@@ -831,7 +851,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
-            if isinstance(model_outputs, tuple):
+            aux_hidden_states = None
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 3:
+                text_hidden_states, captured_layer_dict, aux_hidden_states = model_outputs
+            elif isinstance(model_outputs, tuple) and isinstance(model_outputs[1], list):
+                # The EAGLE-3 pair a thinker returns when no layer capture was requested.
+                text_hidden_states, aux_hidden_states = model_outputs
+                captured_layer_dict = None
+            elif isinstance(model_outputs, tuple):
                 text_hidden_states, captured_layer_dict = model_outputs
             else:
                 # Bare tensor: capture was not requested (no accept_hidden_layer).
@@ -859,6 +886,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             return OmniOutput(
                 text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
                 multimodal_outputs=multimodal_outputs,
+                aux_hidden_states=aux_hidden_states,
             )
         elif self.model_stage == "talker":
             talker_hidden = model_outputs
@@ -1312,8 +1340,57 @@ class Qwen3OmniMoeForConditionalGeneration(
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
+        if self.vllm_config.model_config.async_chunk:
+            self._queue_unspoken_prefill_text(
+                thinker_sequence_embeds,
+                thinker_chatml_ids_cpu if thinker_chatml_ids_cpu is not None else ids_chatml,
+                thinker_sequences_cpu if thinker_sequences_cpu is not None else thinker_sequences,
+                embed,
+                meta,
+                update_dict,
+            )
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+
+    def _queue_unspoken_prefill_text(
+        self,
+        thinker_embeds: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        result_ids: torch.Tensor,
+        embed: Embeddings,
+        meta: OmniPayloadMeta,
+        update_dict: OmniPayload,
+    ) -> None:
+        """Queue the prefill's output text rows after the first, ahead of later decode rows.
+
+        Under async_chunk the talker reads text only from the decode queue, and a
+        speculative thinker step can land several output rows in the prefill
+        payload; the assistant bootstrap speaks only the first of them. Safe to
+        call on every chunk of a prefill split across scheduler steps.
+        """
+        # A chunked prefill re-enters with the queue this call already filled.
+        if meta.get("unspoken_prefill_rows_queued") == thinker_embeds.shape[0]:
+            return
+        update_dict.setdefault("meta", {})["unspoken_prefill_rows_queued"] = thinker_embeds.shape[0]
+        starts = torch.nonzero(prompt_ids[0] == self.config.im_start_token_id).squeeze(-1)
+        if starts.numel() == 0:
+            return
+        last_start = int(starts[-1].item())
+        if last_start + 1 >= prompt_ids.shape[-1] or prompt_ids[0][last_start + 1] != self.config.assistant_token_id:
+            return
+        # Matches the bootstrap's split: im_start, role, newline, first text, then the rest.
+        first_unspoken = last_start + 4
+        spoken_end = spoken_span_end(result_ids.reshape(-1).tolist(), last_start, thinker_embeds.shape[0])
+        if spoken_end <= first_unspoken:
+            return
+        unspoken = thinker_embeds[first_unspoken:spoken_end]
+        queued = update_dict.get("embed", {}).get("cached_decode")
+        if queued is None:
+            queued = embed.get("cached_decode")
+        queued = _as_row_matrix(queued, unspoken.device)
+        if queued is not None:
+            unspoken = torch.cat([unspoken, queued.to(dtype=unspoken.dtype)], dim=0)
+        update_dict.setdefault("embed", {})["cached_decode"] = unspoken
 
     def _talker_cache_thinker_decode_embeds(
         self,

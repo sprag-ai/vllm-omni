@@ -172,6 +172,7 @@ def _model() -> Qwen3OmniMoeForConditionalGeneration:
         ),
     )
     model.thinker_config = SimpleNamespace(audio_token_id=AUDIO, image_token_id=IMAGE, video_token_id=VIDEO)
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=False))
     model.tts_text_spk_token_ids = {"ethan": 2302}
     model.default_tts_text_spk_type = "ethan"
     return model
