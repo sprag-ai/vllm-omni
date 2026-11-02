@@ -118,6 +118,15 @@ def test_speech_ends_at_a_tool_call_inside_an_accepted_span():
     assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
 
 
+def test_speech_ends_at_a_tool_call_inside_the_first_decode_step():
+    rows, manager = _spoken(
+        [[11], ([12, TOOL_CALL_START_TOKEN_ID, 99], [12, TOOL_CALL_START_TOKEN_ID, 99]), ([100], [100])]
+    )
+
+    assert rows == [11, 12]
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
 def test_a_streaming_multi_row_decode_step_is_not_a_new_segment():
     manager = _Manager()
     request = _request([11, 12, 13, 14], resumable=True)

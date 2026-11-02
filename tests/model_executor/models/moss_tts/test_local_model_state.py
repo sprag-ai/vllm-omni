@@ -109,6 +109,7 @@ def _batch(device, slots, counts, index_dtype=torch.int32):
         num_reqs=len(slots),
         num_tokens=int(starts[-1]),
         num_scheduled_tokens=np.array(counts),
+        num_draft_tokens_per_req=None,
         query_start_loc_np=starts,
         query_start_loc=torch.tensor(starts, device=device),
         # Upstream MRV2 uses int32 token buffers, unlike the MTP graph inputs.

@@ -639,8 +639,9 @@ def thinker2talker_async_chunk(
         # the equality above runs. That sample may already be <tool_call>.
         # Mark the boundary and release the captured preface; do not append
         # the marker. After chunk 0 the data plane omits token history, so
-        # the flag is the only thing that stops the marker and the JSON.
-        if _sampled_token_is_tool_call(request):
+        # the flag is the only thing that stops the marker and the JSON. A
+        # speculative step can commit the marker before its last token.
+        if _sampled_token_is_tool_call(request) or tool_call_start_offset(committed_ids) is not None:
             _mark_tool_speech_cut(transfer_manager, request_id)
         # A <tool_call> first token must still release the prompt prefill.
         # Holding it would keep chunk_id at 0 and append later tool tokens.
