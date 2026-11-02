@@ -1468,6 +1468,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
                 setattr(params, field_name, value)
 
+        # The request carries logprobs as a flag plus counts; SamplingParams takes one count or one token list.
+        if "logprobs" in explicit_fields and request.logprobs is True:
+            if "logprob_token_ids" in explicit_fields and request.logprob_token_ids:
+                params.logprob_token_ids = list(request.logprob_token_ids)
+                params.logprobs = None
+            else:
+                params.logprobs = request.top_logprobs
+        if "allowed_token_ids" in explicit_fields and request.allowed_token_ids:
+            params.allowed_token_ids = list(request.allowed_token_ids)
+
         return params
 
     @staticmethod
@@ -1786,13 +1796,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         if finish_reason_sent[i]:
                             continue
 
-                        if request.logprobs and request.top_logprobs is not None:
+                        if request.logprobs:
                             assert output.logprobs is not None, "Did not output logprobs"
                             logprobs = self._create_chat_logprobs(
                                 token_ids=output.token_ids,
                                 top_logprobs=output.logprobs,
                                 tokenizer=tokenizer,
                                 num_output_top_logprobs=request.top_logprobs,
+                                logprob_token_ids=request.logprob_token_ids,
                                 return_as_token_id=request.return_tokens_as_token_ids,
                             )
                         else:
@@ -2721,12 +2732,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             out_logprobs = output.logprobs
             tool_call_info = None
 
-            if request.logprobs and request.top_logprobs is not None:
+            if request.logprobs:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
                     num_output_top_logprobs=request.top_logprobs,
+                    logprob_token_ids=request.logprob_token_ids,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
                 )

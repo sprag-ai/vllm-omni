@@ -417,6 +417,12 @@ class OmniServeCommand(CLISubcommand):
             "sharing an existing stage's GPU when unset.",
         )
         omni_config_group.add_argument(
+            "--decisions",
+            action="store_true",
+            help="Serve POST /v1/decisions, answering each question from the chat model's next-token scores over "
+            "its lettered options. Requires --enable-prompt-tokens-details.",
+        )
+        omni_config_group.add_argument(
             "--deploy-config",
             type=str,
             default=None,
