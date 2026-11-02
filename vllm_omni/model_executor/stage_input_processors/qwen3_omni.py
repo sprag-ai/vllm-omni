@@ -4,7 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -25,7 +25,7 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_hidden_state_rows
-from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID, tool_call_start_offset
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -172,6 +172,23 @@ def _output_reaches_tool_call(request: Any) -> bool:
     return _sampled_token_is_tool_call(request)
 
 
+def _captured_speech_rows(num_rows: int, new_token_ids: tuple[int, ...]) -> int:
+    """Leading rows of a captured decode step that are speech.
+
+    Row 0 is the token sampled on the previous step and row ``i + 1`` the
+    accepted draft ``new_token_ids[i]``. A stop token inside an accepted span
+    leaves fewer committed tokens than rows; a ``<tool_call>`` ends speech at
+    the row before it.
+    """
+    keep = num_rows
+    if 0 < len(new_token_ids) < num_rows:
+        keep = len(new_token_ids)
+    offset = tool_call_start_offset(new_token_ids)
+    if offset is not None:
+        keep = min(keep, offset + 1)
+    return keep
+
+
 def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torch.Tensor | None:
     """Embedding of the token this step sampled, when published and not final.
 
@@ -315,6 +332,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
+    new_token_ids: tuple[int, ...] = (),
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -331,11 +349,20 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
+    # A speculative decode step also carries several rows, which row and token
+    # counts cannot tell apart from a short new input segment once a draft is
+    # rejected. Only a decode step verifies drafts.
+    is_speculative_decode = int(getattr(request, "num_draft_tokens", 0) or 0) > 0
+    if is_speculative_decode:
+        keep = _captured_speech_rows(thinker_emb.shape[0], new_token_ids)
+        thinker_emb = thinker_emb[:keep]
+        thinker_hid = thinker_hid[:keep]
+    is_new_segment = thinker_emb.shape[0] > 1 and not is_speculative_decode
     emb_cpu = thinker_emb.detach().cpu()
     hid_cpu = thinker_hid.detach().cpu()
 
     if output_token_ids:
-        if thinker_emb.shape[0] > 1:
+        if is_new_segment:
             # A new prompt segment is speech again. The model prefill still
             # drops a <tool_call> token inside that segment.
             _clear_tool_speech_cut(transfer_manager, request.external_req_id)
@@ -346,9 +373,9 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             external_req_id = request.external_req_id
             if _tool_speech_is_cut(transfer_manager, external_req_id):
                 return None
-            if _output_reaches_tool_call(request):
+            if _output_reaches_tool_call(request) or tool_call_start_offset(new_token_ids) is not None:
                 _mark_tool_speech_cut(transfer_manager, external_req_id)
-        if thinker_emb.shape[0] > 1:
+        if is_new_segment:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
             new_prompt_len = thinker_emb.shape[0]
@@ -498,6 +525,7 @@ def thinker2talker_async_chunk(
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
+    new_token_ids: Iterable[int] = (),
 ) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
@@ -547,6 +575,12 @@ def thinker2talker_async_chunk(
         return None
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
+    # Tokens this scheduler step committed, snapshotted by the connector
+    # before any resumable cleanup could rewrite the request. The MRv2 data
+    # plane carries them on its request snapshot instead.
+    committed_ids = tuple(int(token_id) for token_id in new_token_ids) or tuple(
+        int(token_id) for token_id in getattr(request, "sampled_token_ids", None) or ()
+    )
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
@@ -582,6 +616,13 @@ def thinker2talker_async_chunk(
             payload.hidden_states.output = torch.cat(
                 (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
+            decode_rows = payload.embed.prefill.shape[0] - len(prompt_token_ids)
+            if decode_rows > 0 and "sampled" not in thinker_embed:
+                # The first decode step lands on the held prompt; bound its
+                # rows as a later decode step's are bounded.
+                keep = len(prompt_token_ids) + _captured_speech_rows(decode_rows, committed_ids)
+                payload.embed.prefill = payload.embed.prefill[:keep]
+                payload.hidden_states.output = payload.hidden_states.output[:keep]
         if not is_finished and payload.embed.prefill.shape[0] == len(prompt_token_ids):
             # The Talker prompt ends with the first generated token's embedding,
             # which the next decode step would capture; take it from the
@@ -598,8 +639,9 @@ def thinker2talker_async_chunk(
         # the equality above runs. That sample may already be <tool_call>.
         # Mark the boundary and release the captured preface; do not append
         # the marker. After chunk 0 the data plane omits token history, so
-        # the flag is the only thing that stops the marker and the JSON.
-        if _sampled_token_is_tool_call(request):
+        # the flag is the only thing that stops the marker and the JSON. A
+        # speculative step can commit the marker before its last token.
+        if _sampled_token_is_tool_call(request) or tool_call_start_offset(committed_ids) is not None:
             _mark_tool_speech_cut(transfer_manager, request_id)
         # A <tool_call> first token must still release the prompt prefill.
         # Holding it would keep chunk_id at 0 and append later tool tokens.
@@ -624,13 +666,15 @@ def thinker2talker_async_chunk(
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, committed_ids
             )
         # Decode embeds have no token ids. A sampled stream's payload is the
         # token just sampled, so <tool_call> is dropped on this step. A
         # captured stream's payload is still the previous spoken token.
         already_cut = _tool_speech_is_cut(transfer_manager, request_id)
-        reached_tool_call = _output_reaches_tool_call(request)
+        # A speculative step can commit <tool_call> before its last token, which
+        # is all the history-free request still shows.
+        reached_tool_call = _output_reaches_tool_call(request) or tool_call_start_offset(committed_ids) is not None
         stream = transfer_manager.request_payload.get(request_id)
         sampled_stream = isinstance(stream, dict) and stream.get(_SAMPLED_TEXT_STREAM)
         if sampled_stream:
@@ -656,16 +700,8 @@ def thinker2talker_async_chunk(
                 # as the bare finish marker.
                 return None
             thinker_emb = sampled
-        if thinker_emb.shape[0] > 1:
-            logger.warning(
-                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
-                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
-                chunk_id,
-                request_id,
-                request.num_computed_tokens,
-                thinker_emb.shape,
-            )
-            return None
+        else:
+            thinker_emb = thinker_emb[: _captured_speech_rows(thinker_emb.shape[0], committed_ids)]
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,

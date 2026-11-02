@@ -46,13 +46,17 @@ class _NativeRequestState:
     # finish reason. MiniCPM-o duplex Talkers only end this way.
     aborted: bool = False
 
-    def accept_tokens(self, token_ids: list[int]) -> None:
+    def accept_tokens(self, token_ids: list[int]) -> list[int]:
         """Fence publications past the sampled stop, before scheduler ACK.
 
         Async scheduling may already have executed another step when the
         scheduler consumes EOS. Keep the terminating step's payload, but do
         not publish the later steps while lifecycle reservations drain.
         Resumable requests keep their segment boundaries owned by the scheduler.
+
+        Returns:
+            The leading ``token_ids`` the request keeps, through the stop when
+            one is sampled.
         """
         params = self.sampling_params
         stop_ids = set(getattr(params, "stop_token_ids", None) or ())
@@ -60,16 +64,21 @@ class _NativeRequestState:
             stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
         min_tokens = getattr(params, "min_tokens", 0) or 0
         max_tokens = getattr(params, "max_tokens", None)
+        accepted: list[int] = []
         for token_id in token_ids:
             self.output_token_ids.append(int(token_id))
+            accepted.append(int(token_id))
             if not self.resumable and (
                 (len(self.output_token_ids) >= min_tokens and token_id in stop_ids)
                 or (max_tokens is not None and len(self.output_token_ids) >= max_tokens)
             ):
                 self.output_stopped = True
                 break
+        return accepted
 
-    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
+    def snapshot(
+        self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None, num_draft_tokens: int = 0
+    ) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -85,6 +94,8 @@ class _NativeRequestState:
             # A ledger tail can belong to an earlier segment. Only these ids
             # were accepted with the payload being published now.
             sampled_token_ids=list(sampled_token_ids or ()),
+            # Drafts the payload's step verified; such a step is a decode step.
+            num_draft_tokens=num_draft_tokens,
             additional_information=self.additional_information,
             model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
@@ -101,6 +112,7 @@ class _NativeOutputBatch:
     req_ids: list[str]
     inter_stage_outputs: list[Any | None] | None
     sampled_token_ids: list[list[int]] | None
+    num_draft_tokens: list[int] | None = None
 
 
 _NATIVE_OUTPUT_STOP = object()
@@ -202,6 +214,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     req_ids=batch.req_ids,
                     inter_stage_outputs=batch.inter_stage_outputs,
                     sampled_token_ids=batch.sampled_token_ids,
+                    num_draft_tokens=batch.num_draft_tokens,
                 )
             except BaseException as error:
                 self._record_output_error(error)
@@ -214,6 +227,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        num_draft_tokens: list[int] | None = None,
     ) -> None:
         """Transfer one completed model batch to the ordered output worker."""
         self._raise_output_error()
@@ -223,6 +237,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             req_ids=req_ids,
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=sampled_token_ids,
+            num_draft_tokens=num_draft_tokens,
         )
         while True:
             try:
@@ -359,6 +374,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        num_draft_tokens: list[int] | None = None,
     ) -> int:
         """Commit one deferred output batch, then release its lifecycle holds."""
         send_lock_held = False
@@ -368,6 +384,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 inter_stage_outputs=inter_stage_outputs,
                 sampled_token_ids=sampled_token_ids,
                 terminal_req_ids=set(),
+                num_draft_tokens=num_draft_tokens,
             )
             # Claim connector ordering before publishing the updated request
             # state. request_terminal() can still register a pending terminal
@@ -525,6 +542,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
         terminal_req_ids: set[str],
+        num_draft_tokens: list[int] | None = None,
     ) -> tuple[list[tuple[Any, Any | None]], list[str]]:
         if not getattr(self, "_can_send", True):
             receive_finished_ids = [req_id for req_id in sorted(terminal_req_ids) if req_id in self._native_requests]
@@ -539,6 +557,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             for index, req_id in enumerate(req_ids)
             if sampled_token_ids is not None and index < len(sampled_token_ids)
         }
+        drafts_by_req = {
+            req_id: num_draft_tokens[index]
+            for index, req_id in enumerate(req_ids)
+            if num_draft_tokens is not None and index < len(num_draft_tokens)
+        }
         entries: list[tuple[Any, Any | None]] = []
         finished_req_ids: list[str] = []
         for req_id in dict.fromkeys([*req_ids, *sorted(terminal_req_ids)]):
@@ -549,10 +572,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             # Native transport runs ahead of scheduler consumption. Its
             # terminal notification fences resource cleanup, not the sampled
             # token boundary: a later in-flight frame must not reach the codec.
+            accepted: list[int] = []
             if state.output_stopped:
                 payload = None
             else:
-                state.accept_tokens(sampled_by_req.get(req_id, []))
+                accepted = state.accept_tokens(sampled_by_req.get(req_id, []))
                 payload = payload_by_req.get(req_id)
             if not self._async_chunk:
                 # Full-payload consumers execute once, after the producer has
@@ -575,7 +599,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
-                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        sampled_token_ids=accepted if not state.finished else None,
+                        num_draft_tokens=int(drafts_by_req.get(req_id, 0)),
                     ),
                     payload,
                 )

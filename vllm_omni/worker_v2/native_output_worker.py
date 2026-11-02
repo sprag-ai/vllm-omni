@@ -72,6 +72,7 @@ class NativeOutputWorker:
             req_ids=list(result.req_ids),
             inter_stage_outputs=getattr(result, "inter_stage_outputs", None),
             sampled_token_ids=getattr(result, "sampled_token_ids", None),
+            num_draft_tokens=getattr(result, "num_draft_tokens", None),
         )
         result.inter_stage_outputs = None
         return result

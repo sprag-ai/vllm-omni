@@ -154,10 +154,17 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
         hidden_states=torch.zeros(2, 4),
         finished_req_ids=set(),
         ec_connector_output=None,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        num_spec_tokens_to_schedule=0,
     )
     runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
+    runner.speculator = None
+    runner.num_speculative_steps = 0
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
     runner.model_state, runner.model = state, model

@@ -96,6 +96,7 @@ def test_streaming_input_prefill_chunk_is_cached() -> None:
         thinker_emb,
         thinker_hid,
         transfer_manager,
+        (),
     )
 
     assert payload is None
@@ -134,6 +135,7 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
         thinker_emb,
         thinker_hid,
         transfer_manager,
+        (11,),
     )
 
     assert payload is not None
