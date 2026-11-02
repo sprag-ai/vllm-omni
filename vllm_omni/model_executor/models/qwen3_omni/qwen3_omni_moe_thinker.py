@@ -119,6 +119,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.inputs.speech_to_text import SPEECH_TO_TEXT_INSTRUCTIONS
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
@@ -1723,15 +1724,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         instruction += "."
 
-        if request_prompt:
-            instruction += f" {request_prompt}"
-
         processor = cached_processor_from_config(model_config, processor_cls=Qwen3OmniMoeProcessor)
         # Audio placeholder format: <|audio_start|><|audio_pad|><|audio_end|>
         audio_placeholder = "<|audio_start|><|audio_pad|><|audio_end|>"
-        user_content = f"{audio_placeholder}{instruction}"
-
-        messages = [{"role": "user", "content": user_content}]
+        system_instructions = SPEECH_TO_TEXT_INSTRUCTIONS.get()
+        if system_instructions:
+            messages = [
+                {"role": "system", "content": system_instructions},
+                {"role": "user", "content": f"{request_prompt or instruction}{audio_placeholder}"},
+            ]
+        else:
+            if request_prompt:
+                instruction += f" {request_prompt}"
+            messages = [{"role": "user", "content": f"{audio_placeholder}{instruction}"}]
         prompt = processor.apply_chat_template(
             messages,
             tokenize=False,
