@@ -980,3 +980,46 @@ def test_existing_extra_args_are_merged_not_replaced():
     ar = SamplingParams(extra_args={"custom": 1})
     _apply_tag([ar], None)
     assert ar.extra_args == {"custom": 1, "ar_task_mode": "comprehension"}
+
+
+# =============================================================================
+# Tests for logprobs and allowed_token_ids in _apply_request_overrides
+# =============================================================================
+
+
+def test_apply_overrides_maps_top_logprobs_to_logprobs(mock_engine_client, default_comprehension_params):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], logprobs=True, top_logprobs=5)
+
+    result = serving_chat._apply_request_overrides(default_comprehension_params, request)
+
+    assert result.logprobs == 5
+    assert result.logprob_token_ids is None
+
+
+def test_apply_overrides_maps_logprob_token_ids(mock_engine_client, default_comprehension_params):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], logprobs=True, logprob_token_ids=[32, 33])
+
+    result = serving_chat._apply_request_overrides(default_comprehension_params, request)
+
+    assert result.logprob_token_ids == [32, 33]
+    assert result.logprobs is None
+
+
+def test_apply_overrides_leaves_logprobs_off_when_not_requested(mock_engine_client, default_comprehension_params):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], logprobs=False)
+
+    result = serving_chat._apply_request_overrides(default_comprehension_params, request)
+
+    assert result.logprobs is None
+
+
+def test_apply_overrides_maps_allowed_token_ids(mock_engine_client, default_comprehension_params):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], allowed_token_ids=[32, 33])
+
+    result = serving_chat._apply_request_overrides(default_comprehension_params, request)
+
+    assert result.allowed_token_ids == [32, 33]

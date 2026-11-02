@@ -429,6 +429,11 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        if getattr(args, "decisions", False):
+            from vllm_omni.entrypoints.openai.serving_decisions import mount_decisions
+
+            await mount_decisions(app)
+
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
         if getattr(app.state, "serving_tokenization", None) is None:
