@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 SAMPLE_RATE_HZ = 16_000
 
@@ -29,6 +29,19 @@ class TurnSessionConfig(BaseModel):
     )
     min_silence_ms: SilenceMs = Field(default=200, description="silence the turn needs before the model can end it")
     eot_timeout_ms: TimeoutMs = Field(default=3_000, description="silence that ends the turn whatever the model scores")
+
+    @model_validator(mode="after")
+    def thresholds_are_ordered(self) -> TurnSessionConfig:
+        """Reject thresholds under which the model could never end a turn or eager_end could never precede it.
+
+        Raises:
+            ValueError: min_silence_ms is not below eot_timeout_ms, or eager_eot_threshold exceeds eot_threshold.
+        """
+        if self.min_silence_ms >= self.eot_timeout_ms:
+            raise ValueError("min_silence_ms must be below eot_timeout_ms")
+        if self.eager_eot_threshold is not None and self.eager_eot_threshold > self.eot_threshold:
+            raise ValueError("eager_eot_threshold must not exceed eot_threshold")
+        return self
 
 
 class TurnSessionPatch(BaseModel):

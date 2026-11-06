@@ -7,12 +7,13 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import wave
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from vllm.entrypoints.pooling.classify.protocol import ClassificationChatRequest
 
 from vllm_omni.entrypoints.openai.turns.protocol import SAMPLE_RATE_HZ
@@ -26,6 +27,8 @@ class TurnReadingError(RuntimeError):
 
 class TurnPrompt(BaseModel):
     """The model's end-of-turn question, shipped with its weights as ``turn_prompt.json``."""
+
+    model_config = ConfigDict(extra="forbid")
 
     question: str = Field(description="question text after the context, including the lettered options")
     context_prefix: str = Field(description="label that introduces the agent's last utterance")
@@ -88,12 +91,19 @@ class TurnScorer:
         """Return the probability that the turn has ended.
 
         Raises:
-            TurnReadingError: The classification handler returned an error or an unexpected shape.
+            TurnReadingError: Classification raised, returned no JSON, carried an error, or gave no value in [0, 1].
         """
-        response = await self.classification(self.request(samples, context, request_id))
-        body = json.loads(bytes(response.body))
         try:
-            return float(body["data"][0]["probs"][0])
+            response = await self.classification(self.request(samples, context, request_id))
+            body = json.loads(bytes(response.body))
+        except Exception as exc:
+            raise TurnReadingError("classification failed") from exc
+        try:
+            p_eot = float(body["data"][0]["probs"][0])
         except (KeyError, IndexError, TypeError, ValueError) as exc:
-            message = body.get("error", {}).get("message") if isinstance(body, dict) else None
+            error = body.get("error") if isinstance(body, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
             raise TurnReadingError(message or "classification returned no probability") from exc
+        if not (math.isfinite(p_eot) and 0.0 <= p_eot <= 1.0):
+            raise TurnReadingError(f"classification returned {p_eot}, not a probability")
+        return p_eot

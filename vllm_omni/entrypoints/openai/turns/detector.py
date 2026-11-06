@@ -90,12 +90,19 @@ class TurnTracker:
             self._enter(TurnPhase.PAUSED)
             self.silence_start_ms = silence_start_ms
 
-    def advance(self, now_ms: int) -> tuple[Reading | None, list[TurnEvent]]:
-        """Move the clock to ``now_ms``; return the reading now due, if any, and a timeout's turn.ended."""
+    def advance(self, now_ms: int, speech_pending: bool = False) -> tuple[Reading | None, list[TurnEvent]]:
+        """Move the clock to ``now_ms``; return the reading now due, if any, and a timeout's turn.ended.
+
+        Args:
+            now_ms: Stream time the VAD has processed up to.
+            speech_pending: The VAD is confirming a speech onset; the timeout waits until it resolves.
+        """
         if self.phase is not TurnPhase.PAUSED:
             return None, []
         silence = now_ms - self.silence_start_ms
         if silence >= self.config.eot_timeout_ms:
+            if speech_pending:
+                return None, []
             return None, [self._end("timeout", self.last_p_eot, silence, now_ms)]
         if silence < self.next_reading_ms:
             return None, []

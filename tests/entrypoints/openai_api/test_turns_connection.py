@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from vllm_omni.engine.duplex.vad import SileroStreamingVAD
-from vllm_omni.entrypoints.openai.turns.connection import VAD_CONFIG, TurnsConnection
+from vllm_omni.entrypoints.openai.turns.connection import MAX_AUDIO_FRAME_BYTES, VAD_CONFIG, TurnsConnection
 from vllm_omni.entrypoints.openai.turns.scorer import TurnPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -125,3 +125,73 @@ def test_unknown_event_is_rejected():
 def test_context_prefix_renders_like_decisions():
     assert PROMPT.text("") == PROMPT.question
     assert PROMPT.text('say "<hi>"') == 'State: "say \\"\\u003chi\\u003e\\""\n' + PROMPT.question
+
+
+class FailingScorer(FakeScorer):
+    async def score(self, samples: np.ndarray, context: str, request_id: str) -> float:
+        raise ValueError("unexpected")
+
+
+class SlowEndWebSocket(FakeWebSocket):
+    def __init__(self, frames: list[dict]) -> None:
+        super().__init__(frames)
+        self.late: list[dict] = []
+
+    async def send_text(self, text: str) -> None:
+        event = json.loads(text)
+        if self.closed:
+            self.late.append(event)
+            return
+        if event["type"] == "turn.update" and event["silence_ms"] >= 200:
+            await asyncio.sleep(0.05)
+        self.sent.append(event)
+
+
+def test_unexpected_reading_failure_is_reported_and_the_session_continues():
+    update = {
+        "type": "websocket.receive",
+        "text": json.dumps({"type": "session.update", "session": {"eot_timeout_ms": 500}}),
+    }
+    close = {"type": "websocket.receive", "text": json.dumps({"type": "session.close"})}
+    websocket = FakeWebSocket([update] + audio_frames((1.0, True), (1.0, False)) + [close])
+
+    async def serve() -> None:
+        connection = TurnsConnection(websocket, FailingScorer(0.5), energy_vad())
+        await connection.run()
+
+    asyncio.run(serve())
+    errors = [e for e in websocket.sent if e["type"] == "error"]
+    assert errors and all(e["error"]["code"] == "reading_failed" for e in errors)
+    ended = next(e for e in websocket.sent if e["type"] == "turn.ended")
+    assert ended["reason"] == "timeout"
+
+
+def test_close_waits_for_a_reading_still_sending_its_turn_end():
+    close = {"type": "websocket.receive", "text": json.dumps({"type": "session.close"})}
+    websocket = SlowEndWebSocket(audio_frames((1.0, True), (0.6, False)) + [close])
+
+    async def serve() -> None:
+        await TurnsConnection(websocket, FakeScorer(0.9), energy_vad()).run()
+        await asyncio.sleep(0.2)
+
+    asyncio.run(serve())
+    assert websocket.late == []
+    assert "turn.ended" in types(websocket)
+
+
+def test_speech_resuming_before_the_timeout_keeps_the_turn_open():
+    update = {
+        "type": "websocket.receive",
+        "text": json.dumps({"type": "session.update", "session": {"eot_timeout_ms": 480}}),
+    }
+    close = {"type": "websocket.receive", "text": json.dumps({"type": "session.close"})}
+    frames = [update] + audio_frames((1.0, True), (0.45, False), (0.5, True)) + [close]
+    websocket, _ = asyncio.run(run(frames, 0.1))
+    assert types(websocket).count("turn.started") == 1
+    assert "turn.ended" not in types(websocket)
+
+
+def test_oversize_audio_frame_is_rejected():
+    frames = [{"type": "websocket.receive", "bytes": bytes(MAX_AUDIO_FRAME_BYTES + 2)}]
+    websocket, _ = asyncio.run(run(frames, 0.5))
+    assert websocket.sent[1]["error"]["code"] == "invalid_audio"

@@ -116,3 +116,11 @@ def test_client_events_parse_by_type():
     assert isinstance(event, TurnContextUpdate)
     with pytest.raises(ValidationError):
         CLIENT_EVENT.validate_json('{"type": "context.update", "text": "x"}')
+
+
+def test_timeout_waits_while_an_onset_is_pending():
+    tracker = paused_tracker(eot_timeout_ms=500)
+    assert tracker.advance(2_600, speech_pending=True) == (None, [])
+    assert tracker.phase is TurnPhase.PAUSED
+    _, ended = tracker.advance(2_632)
+    assert [e.reason for e in ended] == ["timeout"]
