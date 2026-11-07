@@ -9,6 +9,7 @@ turn. The answer distribution is the softmax of the model's raw log-probabilitie
 import asyncio
 import json
 import math
+import string
 from http import HTTPStatus
 from typing import Any
 
@@ -39,7 +40,7 @@ from vllm_omni.inputs.decisions import (
 
 logger = init_logger(__name__)
 
-LETTERS = "ABCDEFGHIJ"
+LETTERS = string.ascii_uppercase
 ANSWER_INSTRUCTION = "\nAnswer with the option's letter from the given choices directly."
 TOKEN_ID_PREFIX = "token_id:"
 
