@@ -21,4 +21,12 @@ RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'imp
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+# The server VAD only reads its pinned Silero model from the HF cache, so offline pods need it baked in.
+RUN python3 -c "import hashlib; \
+from huggingface_hub import hf_hub_download; \
+from vllm_omni.engine.duplex.vad import SILERO_VAD_FILENAME, SILERO_VAD_REPO_ID, SILERO_VAD_REVISION, SILERO_VAD_SHA256; \
+path = hf_hub_download(SILERO_VAD_REPO_ID, SILERO_VAD_FILENAME, revision=SILERO_VAD_REVISION); \
+digest = hashlib.sha256(open(path, 'rb').read()).hexdigest(); \
+assert digest == SILERO_VAD_SHA256, f'{path}: sha256 {digest}'"
+
 ENTRYPOINT []

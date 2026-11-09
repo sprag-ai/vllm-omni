@@ -31,7 +31,7 @@ from vllm_omni.inputs.decisions import DecisionsRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-LETTER_IDS = list(range(32, 42))
+LETTER_IDS = list(range(32, 32 + len(LETTERS)))
 SUFFIX = "\nAnswer with the option's letter from the given choices directly."
 
 
@@ -145,8 +145,18 @@ def test_more_options_than_letters_is_refused():
     choices = [{"value": str(i)} for i in range(len(LETTERS) + 1)]
     request = decisions_request([{"type": "choice", "instructions": "Pick", "choices": choices}])
 
-    with pytest.raises(ValueError, match="at most 10 options"):
+    with pytest.raises(ValueError, match="at most 26 options"):
         question_text(request, request.questions[0])
+
+
+def test_every_letter_labels_an_option_up_to_z():
+    choices = [{"value": str(i)} for i in range(len(LETTERS))]
+    request = decisions_request([{"type": "choice", "instructions": "Pick", "choices": choices}])
+
+    text = question_text(request, request.questions[0])
+
+    assert "\nK. 10\n" in text
+    assert "\nZ. 25" + SUFFIX in text
 
 
 def test_chat_request_reads_the_question_letters_after_the_evidence():
