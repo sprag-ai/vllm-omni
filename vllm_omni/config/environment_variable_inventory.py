@@ -184,6 +184,7 @@ _MODEL_PROMOTE = (
     "OMNIVOICE_TF32",
     # Qwen-Image-2.1 runtime controls should migrate to typed model config.
     "QWEN21_FUSION_PRECISE",
+    "SPRAG_AUDIO_CHUNK_S",
     "VLLM_GEPARD_CHUNK_FRAMES",
     "VLLM_GEPARD_FIRST_CHUNK_FRAMES",
     "VLLM_GEPARD_LOOKBACK_FRAMES",
