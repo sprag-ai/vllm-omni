@@ -66,8 +66,9 @@ def test_the_old_shared_setting_no_longer_segments_transcription(monkeypatch):
     assert transcription(monkeypatch, None, None) is None
 
 
-def test_conversation_defaults_to_5s_segments(monkeypatch):
-    assert conversation(monkeypatch, None) == 5.0
+@pytest.mark.parametrize("segment", [None, ""])
+def test_conversation_decodes_each_turn_once_by_default(monkeypatch, segment):
+    assert conversation(monkeypatch, segment) is None
 
 
 def test_conversation_override_sets_the_segment(monkeypatch):
@@ -75,10 +76,10 @@ def test_conversation_override_sets_the_segment(monkeypatch):
 
 
 def test_conversation_ignores_the_transcription_setting(monkeypatch):
-    monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "120")
-    assert conversation(monkeypatch, None) == 5.0
+    monkeypatch.setenv("SPRAG_REALTIME_TRANSCRIPTION_SEGMENT_S", "5")
+    assert conversation(monkeypatch, None) is None
 
 
 @pytest.mark.parametrize("segment", ["abc", "0", "-1", "inf", "nan"])
-def test_an_invalid_conversation_segment_falls_back_to_the_default(monkeypatch, segment):
-    assert conversation(monkeypatch, segment) == 5.0
+def test_an_invalid_conversation_segment_decodes_each_turn_once(monkeypatch, segment):
+    assert conversation(monkeypatch, segment) is None
