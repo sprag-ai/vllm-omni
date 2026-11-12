@@ -16,6 +16,12 @@ OMNI_DEFAULT_PLUGINS_GROUP = "vllm_omni.general_plugins"
 # `vllm_omni.platforms.current_omni_platform` is called and the value not
 # initialized.
 OMNI_PLATFORM_PLUGINS_GROUP = "vllm_omni.platform_plugins"
+# Engine client plugins run once in the API server process, after the engine
+# client is built and before any route handler takes a reference to it. Each
+# entry point resolves to a callable that receives the engine client and
+# returns the client to serve. They see every request on every route, so they
+# load only when named in `VLLM_PLUGINS`, and a plugin that fails stops startup.
+OMNI_ENGINE_CLIENT_PLUGINS_GROUP = "vllm_omni.engine_client_plugins"
 
 # Make sure one process only loads plugins once.
 omni_plugins_loaded = False
@@ -78,8 +84,39 @@ def load_omni_general_plugins() -> None:
         func()
 
 
+def apply_engine_client_plugins(engine_client: Any) -> Any:
+    """Pass the engine client through each allowlisted engine client plugin, in discovery order."""
+    from importlib.metadata import entry_points
+
+    discovered = entry_points(group=OMNI_ENGINE_CLIENT_PLUGINS_GROUP)
+    if not discovered:
+        return engine_client
+
+    allowed_plugins = envs.VLLM_PLUGINS
+    if allowed_plugins is None:
+        logger.warning(
+            "Found engine client plugin(s) %s but VLLM_PLUGINS is not set. "
+            "Engine client plugins see every request and must be allowlisted "
+            "via VLLM_PLUGINS to be loaded.",
+            [plugin.name for plugin in discovered],
+        )
+        return engine_client
+
+    for plugin in discovered:
+        if plugin.name not in allowed_plugins:
+            continue
+        result = plugin.load()(engine_client)
+        if result is None:
+            raise TypeError(f"Engine client plugin {plugin.name} returned None instead of an engine client")
+        logger.info("Applied engine client plugin %s -> %s", plugin.name, plugin.value)
+        engine_client = result
+    return engine_client
+
+
 __all__ = [
+    "apply_engine_client_plugins",
     "load_omni_general_plugins",
+    "OMNI_ENGINE_CLIENT_PLUGINS_GROUP",
     "OMNI_DEFAULT_PLUGINS_GROUP",
     "OMNI_PLATFORM_PLUGINS_GROUP",
 ]
