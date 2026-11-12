@@ -220,6 +220,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.plugins import apply_engine_client_plugins
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -713,7 +714,8 @@ async def build_async_omni_from_stage_config(
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
 
-        yield async_omni
+        # Shutdown below always targets the engine built here, whatever a plugin returns.
+        yield apply_engine_client_plugins(async_omni)
     finally:
         if async_omni:
             async_omni.shutdown()
