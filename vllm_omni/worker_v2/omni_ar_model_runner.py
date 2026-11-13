@@ -324,6 +324,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
             extra_multimodal_outputs=extra_outputs,
+            client_output_keys=self._client_output_keys(),
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -425,11 +426,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if self.adaptive_verification is not None:
             self.adaptive_verification.record_confidences(self.speculator.draft_token_confidence_probs, input_batch)
 
+    def _client_output_keys(self) -> tuple[str, ...]:
+        return tuple(getattr(getattr(self, "model", None), "omni_client_multimodal_output_keys", ()))
+
     def _batch_needs_pooler(self, engine_output_type: str, req_ids: list[str]) -> bool:
         """Whether this step's outputs are copied out for a later stage or the client.
 
+        True whenever the model declares client multimodal output keys, as in the V1 runner. Otherwise
         False for text-output stages, and for batches whose requests all end at this stage.
         """
+        if self._client_output_keys():
+            return True
         if engine_output_type == "text":
             return False
         return any(req_id not in self._final_stage_req_ids for req_id in req_ids)
@@ -526,8 +533,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_reqs: int,
         total_tokens: int,
         padded_total_tokens: int | None = None,
+        client_output_keys: frozenset[str] = frozenset(),
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
-        """Build async-chunk payloads without materializing hidden on CPU."""
+        """Build async-chunk payloads without materializing hidden on CPU.
+
+        A model that declares ``omni_client_multimodal_output_keys`` gets exactly those keys on the
+        client channel, as in the V1 runner. The inter-stage channel is unchanged.
+        """
         if not mm_outputs:
             return None, None
 
@@ -547,7 +559,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 )
                 for key, value in mm_outputs.items()
             }
-            inter_stage, client_mm = partition_flat_payload(flatten_payload(payload))
+            flat = flatten_payload(payload)
+            inter_stage, client_mm = partition_flat_payload(flat)
+            if client_output_keys:
+                client_mm = {key: value for key, value in flat.items() if key in client_output_keys}
             inter_stage_list.append(inter_stage or None)
             client_mm_list.append(client_mm or None)
 
@@ -838,7 +853,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         pending_aux_output: Any | None = None,
         streaming_audio: StreamingAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
+        client_output_keys: tuple[str, ...] = (),
     ):
+        self._client_output_keys = frozenset(client_output_keys)
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
@@ -1055,6 +1072,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._num_reqs,
                     self._total_tokens,
                     self._padded_total_tokens,
+                    client_output_keys=self._client_output_keys,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
