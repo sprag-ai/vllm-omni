@@ -22,6 +22,13 @@ OMNI_PLATFORM_PLUGINS_GROUP = "vllm_omni.platform_plugins"
 # returns the client to serve. They see every request on every route, so they
 # load only when named in `VLLM_PLUGINS`, and a plugin that fails stops startup.
 OMNI_ENGINE_CLIENT_PLUGINS_GROUP = "vllm_omni.engine_client_plugins"
+# Realtime transcription plugins run in the API server process. Each entry point
+# resolves to a callable that receives a realtime connection and the transcription
+# session config, and returns the object that transcribes the session's audio, or
+# None to leave the session to the next plugin and finally the built-in
+# `TranscriptionTurns`. They load only when named in `VLLM_PLUGINS`, and a plugin
+# that fails to load stops startup.
+OMNI_REALTIME_TRANSCRIPTION_PLUGINS_GROUP = "vllm_omni.realtime_transcription_plugins"
 
 # Make sure one process only loads plugins once.
 omni_plugins_loaded = False
@@ -113,10 +120,38 @@ def apply_engine_client_plugins(engine_client: Any) -> Any:
     return engine_client
 
 
+def load_realtime_transcription_plugins() -> list[Callable[..., Any]]:
+    """Return the allowlisted realtime transcription plugins, in discovery order."""
+    from importlib.metadata import entry_points
+
+    discovered = entry_points(group=OMNI_REALTIME_TRANSCRIPTION_PLUGINS_GROUP)
+    if not discovered:
+        return []
+
+    allowed_plugins = envs.VLLM_PLUGINS
+    if allowed_plugins is None:
+        logger.warning(
+            "Found realtime transcription plugin(s) %s but VLLM_PLUGINS is not set. "
+            "Realtime transcription plugins must be allowlisted via VLLM_PLUGINS to be loaded.",
+            [plugin.name for plugin in discovered],
+        )
+        return []
+
+    plugins = []
+    for plugin in discovered:
+        if plugin.name not in allowed_plugins:
+            continue
+        plugins.append(plugin.load())
+        logger.info("Loaded realtime transcription plugin %s -> %s", plugin.name, plugin.value)
+    return plugins
+
+
 __all__ = [
     "apply_engine_client_plugins",
+    "load_realtime_transcription_plugins",
     "load_omni_general_plugins",
     "OMNI_ENGINE_CLIENT_PLUGINS_GROUP",
     "OMNI_DEFAULT_PLUGINS_GROUP",
     "OMNI_PLATFORM_PLUGINS_GROUP",
+    "OMNI_REALTIME_TRANSCRIPTION_PLUGINS_GROUP",
 ]

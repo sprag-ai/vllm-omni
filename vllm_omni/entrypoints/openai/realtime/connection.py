@@ -58,7 +58,11 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
-from vllm_omni.entrypoints.openai.realtime.transcription import TranscriptionTurns, merge_transcription_config
+from vllm_omni.entrypoints.openai.realtime.transcription import (
+    TranscriptionTurns,
+    make_transcription_turns,
+    merge_transcription_config,
+)
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 from vllm_omni.utils.speakers import validate_requested_speaker
@@ -273,7 +277,7 @@ class OpenAIFullDuplexConnection:
 
         self._apply_turn_detection(turn_detection_config)
         if self._transcription is None:
-            self._transcription = TranscriptionTurns(self, config)
+            self._transcription = make_transcription_turns(self, config)
         else:
             self._transcription.config = config
         session_obj = config.model_dump(exclude_none=True)
@@ -459,6 +463,8 @@ class OpenAIFullDuplexConnection:
         # prefix_padding_ms only adjusts speech_started.audio_start_ms; it does
         # not trim earlier silence from the audio item.
         self.session.input_audio_buffer.extend(audio_bytes)
+        if self._transcription is not None:
+            await self._transcription.append(audio_bytes)
         if result is not None:
             await self._handle_turn_detection_result(result)
 
@@ -647,6 +653,8 @@ class OpenAIFullDuplexConnection:
 
     async def _handle_audio_clear(self, event: types.InputAudioBufferClearEvent):
         self.session.input_audio_buffer.clear()
+        if self._transcription is not None:
+            await self._transcription.clear()
         self._reset_turn_detection()
         await self._send_event(
             types.InputAudioBufferClearedEvent(

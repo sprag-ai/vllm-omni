@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from functools import cache
 from typing import TYPE_CHECKING
 
 from openai.types import realtime as types
@@ -14,6 +15,7 @@ from vllm.model_executor.models.interfaces import SupportsTranscription, support
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.openai.realtime.session import _gen_id, _merge_config_models
+from vllm_omni.plugins import load_realtime_transcription_plugins
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -70,6 +72,12 @@ class TranscriptionTurns:
         transcription = audio_input.transcription if audio_input is not None else None
         prompt = transcription.prompt if transcription is not None else None
         return prompt or DEFAULT_TRANSCRIPTION_PROMPT
+
+    async def append(self, audio: bytes) -> None:
+        """Receive appended PCM16 at the session rate as it arrives; the built-in turns wait for commit."""
+
+    async def clear(self) -> None:
+        """Drop the audio appended since the last commit."""
 
     async def commit(self, audio: str, audio_seconds: float, item_id: str | None) -> None:
         """Announce a committed turn and start transcribing it.
@@ -204,6 +212,23 @@ class TranscriptionTurns:
                 delta=delta,
             )
         )
+
+
+@cache
+def transcription_plugins() -> tuple:
+    """Load the realtime transcription plugins once per process; the API server calls this at startup."""
+    return tuple(load_realtime_transcription_plugins())
+
+
+def make_transcription_turns(
+    connection: OpenAIFullDuplexConnection, config: types.RealtimeTranscriptionSessionCreateRequest
+) -> TranscriptionTurns:
+    """Return the first plugin's turns that claims the session, or the built-in ``TranscriptionTurns``."""
+    for plugin in transcription_plugins():
+        turns = plugin(connection, config)
+        if turns is not None:
+            return turns
+    return TranscriptionTurns(connection, config)
 
 
 def merge_transcription_config(

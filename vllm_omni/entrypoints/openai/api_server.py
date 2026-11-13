@@ -165,6 +165,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime.transcription import transcription_plugins
 from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionCapacityError,
     RolloutSessionClosedError,
@@ -714,6 +715,7 @@ async def build_async_omni_from_stage_config(
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
 
+        transcription_plugins()
         # Shutdown below always targets the engine built here, whatever a plugin returns.
         yield apply_engine_client_plugins(async_omni)
     finally:
