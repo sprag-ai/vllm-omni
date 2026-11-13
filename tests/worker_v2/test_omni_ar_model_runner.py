@@ -1046,3 +1046,27 @@ def test_outputs_are_copied_only_when_a_request_needs_them(output_type, req_ids,
     runner._final_stage_req_ids = {"text_a", "text_b"}
 
     assert runner._batch_needs_pooler(output_type, req_ids) is expected
+
+
+@pytest.mark.parametrize("output_type", ["text", "latent"])
+def test_declared_client_keys_are_always_copied(output_type):
+    runner = object.__new__(OmniARModelRunner)
+    runner._final_stage_req_ids = {"text_a"}
+    runner.model = SimpleNamespace(omni_client_multimodal_output_keys=("probe",))
+
+    assert runner._batch_needs_pooler(output_type, ["text_a"]) is True
+
+
+def test_declared_client_keys_reach_the_client_channel() -> None:
+    build = OmniARModelRunner._build_async_chunk_outputs_from_mm
+    probe, codes = torch.randn(4, 8), torch.arange(16, dtype=torch.long).reshape(4, 4)
+    mm = {"probe": probe, "codes": {"audio": codes}}
+    starts, lengths = np.array([0, 3, 4]), np.array([3, 1])
+
+    inter_stage, client = build(mm, starts, lengths, 2, 4)
+    assert client is None  # undeclared, so the key stays off the client channel
+
+    inter_stage, client = build(mm, starts, lengths, 2, 4, client_output_keys=frozenset({"probe"}))
+    assert torch.equal(client[0]["probe"], probe[:3]) and torch.equal(client[1]["probe"], probe[3:])
+    assert set(client[0]) == {"probe"}
+    assert torch.equal(inter_stage[1]["codes.audio"], codes[3:]) and "probe" in inter_stage[0]
