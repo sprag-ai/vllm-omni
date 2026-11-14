@@ -16,6 +16,8 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
 )
 from vllm.inputs import EngineInput
 
+from vllm_omni.inputs.speech_to_text import SPEECH_TO_TEXT_INSTRUCTIONS
+
 _BASE_TOKENS = 128
 """Allowance independent of length, covering short clips whose rate is dominated by the framing."""
 
@@ -165,7 +167,28 @@ class _StreamedPromptUsage:
             yield _with_prompt_usage(event, counts, details)
 
 
-class OmniOpenAIServingTranscription(_StreamedPromptUsage, _AudioDurationBound, OpenAIServingTranscription):
+class _TranscriptionInstructions:
+    """Exposes a transcription's ``instructions`` form field to the model's generation prompt."""
+
+    async def _preprocess_speech_to_text(
+        self,
+        request: SpeechToTextRequest,
+        audio_data: bytes,
+        request_id: str,
+    ) -> tuple[list[EngineInput], float, list[float]]:
+        """Preprocess as upstream does with the request's instructions set for its prompt rendering."""
+        token = SPEECH_TO_TEXT_INSTRUCTIONS.set((request.model_extra or {}).get("instructions"))
+        try:
+            return await super()._preprocess_speech_to_text(
+                request=request, audio_data=audio_data, request_id=request_id
+            )
+        finally:
+            SPEECH_TO_TEXT_INSTRUCTIONS.reset(token)
+
+
+class OmniOpenAIServingTranscription(
+    _TranscriptionInstructions, _StreamedPromptUsage, _AudioDurationBound, OpenAIServingTranscription
+):
     """``/v1/audio/transcriptions``, bounded by its audio's duration, with a stream's prompt tokens by modality."""
 
 
