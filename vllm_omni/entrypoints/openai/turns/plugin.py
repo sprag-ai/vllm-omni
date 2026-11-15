@@ -16,6 +16,7 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from vllm_omni.engine.duplex.vad import SileroStreamingVAD, SileroVADBackendProvider
 from vllm_omni.entrypoints.openai.turns.connection import VAD_CONFIG, TurnsConnection
+from vllm_omni.entrypoints.openai.turns.score import score_turn
 from vllm_omni.entrypoints.openai.turns.scorer import TURN_PROMPT_FILE, TurnPrompt, TurnScorer
 
 
@@ -39,8 +40,9 @@ class TurnsEndpointPlugin:
     required_tasks = ("classify",)
 
     def attach_router(self, app: FastAPI) -> None:
-        """Register the ``/v1/turns`` WebSocket route."""
+        """Register the ``/v1/turns`` WebSocket route and its ``POST`` scoring route."""
         app.add_api_websocket_route("/v1/turns", turns_session)
+        app.add_api_route("/v1/turns", score_turn, methods=["POST"])
 
     async def init_state(self, engine_client: EngineClient | None, state: State, args: Namespace) -> None:
         """Build the shared scorer and VAD backend.
