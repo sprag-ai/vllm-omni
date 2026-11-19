@@ -36,6 +36,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.generate.structured_decisions.api_router import init_structured_decisions_state
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
@@ -1310,6 +1311,17 @@ async def omni_init_app_state(
     )
     state.openai_serving_realtime_robot = None
     state.rl_rollout_serving = None
+
+    # Upstream reads the template from args.chat_template alone, which misses a model whose template
+    # ships in chat_template.json and leaves /v1/systemone disabled.
+    init_structured_decisions_state(
+        engine_client,
+        state,
+        Namespace(**{**vars(args), "chat_template": resolved_chat_template}),
+        request_logger,
+        tuple(supported_tasks),
+        args.default_chat_template_kwargs or {},
+    )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0

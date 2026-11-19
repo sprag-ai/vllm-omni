@@ -1414,8 +1414,21 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
+    async def fake_resolve_chat_template(_engine_client, _args):
+        return "model-template"
+
+    monkeypatch.setattr(api_server, "_resolve_chat_template", fake_resolve_chat_template)
+    decisions_init = {}
+
+    def fake_init_structured_decisions_state(engine_client, state, args, _logger, tasks, template_kwargs):
+        decisions_init.update(chat_template=args.chat_template, tasks=tasks, template_kwargs=template_kwargs)
+        state.serving_structured_decisions = _marker("structured_decisions")
+
+    monkeypatch.setattr(api_server, "init_structured_decisions_state", fake_init_structured_decisions_state)
+
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
+    assert decisions_init == {"chat_template": "model-template", "tasks": supported_tasks, "template_kwargs": {}}
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
