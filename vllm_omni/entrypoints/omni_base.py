@@ -36,8 +36,8 @@ from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.metrics.utils import (
-    completion_outputs,
     extract_queue_wait_s,
+    iter_request_output_items,
     normalize_failure_reason,
     observe_stage_workload_metrics,
 )
@@ -715,7 +715,7 @@ class OmniBase(PDDisaggregationMixin):
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
                 # Extract finished_reason from upstream CompletionOutput so
                 # the per-reason completion Counter is labelled correctly.
-                completions = completion_outputs(engine_outputs)
+                completions = iter_request_output_items(engine_outputs)
                 fr = (getattr(completions[0], "finish_reason", None) if completions else None) or "stop"
                 self.prom_metrics.request_succeeded(
                     e2e_seconds,

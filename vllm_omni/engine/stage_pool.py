@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
-from vllm.outputs import PoolingOutput
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
@@ -42,8 +41,8 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
-    completion_outputs,
     iter_mm_outputs,
+    iter_request_output_items,
 )
 
 if TYPE_CHECKING:
@@ -738,7 +737,7 @@ class StagePool:
             (
                 str(reason)
                 for request_output in reversed(request_outputs)
-                for completion in reversed(completion_outputs(request_output))
+                for completion in reversed(iter_request_output_items(request_output))
                 if (reason := getattr(completion, "finish_reason", None)) is not None
             ),
             None,
@@ -1001,14 +1000,11 @@ class StagePool:
         return self._has_non_empty_output(request_output)
 
     def _has_non_empty_output(self, request_output: Any) -> bool:
-        outputs = getattr(request_output, "outputs", None)
-        if isinstance(outputs, PoolingOutput):
-            return outputs.data is not None
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
-            return any(bool(getattr(output, "text", "")) for output in completion_outputs(request_output))
+            return any(bool(getattr(output, "text", "")) for output in iter_request_output_items(request_output))
 
         if getattr(request_output, "images", None):
             return True
@@ -1022,8 +1018,10 @@ class StagePool:
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
-        for output in completion_outputs(request_output):
+        for output in iter_request_output_items(request_output):
             if getattr(output, "text", None):
+                return True
+            if self._is_non_empty_value(getattr(output, "data", None)):
                 return True
             token_ids = getattr(output, "token_ids", None)
             if self._is_non_empty_value(token_ids):

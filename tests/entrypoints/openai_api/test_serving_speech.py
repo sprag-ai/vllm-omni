@@ -6612,3 +6612,13 @@ def test_extract_audio_output_reads_a_completion_multimodal_output():
     mm, key = OmniOpenAIServingSpeech._extract_audio_output(res)
 
     assert key == "audio" and mm["audio"] is audio
+
+
+def test_extract_audio_output_preserves_scalar_multimodal_output():
+    audio = torch.ones(4)
+    scalar = SimpleNamespace(multimodal_output={"audio": audio})
+    res = SimpleNamespace(multimodal_output=None, outputs=scalar)
+
+    mm, key = OmniOpenAIServingSpeech._extract_audio_output(res)
+
+    assert key == "audio" and mm["audio"] is audio

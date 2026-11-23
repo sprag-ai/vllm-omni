@@ -86,6 +86,14 @@ interpretation, connector transport mechanics, scheduling policy, or semantic
 error classification. The `ErrorMessage` schema belongs here; the meaning and
 public rendering of its error fields belong to `error_contracts.md`.
 
+## Generation and pooling outputs
+
+Generation requests expose a sequence of completion outputs; pooling requests
+expose one scalar output. Consumers normalize both shapes with
+`iter_request_output_items` before inspecting their payloads. Scalar multimodal
+payloads remain discoverable. Plain pooling results contribute no generated
+tokens or audio; non-empty pooling data counts as a stage output.
+
 ## Current audio decoding compatibility
 
 Omni retains soundfile-first automatic audio decoding when using vLLM 0.32.

@@ -2399,7 +2399,7 @@ def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> N
     assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
 
 
-@pytest.mark.parametrize(("data", "expected"), [(torch.zeros(2, 3), True), (None, False)])
+@pytest.mark.parametrize(("data", "expected"), [(torch.zeros(2, 3), True), (torch.zeros(0, 3), False), (None, False)])
 def test_pooling_stage_output_is_non_empty_when_it_carries_data(data, expected) -> None:
     stage = FakeStageClient(stage_type="llm", final_output=True, final_output_type="timestamps")
     pool = StagePool(2, [stage], output_processor=FakeOutputProcessor())
