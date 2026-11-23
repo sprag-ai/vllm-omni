@@ -17,6 +17,7 @@ from vllm_omni.metrics.utils import (
     extract_diffusion_vae_decode_ms,
     extract_mm_output,
     iter_mm_outputs,
+    iter_request_output_items,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -180,6 +181,27 @@ class _PoolingOutput:
     multimodal_output = None
 
 
+@pytest.mark.parametrize("shape", ["missing", "none", "empty", "list", "tuple", "scalar"])
+def test_request_output_items_normalize_generation_and_pooling(shape: str) -> None:
+    item = _PoolingOutput()
+    shapes = {
+        "missing": SimpleNamespace(),
+        "none": SimpleNamespace(outputs=None),
+        "empty": SimpleNamespace(outputs=[]),
+        "list": SimpleNamespace(outputs=[item]),
+        "tuple": SimpleNamespace(outputs=(item,)),
+        "scalar": SimpleNamespace(outputs=item),
+    }
+
+    result = iter_request_output_items(shapes[shape])
+
+    assert isinstance(result, tuple)
+    if shape in {"missing", "none", "empty"}:
+        assert result == ()
+    else:
+        assert len(result) == 1 and result[0] is item
+
+
 def test_iter_mm_outputs_skips_a_pooling_stage_output() -> None:
     assert iter_mm_outputs(SimpleNamespace(outputs=_PoolingOutput())) == []
 
@@ -192,3 +214,12 @@ def test_iter_mm_outputs_still_visits_completion_outputs() -> None:
     audio = {"audio": [1]}
     source = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=audio), SimpleNamespace()])
     assert iter_mm_outputs(source) == [audio]
+
+
+@pytest.mark.parametrize("extract", [iter_mm_outputs, extract_mm_output])
+def test_scalar_multimodal_output_is_preserved(extract) -> None:
+    payload = {"audio": [1, 2, 3]}
+    output = SimpleNamespace(outputs=SimpleNamespace(multimodal_output=payload))
+
+    expected = [payload] if extract is iter_mm_outputs else payload
+    assert extract(output) == expected

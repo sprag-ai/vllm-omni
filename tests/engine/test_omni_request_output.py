@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for OmniRequestOutput class."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -11,6 +13,14 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_multimodal_output_preserves_scalar_payload():
+    payload = {"audio": [0.1, -0.1], "sr": 24000}
+    output = OmniRequestOutput(request_id="scalar-audio")
+    output.outputs = SimpleNamespace(multimodal_output=payload)
+
+    assert output.multimodal_output is payload
 
 
 @pytest.mark.parametrize("payload_location", ["request", "completion", "missing"])

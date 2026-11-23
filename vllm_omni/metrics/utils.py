@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
 
@@ -250,7 +250,7 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(value)
+        value = int(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -278,7 +278,7 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(value)
+        value = float(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -304,16 +304,6 @@ def resolve_int_by_sequential_keys(
     return None
 
 
-def completion_outputs(mm_source: object) -> list[Any] | tuple[Any, ...]:
-    """Return ``mm_source.outputs`` when it is a sequence of completions; empty otherwise.
-
-    A pooling stage's ``RequestOutput`` carries a single ``PoolingOutput`` in ``outputs``, which holds no
-    multimodal payload.
-    """
-    outputs = getattr(mm_source, "outputs", None)
-    return outputs if isinstance(outputs, (list, tuple)) else ()
-
-
 def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     """Return the first non-empty multimodal_output Mapping on ``mm_source``.
 
@@ -335,7 +325,7 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(mm, Mapping) and mm:
         return mm
-    outs = completion_outputs(mm_source)
+    outs = iter_request_output_items(mm_source)
     if outs:
         nested = getattr(outs[0], "multimodal_output", None)
         if isinstance(nested, Mapping) and nested:
@@ -343,13 +333,24 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     return {}
 
 
+def iter_request_output_items(output_source: object) -> tuple[object, ...]:
+    """Normalize vLLM generation and pooling request outputs."""
+    outputs = getattr(output_source, "outputs", None)
+    if outputs is None:
+        return ()
+    if isinstance(outputs, (list, tuple)):
+        return tuple(outputs)
+    return (outputs,)
+
+
 def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     """Collect all non-empty multimodal_output Mappings from ``mm_source``.
 
     Lookup order:
       1. ``mm_source.multimodal_output`` — top-level attribute / property
-      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
-         entry that carries a non-empty multimodal Mapping
+      2. each normalized output item's ``multimodal_output`` — every
+         CompletionOutput entry that carries a non-empty multimodal Mapping.
+         A scalar PoolingOutput is accepted and normally contributes nothing.
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
@@ -366,7 +367,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in completion_outputs(mm_source):
+    for output in iter_request_output_items(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -505,7 +506,7 @@ def count_video_frames(video: object) -> int | None:
 def _build_field_defs(
     cls: type,
     exclude: set[str],
-    transforms: dict[str, tuple[str, Callable]] | None = None,
+    transforms: dict[str, tuple[str, Callable[[Any], Any]]] | None = None,
 ) -> list[tuple[str, Callable[[Any], Any]]]:
     """Auto-generate field definitions from a dataclass.
 
@@ -519,16 +520,28 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
-            # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+
+            def transformed_getter(
+                event: Any,
+                *,
+                transform: Callable[[Any], Any] = transform_fn,
+                name: str = f.name,
+            ) -> Any:
+                return transform(getattr(event, name))
+
+            result.append((display_name, transformed_getter))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+
+            def getter(event: Any, *, name: str = f.name) -> Any:
+                return getattr(event, name)
+
+            result.append((f.name, getter))
     return result
 
 
@@ -646,7 +659,7 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
     total = 0
     for _ro in engine_outputs:
         try:
-            for output in completion_outputs(_ro):
+            for output in iter_request_output_items(_ro):
                 # In DELTA mode token_ids only contains the latest chunk.
                 # Omni's output processor attaches the cumulative sequence
                 # for inter-stage routing and accurate metrics.

@@ -11,6 +11,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.metrics.utils import iter_request_output_items
 
 
 @dataclass
@@ -342,9 +343,7 @@ class OmniRequestOutput(RequestOutput):
 
         Returns either a MultimodalPayload (Phase 3+) or a plain dict (legacy).
         """
-        # A pooling stage's outputs is a single PoolingOutput, which carries no multimodal payload.
-        completions = self.outputs if isinstance(self.outputs, (list, tuple)) else ()
-        for output in completions:
+        for output in iter_request_output_items(self):
             if mm := getattr(output, "multimodal_output", None):
                 return mm
         return self._multimodal_output
