@@ -295,6 +295,22 @@ def _assert_app_state_snapshot(
     assert not unexpectedly_set, f"app.state keys expected to stay None: {unexpectedly_set}"
 
 
+class _RecordingEndpointPlugin:
+    """An endpoint plugin that records the chat handler it found when its state was initialized."""
+
+    name = "recording"
+    required_tasks = None
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, object]] = []
+
+    def attach_router(self, app) -> None:
+        pass
+
+    async def init_state(self, engine_client, state, args) -> None:
+        self.calls.append((engine_client, getattr(state, "openai_serving_chat", None)))
+
+
 def _minimal_args(**overrides) -> SimpleNamespace:
     args = SimpleNamespace(
         tool_parser_plugin=None,
@@ -1273,13 +1289,18 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         classmethod(lambda cls, *a, **k: _marker("openpi")),
     )
 
+    plugin = _RecordingEndpointPlugin()
     state = State()
+    state.endpoint_plugins = [plugin]
     await api_server.omni_init_app_state(
         engine,
         state,
         _minimal_args(),
     )
 
+    assert len(plugin.calls) == 1
+    assert plugin.calls[0][0] is engine
+    assert plugin.calls[0][1] is not None
     _assert_app_state_snapshot(
         state,
         expected_keys=_DIFFUSION_APP_STATE_KEYS,
@@ -1426,8 +1447,11 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
 
     monkeypatch.setattr(api_server, "init_structured_decisions_state", fake_init_structured_decisions_state)
 
+    plugin = _RecordingEndpointPlugin()
     state = State()
+    state.endpoint_plugins = [plugin]
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
+    assert plugin.calls == [(engine, state.openai_serving_chat)]
     assert decisions_init == {"chat_template": "model-template", "tasks": supported_tasks, "template_kwargs": {}}
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
