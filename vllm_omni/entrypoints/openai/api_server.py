@@ -76,6 +76,7 @@ from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.outputs import RequestOutput
+from vllm.plugins.endpoint_plugins.interface import init_endpoint_plugins_state
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
@@ -910,13 +911,23 @@ async def omni_init_app_state(
     Sets up the application state with model information, request logger,
     and other server configuration needed for handling API requests.
     Automatically detects pure diffusion mode (single diffusion stage) and
-    handles it appropriately.
+    handles it appropriately. Endpoint plugins initialize their state last,
+    after the core state they may read, as in upstream ``init_app_state``.
 
     Args:
         engine_client: Engine client instance (AsyncOmni)
         state: FastAPI application state object to initialize
         args: Parsed command-line arguments
     """
+    await _init_core_app_state(engine_client, state, args)
+    await init_endpoint_plugins_state(engine_client, state, args)
+
+
+async def _init_core_app_state(
+    engine_client: EngineClient,
+    state: State,
+    args: Namespace,
+) -> None:
     # AsyncOmni already exposes the selected deploy path, including the model's
     # default YAML. Reuse the loader for base_config inheritance; API-only cache
     # settings need not be carried through the engine or stage configurations.
