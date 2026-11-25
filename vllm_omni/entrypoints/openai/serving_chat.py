@@ -1674,6 +1674,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
         last_metrics: dict[str, Any] | None = None
+        usage_metrics: dict[str, Any] | None = None
+        unreturned_text_counted = False
         # Hold a strong reference to the audio request state so the
         # streaming-finalize hook below survives the inner generator's
         # _log_summary_and_cleanup, which pops request_states[request_id]
@@ -1683,7 +1685,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
                 res = omni_res
+                if omni_res.metrics:
+                    usage_metrics = omni_res.metrics
                 if final_output_type not in first_iteration_dict:
+                    if final_output_type == "text":
+                        # Usage counts the text stage whether or not the request returns text: the
+                        # other modalities are generated from it.
+                        if not unreturned_text_counted and res.prompt_token_ids is not None:
+                            num_prompt_tokens = self._prompt_token_count(res)
+                            num_cached_tokens = res.num_cached_tokens
+                            num_cache_creation_tokens = res.num_cache_creation_tokens
+                            unreturned_text_counted = True
+                        for output in res.outputs:
+                            previous_num_tokens[output.index] += len(output.token_ids)
+                        continue
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
 
@@ -1712,9 +1727,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # of the stage that producing text output for consistency for current
                     # non-stream behaviors.
                     if res.prompt_token_ids is not None:
-                        num_prompt_tokens = len(res.prompt_token_ids)
-                        if res.encoder_prompt_token_ids is not None:
-                            num_prompt_tokens += len(res.encoder_prompt_token_ids)
+                        num_prompt_tokens = self._prompt_token_count(res)
 
                     num_cached_tokens = res.num_cached_tokens
                     num_cache_creation_tokens = res.num_cache_creation_tokens
@@ -2464,17 +2477,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
-                completion_tokens = sum(previous_num_tokens)
-                final_usage = UsageInfo(
+                final_usage = self._build_usage(
+                    request,
                     prompt_tokens=num_prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=num_prompt_tokens + completion_tokens,
-                )
-                final_usage.prompt_tokens_details = _make_prompt_tokens_details(
-                    self.enable_prompt_tokens_details,
-                    num_cached_tokens,
-                    num_cache_creation_tokens,
-                    mm_token_counts,
+                    completion_tokens=sum(previous_num_tokens),
+                    num_cached_tokens=num_cached_tokens,
+                    num_cache_creation_tokens=num_cache_creation_tokens,
+                    mm_token_counts=mm_token_counts,
+                    metrics=usage_metrics,
                 )
 
                 final_usage_chunk = OmniChatCompletionStreamResponse(
@@ -2584,10 +2594,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
         )
 
+        usage_res: OmniRequestOutput | None = None
+        usage_metrics: dict[str, Any] | None = None
         for omni_outputs in final_outputs:
             choices_data = []
             if not omni_outputs.finished:
                 continue
+
+            if omni_outputs.metrics:
+                usage_metrics = omni_outputs.metrics
+            # Usage counts the text stage whether or not the request returns text: the other
+            # modalities are generated from it.
+            if omni_outputs.final_output_type == "text" and omni_outputs.prompt_token_ids is not None:
+                usage_res = omni_outputs
 
             # Filter outputs based on requested modalites
             if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
@@ -2653,6 +2672,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         if pending_audio_choices:
             choices = self._merge_audio_choices(choices, pending_audio_choices)
+
+        if usage_res is not None:
+            usage = self._text_stage_usage(request, usage_res, mm_token_counts, usage_metrics)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
@@ -2946,27 +2968,75 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 choice.message.content = full_message
 
         assert final_res.prompt_token_ids is not None
-        num_prompt_tokens = len(final_res.prompt_token_ids)
-        if final_res.encoder_prompt_token_ids is not None:
-            num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
-        num_generated_tokens = sum(len(output.token_ids) for output in final_res.outputs)
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
-            total_tokens=num_prompt_tokens + num_generated_tokens,
-        )
-        usage.prompt_tokens_details = _make_prompt_tokens_details(
-            self.enable_prompt_tokens_details,
-            final_res.num_cached_tokens,
-            final_res.num_cache_creation_tokens,
-            mm_token_counts,
-        )
+        usage = self._text_stage_usage(request, final_res, mm_token_counts, final_res.metrics)
 
         prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
         prompt_token_ids = final_res.prompt_token_ids if request.return_token_ids else None
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
+
+    @staticmethod
+    def _prompt_token_count(res: OmniRequestOutput) -> int:
+        """Prompt tokens of a text-stage output, its encoder prompt included."""
+        count = len(res.prompt_token_ids or ())
+        if res.encoder_prompt_token_ids is not None:
+            count += len(res.encoder_prompt_token_ids)
+        return count
+
+    def _text_stage_usage(
+        self,
+        request: ChatCompletionRequest,
+        res: OmniRequestOutput,
+        mm_token_counts: dict[str, int] | None,
+        metrics: dict[str, Any] | None,
+    ) -> UsageInfo:
+        """Usage of a finished, non-streamed text-stage output."""
+        return self._build_usage(
+            request,
+            prompt_tokens=self._prompt_token_count(res),
+            completion_tokens=sum(len(output.token_ids) for output in res.outputs),
+            num_cached_tokens=res.num_cached_tokens,
+            num_cache_creation_tokens=res.num_cache_creation_tokens,
+            mm_token_counts=mm_token_counts,
+            metrics=metrics,
+        )
+
+    def _build_usage(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        num_cached_tokens: int | None,
+        num_cache_creation_tokens: int | None,
+        mm_token_counts: dict[str, int] | None,
+        metrics: dict[str, Any] | None,
+    ) -> UsageInfo:
+        """Build a chat response's usage; streamed and non-streamed responses both build it here.
+
+        Args:
+            request: The chat request.
+            prompt_tokens: Prompt tokens of the text stage, its encoder prompt included.
+            completion_tokens: Tokens the text stage generated.
+            num_cached_tokens: The text stage's prefix-cache hits.
+            num_cache_creation_tokens: The text stage's prefix-cache writes.
+            mm_token_counts: Prompt placeholder tokens per input modality.
+            metrics: The response's latest per-stage metrics snapshot, which reports what stages
+                after the text stage produced.
+        """
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+        usage.prompt_tokens_details = _make_prompt_tokens_details(
+            self.enable_prompt_tokens_details,
+            num_cached_tokens,
+            num_cache_creation_tokens,
+            mm_token_counts,
+        )
+        return usage
 
     def _merge_audio_choices(
         self,

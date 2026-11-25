@@ -29,8 +29,9 @@ def make_text_omni_output(
     index: int = 0,
     num_prompt_tokens: int = 3,
     num_cached_tokens: int | None = None,
+    final_output_type: str = "text",
 ) -> OmniRequestOutput:
-    """Build an OmniRequestOutput wrapping a text RequestOutput."""
+    """Build an OmniRequestOutput wrapping a RequestOutput, a text one unless ``final_output_type`` says otherwise."""
     if token_ids is None:
         token_ids = [10, 11, 12]
     res = RequestOutput(
@@ -55,7 +56,7 @@ def make_text_omni_output(
     return OmniRequestOutput.from_stage_output(
         res,
         request_id=request_id,
-        final_output_type="text",
+        final_output_type=final_output_type,
         finished=finish_reason is not None,
     )
 
@@ -80,6 +81,7 @@ def build_serving_chat(
     request_logger=None,
     chat_template=None,
     chat_template_content_format="auto",
+    chat_cls: type[OmniOpenAIServingChat] = OmniOpenAIServingChat,
     **init_overrides,
 ) -> OmniOpenAIServingChat:
     """Create a real OmniOpenAIServingChat via its actual __init__.
@@ -102,7 +104,7 @@ def build_serving_chat(
     if online_renderer is None:
         online_renderer = MagicMock()
 
-    instance = OmniOpenAIServingChat(
+    instance = chat_cls(
         engine_client=engine_client,
         models=models,
         response_role=response_role,
