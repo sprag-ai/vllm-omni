@@ -4105,3 +4105,20 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+def test_cli_head_dtype_reaches_the_qwen3_asr_stage():
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
+        OMNI_PIPELINES["qwen3_asr"], {"hf_overrides": {"head_dtype": "float32"}}
+    )
+    assert stages[0].to_omegaconf().engine_args.hf_overrides.head_dtype == "float32"
+
+
+def test_cli_head_dtype_merges_with_deploy_hf_overrides():
+    deploy = load_deploy_config(get_deploy_config_path("gepard.yaml"))
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
+        OMNI_PIPELINES["gepard"], {"hf_overrides": {"head_dtype": "float32"}}, user_deploy_config=deploy
+    )
+    hf_overrides = stages[0].to_omegaconf().engine_args.hf_overrides
+    assert hf_overrides.head_dtype == "float32"
+    assert list(hf_overrides.architectures) == ["GepardTalkerForConditionalGeneration"]
