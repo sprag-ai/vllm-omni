@@ -7,7 +7,10 @@ import math
 from types import SimpleNamespace
 
 import pytest
+import torch
 from fastapi import HTTPException
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.model import _get_head_dtype
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -17,6 +20,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatMessage,
 )
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse, PromptTokenUsageInfo, UsageInfo
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
 from vllm_omni.entrypoints.openai.serving_decisions import (
     LETTERS,
@@ -269,3 +274,46 @@ def test_a_failed_question_cancels_the_others():
 def test_letters_must_be_distinct_single_tokens():
     with pytest.raises(ValueError, match="distinct token"):
         OmniServingDecisions(FakeChat([]), [32] * len(LETTERS))
+
+
+def lm_head_letter_probabilities(head_dtype: torch.dtype | None) -> tuple[list[float], list[float]]:
+    """Return P(A) through vLLM's LogitsProcessor at ``head_dtype``, and P(A) from a float32 reference."""
+    generator = torch.Generator().manual_seed(0)
+    rows, hidden, vocab = 4096, 2048, 64
+    hidden_states = torch.randn(rows, hidden, generator=generator)
+    hidden_states[:, 0] = 20.0
+    weight = 0.05 * torch.randn(vocab, hidden, generator=generator)
+    weight[LETTER_IDS[:2], 0] = 1.0
+    hidden_states, weight = hidden_states.bfloat16(), weight.bfloat16()
+    lm_head = SimpleNamespace(weight=weight, quant_method=UnquantizedEmbeddingMethod(), tp_size=1)
+    with set_current_vllm_config(VllmConfig()):
+        processor = LogitsProcessor(vocab)
+    processor.head_dtype = head_dtype
+    logprobs = torch.log_softmax(processor(lm_head, hidden_states).float(), dim=-1)
+    served = [
+        letter_probabilities(chat_response({32: row[32].item(), 33: row[33].item()}), LETTER_IDS[:2])[0]
+        for row in logprobs
+    ]
+    reference = torch.softmax(hidden_states.float() @ weight[LETTER_IDS[:2]].float().T, dim=-1)[:, 0]
+    return served, reference.tolist()
+
+
+def test_a_float32_head_dtype_resolves_for_a_generation_model():
+    config = SimpleNamespace(head_dtype="float32")
+    assert _get_head_dtype(config=config, dtype=torch.bfloat16, runner_type="generate") == torch.float32
+
+
+def distinct(probabilities: list[float]) -> int:
+    return len({round(p, 6) for p in probabilities})
+
+
+def test_a_bf16_head_quantizes_letter_probabilities():
+    served, reference = lm_head_letter_probabilities(None)
+    assert distinct(served) < 300
+    assert max(abs(s - r) for s, r in zip(served, reference)) > 1e-2
+
+
+def test_a_float32_head_matches_the_float32_reference():
+    served, reference = lm_head_letter_probabilities(torch.float32)
+    assert distinct(served) > 4000
+    assert max(abs(s - r) for s, r in zip(served, reference)) < 1e-4

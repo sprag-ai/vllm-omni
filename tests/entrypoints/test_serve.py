@@ -206,6 +206,36 @@ def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) 
     assert "no_guardrails" not in explicit
 
 
+def _decisions_hf_overrides(mocker: MockerFixture, extra_argv: list[str]) -> dict[str, Any] | None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", *extra_argv])
+    args.headless = True
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    mocker.patch("vllm_omni.entrypoints.cli.serve.run_headless")
+    OmniServeCommand.cmd(args)
+    return args.get_explicit_kwargs_dict().get("hf_overrides")
+
+
+def test_decisions_defaults_the_head_to_float32(mocker: MockerFixture) -> None:
+    assert _decisions_hf_overrides(mocker, ["--decisions"]) == {"head_dtype": "float32"}
+
+
+def test_decisions_keeps_other_hf_overrides(mocker: MockerFixture) -> None:
+    overrides = _decisions_hf_overrides(mocker, ["--decisions", "--hf-overrides", '{"max_position_embeddings": 4096}'])
+    assert overrides == {"max_position_embeddings": 4096, "head_dtype": "float32"}
+
+
+def test_decisions_respects_an_explicit_head_dtype(mocker: MockerFixture) -> None:
+    overrides = _decisions_hf_overrides(mocker, ["--decisions", "--hf-overrides", '{"head_dtype": "model"}'])
+    assert overrides == {"head_dtype": "model"}
+
+
+def test_head_dtype_is_untouched_without_decisions(mocker: MockerFixture) -> None:
+    assert _decisions_hf_overrides(mocker, []) is None
+
+
 def test_omni_serve_requires_model_when_none_provided() -> None:
     """Regression for https://github.com/vllm-project/vllm-omni/issues/4158:
     ``vllm serve --omni`` with no model must fail fast instead of silently

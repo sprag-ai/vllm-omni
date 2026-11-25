@@ -111,6 +111,26 @@ def _json_object(value: str) -> dict[str, object]:
     return parsed
 
 
+def _default_decisions_head_dtype(args: TrackingNamespace) -> None:
+    """Default the lm_head to float32 output under ``--decisions`` unless ``--hf-overrides`` names a ``head_dtype``.
+
+    Raises:
+        ValueError: ``--hf-overrides`` is not a JSON object.
+    """
+    existing = getattr(args, "hf_overrides", None)
+    if existing is not None and not isinstance(existing, dict):
+        raise ValueError("--decisions requires --hf-overrides to be a JSON object")
+    hf_overrides = dict(existing or {})
+    if "head_dtype" in hf_overrides:
+        return
+    # A bf16 lm_head rounds each logit before the letter softmax, so decision probabilities collapse onto a grid.
+    hf_overrides["head_dtype"] = "float32"
+    args.hf_overrides = hf_overrides
+    explicit_keys = getattr(args, "explicit_keys", None)
+    if explicit_keys is not None:
+        args.explicit_keys = explicit_keys | {"hf_overrides"}
+
+
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -169,6 +189,9 @@ class OmniServeCommand(CLISubcommand):
             if explicit_keys is not None:
                 # --no-guardrails is a CLI-only alias, not a diffusion engine arg.
                 args.explicit_keys = (explicit_keys - {"no_guardrails"}) | {"model_config"}
+
+        if getattr(args, "decisions", False):
+            _default_decisions_head_dtype(args)
 
         if args.headless:
             run_headless(args)
@@ -420,7 +443,8 @@ class OmniServeCommand(CLISubcommand):
             "--decisions",
             action="store_true",
             help="Serve POST /v1/decisions, answering each question from the chat model's next-token scores over "
-            "its lettered options. Requires --enable-prompt-tokens-details.",
+            "its lettered options. Requires --enable-prompt-tokens-details. Runs the lm_head in float32 unless "
+            "--hf-overrides sets head_dtype.",
         )
         omni_config_group.add_argument(
             "--deploy-config",
