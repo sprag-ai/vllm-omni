@@ -261,7 +261,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     @classmethod
     def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
-        return VllmQwen3OmniMoeThinker.get_generation_prompt(stt_params)
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_generation_prompt(stt_params)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

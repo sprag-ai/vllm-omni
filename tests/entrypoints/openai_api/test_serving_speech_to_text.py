@@ -5,12 +5,16 @@ import asyncio
 import json
 import math
 from types import SimpleNamespace
+from typing import Annotated
 
 import pytest
+from fastapi import FastAPI, Form
+from fastapi.testclient import TestClient
 from vllm.config import SpeechToTextConfig
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.speech_to_text.base.serving import SpeechToTextBaseServing
 from vllm.entrypoints.speech_to_text.transcription.protocol import (
+    TranscriptionRequest,
     TranscriptionResponseStreamChoice,
     TranscriptionStreamResponse,
 )
@@ -20,7 +24,9 @@ from vllm_omni.entrypoints.openai.serving_speech_to_text import (
     OmniOpenAIServingTranscription,
     _AudioDurationBound,
     _StreamedPromptUsage,
+    _TranscriptionInstructions,
 )
+from vllm_omni.inputs.speech_to_text import SPEECH_TO_TEXT_INSTRUCTIONS
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -277,3 +283,44 @@ async def test_concurrent_requests_keep_their_own_counts():
 
 def test_transcription_serving_streams_through_the_prompt_usage():
     assert OmniOpenAIServingTranscription._create_speech_to_text is _StreamedPromptUsage._create_speech_to_text
+
+
+class _RecordingInstructionsServing:
+    def __init__(self) -> None:
+        self.seen: str | None = None
+
+    async def _preprocess_speech_to_text(self, request, audio_data, request_id):
+        self.seen = SPEECH_TO_TEXT_INSTRUCTIONS.get()
+        return [], 0.0, []
+
+
+class _InstructionsServing(_TranscriptionInstructions, _RecordingInstructionsServing):
+    pass
+
+
+@pytest.mark.parametrize(("extra", "expected"), [({"instructions": "You are strict."}, "You are strict."), ({}, None)])
+def test_a_transcriptions_instructions_are_set_only_while_it_is_preprocessed(extra, expected) -> None:
+    serving = _InstructionsServing()
+    request = SimpleNamespace(model_extra=extra)
+
+    asyncio.run(serving._preprocess_speech_to_text(request=request, audio_data=b"", request_id="req-1"))
+
+    assert serving.seen == expected
+    assert SPEECH_TO_TEXT_INSTRUCTIONS.get() is None
+
+
+def test_the_upstream_form_model_keeps_the_instructions_field() -> None:
+    app = FastAPI()
+
+    @app.post("/transcribe")
+    async def transcribe(request: Annotated[TranscriptionRequest, Form()]) -> dict[str, object]:
+        return {"instructions": (request.model_extra or {}).get("instructions"), "prompt": request.prompt}
+
+    response = TestClient(app).post(
+        "/transcribe",
+        data={"instructions": "You are strict.", "prompt": "Return only the transcript."},
+        files={"file": ("a.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"instructions": "You are strict.", "prompt": "Return only the transcript."}
